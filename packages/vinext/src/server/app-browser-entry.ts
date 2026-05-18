@@ -226,6 +226,61 @@ function commitHistoryTraversalIndex(index: number | null): void {
   }
 }
 
+function commitHashOnlyNavigation(
+  href: string,
+  historyUpdateMode: Exclude<HistoryUpdateMode, undefined>,
+  scroll: boolean,
+): void {
+  const navigationHistoryIndex = allocateNavigationHistoryTraversalIndex(historyUpdateMode);
+  const previousNextUrl = hasBrowserRouterState()
+    ? getBrowserRouterState().previousNextUrl
+    : readHistoryStatePreviousNextUrl(window.history.state);
+  const historyState = createHistoryStateWithNavigationMetadata(
+    createHashOnlyNavigationBaseHistoryState(historyUpdateMode, scroll),
+    {
+      previousNextUrl,
+      traversalIndex: navigationHistoryIndex,
+    },
+  );
+
+  if (historyUpdateMode === "replace") {
+    replaceHistoryStateWithoutNotify(historyState, "", href);
+  } else {
+    pushHistoryStateWithoutNotify(historyState, "", href);
+  }
+  commitHistoryTraversalIndex(navigationHistoryIndex);
+}
+
+function createHashOnlyNavigationBaseHistoryState(
+  historyUpdateMode: Exclude<HistoryUpdateMode, undefined>,
+  scroll: boolean,
+): unknown {
+  if (historyUpdateMode !== "replace") {
+    return null;
+  }
+  return scroll ? stripVinextScrollState(window.history.state) : window.history.state;
+}
+
+function stripVinextScrollState(state: unknown): unknown {
+  if (!state || typeof state !== "object") {
+    return state;
+  }
+
+  const nextState: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(state)) {
+    if (key === "__vinext_scrollX" || key === "__vinext_scrollY") {
+      continue;
+    }
+    nextState[key] = value;
+  }
+
+  return Object.keys(nextState).length > 0 ? nextState : null;
+}
+
+function commitTraversalIndexFromHistoryState(historyState: unknown): void {
+  commitHistoryTraversalIndex(readHistoryStateTraversalIndex(historyState));
+}
+
 function getBrowserRouterState(): AppRouterState {
   return browserNavigationController.getBrowserRouterState();
 }
@@ -1113,6 +1168,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
   // header comment: "the segment cache contains the actual RSC data which
   // needs to be re-fetched."
   window.__VINEXT_CLEAR_NAV_CACHES__ = clearClientNavigationCaches;
+  window.__VINEXT_RSC_COMMIT_HASH_NAVIGATION__ = commitHashOnlyNavigation;
 
   window.__VINEXT_RSC_NAVIGATE__ = async function navigateRsc(
     href: string,
@@ -1475,6 +1531,7 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
     const href = window.location.href;
     if (isSameAppRoutePopstateTarget(href)) {
       notifyAppRouterTransitionStart(href, "traverse");
+      commitTraversalIndexFromHistoryState(event.state);
       restorePopstateScrollPosition(event.state);
       return;
     }

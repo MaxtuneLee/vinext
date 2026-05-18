@@ -121,6 +121,16 @@ declare global {
     __VINEXT_CLEAR_NAV_CACHES__: (() => void) | undefined;
 
     /**
+     * Commits an App Router hash-only navigation without fetching RSC data.
+     * Installed by the browser RSC entry so `next/navigation` and `next/link`
+     * can route app-owned hash-only history writes through the same vinext
+     * history metadata/index allocator as approved RSC commits.
+     */
+    __VINEXT_RSC_COMMIT_HASH_NAVIGATION__:
+      | ((href: string, historyUpdateMode: "push" | "replace", scroll: boolean) => void)
+      | undefined;
+
+    /**
      * A Promise that resolves when the current in-flight popstate RSC navigation
      * finishes rendering.
      * Set by the popstate handler in the browser RSC entry; read by

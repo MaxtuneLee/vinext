@@ -1214,6 +1214,20 @@ function saveScrollPosition(): void {
   );
 }
 
+function commitHashOnlyHistoryState(href: string, mode: "push" | "replace", scroll: boolean): void {
+  const commitAppRouterHashNavigation = window.__VINEXT_RSC_COMMIT_HASH_NAVIGATION__;
+  if (commitAppRouterHashNavigation) {
+    commitAppRouterHashNavigation(href, mode, scroll);
+    return;
+  }
+
+  if (mode === "replace") {
+    replaceHistoryStateWithoutNotify(null, "", href);
+  } else {
+    pushHistoryStateWithoutNotify(null, "", href);
+  }
+}
+
 /**
  * Restore scroll position from a history state object (used on popstate).
  *
@@ -1297,11 +1311,7 @@ export async function navigateClientSide(
   // Hash-only change: update URL and scroll to target, skip RSC fetch
   if (isHashOnlyChange(fullHref)) {
     const hash = fullHref.includes("#") ? fullHref.slice(fullHref.indexOf("#")) : "";
-    if (mode === "replace") {
-      replaceHistoryStateWithoutNotify(null, "", fullHref);
-    } else {
-      pushHistoryStateWithoutNotify(null, "", fullHref);
-    }
+    commitHashOnlyHistoryState(fullHref, mode, scroll);
     commitClientNavigationState();
     if (scroll) {
       scrollToHashTarget(hash);
