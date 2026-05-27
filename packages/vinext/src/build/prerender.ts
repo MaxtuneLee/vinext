@@ -40,7 +40,15 @@ import { runWithHeadersContext, headersContextFromRequest } from "vinext/shims/h
 import { createValidFileMatcher, findFileWithExtensions } from "../routing/file-matcher.js";
 import { normalizeStaticPathsEntry, type StaticPathsEntry } from "../routing/route-pattern.js";
 import { navigationRuntimeRscBootstrapExpression } from "../server/app-ssr-stream.js";
-import { VINEXT_PRERENDER_SECRET_HEADER } from "../server/headers.js";
+import {
+  VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
+  VINEXT_PRERENDER_SECRET_HEADER,
+} from "../server/headers.js";
+import {
+  encodePrerenderRouteParams,
+  serializePrerenderRouteParamsHeader,
+  type PrerenderRouteParamsPayload,
+} from "../server/prerender-route-params.js";
 import { startProdServer } from "../server/prod-server.js";
 import { readPrerenderSecret } from "./server-manifest.js";
 import { getOutputPath, getRscOutputPath } from "../utils/prerender-output-paths.js";
@@ -1017,6 +1025,7 @@ export async function prerenderApp({
       urlPath: string;
       /** The file-system route pattern this URL was expanded from (e.g. `/blog/:slug`). */
       routePattern: string;
+      prerenderRouteParams: PrerenderRouteParamsPayload | null;
       revalidate: number | false;
       isSpeculative: boolean; // 'unknown' route — mark skipped if render fails
     };
@@ -1161,6 +1170,7 @@ export async function prerenderApp({
             urlsToRender.push({
               urlPath,
               routePattern: route.pattern,
+              prerenderRouteParams: encodePrerenderRouteParams(route.pattern, params),
               revalidate,
               isSpeculative: false,
             });
@@ -1181,6 +1191,7 @@ export async function prerenderApp({
         urlsToRender.push({
           urlPath: route.pattern,
           routePattern: route.pattern,
+          prerenderRouteParams: null,
           revalidate: false,
           isSpeculative: true,
         });
@@ -1189,6 +1200,7 @@ export async function prerenderApp({
         urlsToRender.push({
           urlPath: route.pattern,
           routePattern: route.pattern,
+          prerenderRouteParams: null,
           revalidate,
           isSpeculative: false,
         });
@@ -1206,6 +1218,7 @@ export async function prerenderApp({
     async function renderUrl({
       urlPath,
       routePattern,
+      prerenderRouteParams,
       revalidate,
       isSpeculative,
     }: UrlToRender): Promise<PrerenderRouteResult> {
@@ -1219,7 +1232,13 @@ export async function prerenderApp({
         // (devWorker.fetch) so the ALS context set up here on the Node side never
         // reaches the worker isolate. The wrapping is a no-op for the CF path but
         // harmless — and it keeps renderUrl() shape-compatible across both modes.
-        const htmlRequest = new Request(`http://localhost${urlPath}`);
+        const prerenderRouteParamsHeader =
+          serializePrerenderRouteParamsHeader(prerenderRouteParams);
+        const htmlHeaders = new Headers();
+        if (prerenderRouteParamsHeader !== null) {
+          htmlHeaders.set(VINEXT_PRERENDER_ROUTE_PARAMS_HEADER, prerenderRouteParamsHeader);
+        }
+        const htmlRequest = new Request(`http://localhost${urlPath}`, { headers: htmlHeaders });
         const htmlRender = await runWithHeadersContext(
           headersContextFromRequest(htmlRequest),
           async () => {
@@ -1289,8 +1308,12 @@ export async function prerenderApp({
         // response that never went through createRscEmbedTransform.
         let rscData = extractRscPayloadFromPrerenderedHtml(html);
         if (rscData === null) {
+          const rscHeaders = new Headers({ Accept: "text/x-component", RSC: "1" });
+          if (prerenderRouteParamsHeader !== null) {
+            rscHeaders.set(VINEXT_PRERENDER_ROUTE_PARAMS_HEADER, prerenderRouteParamsHeader);
+          }
           const rscRequest = new Request(`http://localhost${urlPath}`, {
-            headers: { Accept: "text/x-component", RSC: "1" },
+            headers: rscHeaders,
           });
           const rscRes = await runWithHeadersContext(headersContextFromRequest(rscRequest), () =>
             rscHandler(rscRequest),

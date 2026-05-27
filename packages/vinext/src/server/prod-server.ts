@@ -70,7 +70,15 @@ import { manifestFileWithBase } from "../utils/manifest-paths.js";
 import { normalizePathnameForRouteMatchStrict } from "../routing/utils.js";
 import type { ExecutionContextLike } from "vinext/shims/request-context";
 import { readPrerenderSecret } from "../build/server-manifest.js";
-import { VINEXT_PRERENDER_SECRET_HEADER, VINEXT_STATIC_FILE_HEADER } from "./headers.js";
+import {
+  VINEXT_PRERENDER_ROUTE_PARAMS_HEADER,
+  VINEXT_PRERENDER_SECRET_HEADER,
+  VINEXT_STATIC_FILE_HEADER,
+} from "./headers.js";
+import {
+  readTrustedPrerenderRouteParamsFromHeaders,
+  serializePrerenderRouteParamsHeader,
+} from "./prerender-route-params.js";
 import { seedMemoryCacheFromPrerender as seedMemoryCacheFromPrerenderFallback } from "./seed-cache.js";
 import { installSocketErrorBackstop } from "./socket-error-backstop.js";
 
@@ -209,13 +217,41 @@ function mergeResponseHeaders(
 function toWebHeaders(headersRecord: Record<string, string | string[]>): Headers {
   const headers = new Headers();
   for (const [key, value] of Object.entries(headersRecord)) {
-    if (Array.isArray(value)) {
-      for (const item of value) headers.append(key, item);
-    } else {
-      headers.set(key, value);
-    }
+    appendWebHeader(headers, key, value);
   }
   return headers;
+}
+
+function appendWebHeader(
+  headers: Headers,
+  key: string,
+  value: string | string[] | undefined,
+): void {
+  if (value === undefined) return;
+  if (Array.isArray(value)) {
+    for (const item of value) headers.append(key, item);
+    return;
+  }
+  headers.set(key, value);
+}
+
+function nodeHeadersToWebHeaders(headersRecord: IncomingMessage["headers"]): Headers {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(headersRecord)) {
+    appendWebHeader(headers, key, value);
+  }
+  return headers;
+}
+
+function firstHeaderValue(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function resolveRequestProtocol(req: IncomingMessage): "http" | "https" {
+  const rawProto = trustProxy
+    ? firstHeaderValue(req.headers["x-forwarded-proto"])?.split(",")[0]?.trim()
+    : undefined;
+  return rawProto === "https" || rawProto === "http" ? rawProto : "http";
 }
 
 const NO_BODY_RESPONSE_STATUSES = new Set([204, 205, 304]);
@@ -678,7 +714,7 @@ async function statIfFile(filePath: string): Promise<{ size: number; mtimeMs: nu
  * itself, so this is only a concern for the Node.js prod-server.
  */
 function resolveHost(req: IncomingMessage, fallback: string): string {
-  const rawForwarded = req.headers["x-forwarded-host"] as string | undefined;
+  const rawForwarded = firstHeaderValue(req.headers["x-forwarded-host"]);
   const hostHeader = req.headers.host;
 
   if (rawForwarded) {
@@ -717,26 +753,29 @@ const trustProxy = process.env.VINEXT_TRUST_PROXY === "1" || trustedHosts.size >
  * Router prod server normalizes before static-asset lookup, and can pass
  * the result here so the downstream RSC handler doesn't re-normalize).
  */
-function nodeToWebRequest(req: IncomingMessage, urlOverride?: string): Request {
-  const rawProto = trustProxy
-    ? (req.headers["x-forwarded-proto"] as string)?.split(",")[0]?.trim()
-    : undefined;
-  const proto = rawProto === "https" || rawProto === "http" ? rawProto : "http";
+function nodeToWebRequest(
+  req: IncomingMessage,
+  urlOverride?: string,
+  prerenderSecret?: string,
+): Request {
+  const proto = resolveRequestProtocol(req);
   const host = resolveHost(req, "localhost");
   const origin = `${proto}://${host}`;
   const url = new URL(urlOverride ?? req.url ?? "/", origin);
 
-  const rawHeaders = new Headers();
-  for (const [key, value] of Object.entries(req.headers)) {
-    if (value === undefined) continue;
-    if (Array.isArray(value)) {
-      for (const v of value) rawHeaders.append(key, v);
-    } else {
-      rawHeaders.set(key, value);
-    }
-  }
+  const rawHeaders = nodeHeadersToWebHeaders(req.headers);
+  const prerenderRouteParamsPayload = readTrustedPrerenderRouteParamsFromHeaders(
+    rawHeaders,
+    prerenderSecret,
+  );
   // Strip internal headers that should not be honored from external requests.
   const headers = filterInternalHeaders(rawHeaders);
+  const prerenderRouteParamsHeader = serializePrerenderRouteParamsHeader(
+    prerenderRouteParamsPayload,
+  );
+  if (prerenderRouteParamsHeader !== null) {
+    headers.set(VINEXT_PRERENDER_ROUTE_PARAMS_HEADER, prerenderRouteParamsHeader);
+  }
 
   const method = req.method ?? "GET";
   const hasBody = method !== "GET" && method !== "HEAD";
@@ -1234,7 +1273,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
       const normalizedUrl = pathname + qs;
 
       // Convert Node.js request to Web Request and call the RSC handler
-      const request = nodeToWebRequest(req, normalizedUrl);
+      const request = nodeToWebRequest(req, normalizedUrl, prerenderSecret);
       const response = await rscHandler(request);
 
       const staticFileSignal = response.headers.get(VINEXT_STATIC_FILE_HEADER);
@@ -1627,15 +1666,9 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       }
 
       // Convert Node.js req to Web Request for the server entry
-      const rawProtocol = trustProxy
-        ? (req.headers["x-forwarded-proto"] as string)?.split(",")[0]?.trim()
-        : undefined;
-      const protocol = rawProtocol === "https" || rawProtocol === "http" ? rawProtocol : "http";
+      const protocol = resolveRequestProtocol(req);
       const hostHeader = resolveHost(req, `${host}:${port}`);
-      const rawReqHeaders = Object.entries(req.headers).reduce((h, [k, v]) => {
-        if (v) h.set(k, Array.isArray(v) ? v.join(", ") : v);
-        return h;
-      }, new Headers());
+      const rawReqHeaders = nodeHeadersToWebHeaders(req.headers);
       // Capture `x-nextjs-data` before filterInternalHeaders strips it — the
       // middleware redirect protocol needs to know whether the inbound request
       // was a `_next/data` fetch to emit `x-nextjs-redirect` instead of a 3xx.
