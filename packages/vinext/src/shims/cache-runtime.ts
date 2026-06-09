@@ -631,8 +631,17 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
   // Function `length` is always `configurable: true` per spec, so this is safe.
   Object.defineProperty(cachedFn, "length", { value: fn.length, configurable: true });
 
+  // Tag the wrapper so callers (e.g. the OTel tracer extension) can detect
+  // that this is a "use cache" function without relying on React server
+  // reference internals.
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  (cachedFn as any)[USE_CACHE_FUNCTION_SYMBOL] = true;
+
   return cachedFn;
 }
+
+/** @internal Symbol used to identify "use cache" wrapper functions. */
+const USE_CACHE_FUNCTION_SYMBOL = Symbol.for("vinext.useCacheFunction");
 
 function throwPrivateUseCacheInsidePublicUseCacheError(): never {
   const error = new Error(
