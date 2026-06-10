@@ -684,16 +684,42 @@ function formatResolvedMetadataUrl(url: URL): string {
   return url.href;
 }
 
-function resolveMetadataUrl(url: string | URL, metadataBase: URL | null | undefined): string {
+// Next.js's exact file-extension regex for trailingSlash canonical rule.
+// Matches paths like /foo.xml, /bar/baz.json but NOT /.well-known/... paths.
+const TRAILING_SLASH_FILE_REGEX =
+  /^(?:\/((?!\.well-known(?:\/.*)?)((?:[^/]+\/)*)([^/]+\.\w+)))(\/?|$)/i;
+
+function resolveMetadataUrl(
+  url: string | URL,
+  metadataBase: URL | null | undefined,
+  trailingSlash?: boolean,
+): string {
   const value = stringifyUrl(url);
   if (isAbsoluteOrProtocolRelativeUrl(value) || !metadataBase) {
     return value;
   }
 
   try {
-    return formatResolvedMetadataUrl(
-      new URL(joinMetadataPath(metadataBase.pathname, value), metadataBase),
-    );
+    const composed = new URL(joinMetadataPath(metadataBase.pathname, value), metadataBase);
+    // Match Next.js's resolveAbsoluteUrlWithPathname: only ADD a trailing slash
+    // when trailingSlash is true; never strip when false. See
+    // packages/next/src/lib/metadata/resolvers/resolve-url.ts.
+    if (trailingSlash === true && composed.search === "") {
+      if (
+        composed.pathname !== "/" &&
+        !composed.pathname.endsWith("/") &&
+        !TRAILING_SLASH_FILE_REGEX.test(composed.pathname)
+      ) {
+        composed.pathname += "/";
+      }
+    }
+    const result = formatResolvedMetadataUrl(composed);
+    // formatResolvedMetadataUrl collapses pathname '/' with no query to bare
+    // origin (no trailing slash). For trailingSlash:true restore the slash.
+    if (trailingSlash === true && result === metadataBase.origin) {
+      return `${metadataBase.origin}/`;
+    }
+    return result;
   } catch {
     return value;
   }
@@ -703,11 +729,12 @@ function resolveCanonicalUrl(
   url: string | URL,
   metadataBase: URL | null | undefined,
   pathname: string,
+  trailingSlash?: boolean,
 ): string {
   if (url instanceof URL) {
-    return resolveMetadataUrl(url, metadataBase);
+    return resolveMetadataUrl(url, metadataBase, trailingSlash);
   }
-  return resolveMetadataUrl(resolveRelativeMetadataUrl(url, pathname), metadataBase);
+  return resolveMetadataUrl(resolveRelativeMetadataUrl(url, pathname), metadataBase, trailingSlash);
 }
 
 function isSocialImageDescriptor(
@@ -739,6 +766,7 @@ function resolveSocialImageUrl(
 type MetadataHeadProps = {
   metadata: Metadata;
   pathname?: string;
+  trailingSlash?: boolean;
 };
 
 function escapeHtmlText(value: string): string {
@@ -799,11 +827,17 @@ function renderMetadataElementToHtml(node: unknown): string {
   }
 }
 
-export function renderMetadataToHtml(metadata: Metadata, pathname = "/"): string {
-  return renderMetadataElementToHtml(MetadataHead({ metadata, pathname }));
+export function renderMetadataToHtml(
+  metadata: Metadata,
+  pathname = "/",
+  options?: { trailingSlash?: boolean },
+): string {
+  return renderMetadataElementToHtml(
+    MetadataHead({ metadata, pathname, trailingSlash: options?.trailingSlash }),
+  );
 }
 
-export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
+export function MetadataHead({ metadata, pathname = "/", trailingSlash }: MetadataHeadProps) {
   const elements: React.ReactElement[] = [];
   let key = 0;
 
@@ -813,7 +847,7 @@ export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
   function resolveUrl(url: string | URL | undefined): string | undefined;
   function resolveUrl(url: string | URL | undefined): string | undefined {
     if (!url) return undefined;
-    return resolveMetadataUrl(url, base);
+    return resolveMetadataUrl(url, base, trailingSlash);
   }
 
   // Title
@@ -1166,7 +1200,7 @@ export function MetadataHead({ metadata, pathname = "/" }: MetadataHeadProps) {
         <link
           key={key++}
           rel="canonical"
-          href={resolveCanonicalUrl(alt.canonical, base, pathname)}
+          href={resolveCanonicalUrl(alt.canonical, base, pathname, trailingSlash)}
         />,
       );
     }

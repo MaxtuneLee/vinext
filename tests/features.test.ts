@@ -3031,6 +3031,93 @@ describe("MetadataHead rendering", () => {
     expect(html).toContain('content="val1"');
     expect(html).toContain('content="val2"');
   });
+
+  // trailingSlash canonical URL tests
+  // Ported from Next.js app-dir trailing-slash e2e: "should contain trailing slash to canonical url"
+  // see https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/trailingslash/trailingslash.test.ts#L31
+
+  it("trailingSlash:true appends slash to root canonical '/'", () => {
+    // metadataBase='http://trailingslash.com', canonical='/', pathname='/'
+    // → href='http://trailingslash.com/'
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/" },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/"');
+  });
+
+  it("trailingSlash:true appends slash to relative canonical './' at pathname '/a'", () => {
+    // metadataBase='http://trailingslash.com', canonical='./', pathname='/a'
+    // → href='http://trailingslash.com/a/'
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "./" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("trailingSlash:true does not append slash before query string", () => {
+    // canonical='/q?x=1' → href='http://trailingslash.com/q?x=1' (no slash before '?')
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/q?x=1" },
+      },
+      "/q",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/q?x=1"');
+    expect(html).not.toContain("/q/");
+  });
+
+  it("trailingSlash:true leaves external canonical unchanged", () => {
+    // canonical='http://other.com/a' → href='http://other.com/a' (external host)
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "http://other.com/a" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://other.com/a"');
+    expect(html).not.toContain('href="http://other.com/a/"');
+  });
+
+  it("trailingSlash:false preserves a user-provided trailing slash on canonical", () => {
+    // Match Next.js: trailingSlash:false (the default) does NOT strip a
+    // user-provided slash; canonical='/a/' renders verbatim.
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/a/" },
+      },
+      "/a",
+      { trailingSlash: false },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("trailingSlash:true is idempotent when canonical already ends with slash", () => {
+    // canonical='http://trailingslash.com/a/' → href='http://trailingslash.com/a/' (unchanged)
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "http://trailingslash.com/a/" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
 });
 
 // ---------------------------------------------------------------------------
