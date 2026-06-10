@@ -3118,6 +3118,36 @@ describe("MetadataHead rendering", () => {
     );
     expect(html).toContain('href="http://trailingslash.com/a/"');
   });
+
+  it("trailingSlash:true does not append slash to file-like canonical urls", () => {
+    // canonical='/sitemap.xml' → href='http://trailingslash.com/sitemap.xml'
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/sitemap.xml" },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/sitemap.xml"');
+    expect(html).not.toContain("sitemap.xml/");
+  });
+
+  it("trailingSlash:true does not append slash to .well-known canonical urls", () => {
+    // canonical='/.well-known/apple-app-site-association' → href='http://trailingslash.com/.well-known/apple-app-site-association'
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/.well-known/apple-app-site-association" },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain(
+      'href="http://trailingslash.com/.well-known/apple-app-site-association"',
+    );
+    expect(html).not.toContain("apple-app-site-association/");
+  });
 });
 
 // ---------------------------------------------------------------------------

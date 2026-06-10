@@ -708,6 +708,7 @@ function resolveMetadataUrl(
       if (
         composed.pathname !== "/" &&
         !composed.pathname.endsWith("/") &&
+        !composed.pathname.startsWith("/.well-known/") &&
         !TRAILING_SLASH_FILE_REGEX.test(composed.pathname)
       ) {
         composed.pathname += "/";
