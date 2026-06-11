@@ -3150,6 +3150,66 @@ describe("MetadataHead rendering", () => {
   });
 });
 
+describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
+  let createAppPageRouteBodyMetadata: typeof import("../packages/vinext/src/server/app-page-route-wiring.js").createAppPageRouteBodyMetadata;
+  let _React: typeof import("react");
+  let renderToStaticMarkup: typeof import("react-dom/server").renderToStaticMarkup;
+
+  beforeAll(async () => {
+    ({ createAppPageRouteBodyMetadata } =
+      await import("../packages/vinext/src/server/app-page-route-wiring.js"));
+    _React = await import("react");
+    ({ renderToStaticMarkup } = await import("react-dom/server"));
+  });
+
+  it("body placement: applies trailingSlash to canonical href in the streamed body branch", () => {
+    const node = createAppPageRouteBodyMetadata(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/a" },
+      },
+      "/a",
+      "body",
+      true, // trailingSlash
+    );
+    const html = renderToStaticMarkup(node as React.ReactElement);
+    // Body branch wraps the metadata HTML in a hidden div (htmlLimitedBots
+    // / streamed-body path used when metadata can't be flushed into <head>
+    // before the first shell chunk).
+    expect(html).toContain("<div hidden");
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("body placement: no slash inserted before query string", () => {
+    const node = createAppPageRouteBodyMetadata(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/q?x=1" },
+      },
+      "/q",
+      "body",
+      true,
+    );
+    const html = renderToStaticMarkup(node as React.ReactElement);
+    expect(html).toContain('href="http://trailingslash.com/q?x=1"');
+    expect(html).not.toContain("/q/?");
+  });
+
+  it("body placement: returns null when placement is 'head' (no double-render)", () => {
+    const node = createAppPageRouteBodyMetadata(
+      { metadataBase: new URL("http://trailingslash.com"), alternates: { canonical: "/a" } },
+      "/a",
+      "head",
+      true,
+    );
+    expect(node).toBeNull();
+  });
+
+  it("body placement: returns null when metadata is null", () => {
+    expect(createAppPageRouteBodyMetadata(null, "/a", "body", true)).toBeNull();
+  });
+});
+
 // ---------------------------------------------------------------------------
 // ViewportHead rendering tests
 

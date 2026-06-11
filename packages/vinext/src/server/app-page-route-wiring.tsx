@@ -489,7 +489,7 @@ function createAppPageRouteHead(
   );
 }
 
-function createAppPageRouteBodyMetadata(
+export function createAppPageRouteBodyMetadata(
   metadata: Metadata | null,
   pathname: string,
   metadataPlacement: "body" | "head",
