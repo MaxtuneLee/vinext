@@ -708,7 +708,6 @@ function resolveMetadataUrl(
       if (
         composed.pathname !== "/" &&
         !composed.pathname.endsWith("/") &&
-        !composed.pathname.startsWith("/.well-known/") &&
         !TRAILING_SLASH_FILE_REGEX.test(composed.pathname)
       ) {
         composed.pathname += "/";
@@ -848,7 +847,7 @@ export function MetadataHead({ metadata, pathname = "/", trailingSlash }: Metada
   function resolveUrl(url: string | URL | undefined): string | undefined;
   function resolveUrl(url: string | URL | undefined): string | undefined {
     if (!url) return undefined;
-    return resolveMetadataUrl(url, base, trailingSlash);
+    return resolveMetadataUrl(url, base);
   }
 
   // Title

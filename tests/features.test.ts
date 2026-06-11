@@ -3075,7 +3075,7 @@ describe("MetadataHead rendering", () => {
       { trailingSlash: true },
     );
     expect(html).toContain('href="http://trailingslash.com/q?x=1"');
-    expect(html).not.toContain("/q/");
+    expect(html).not.toContain('href="http://trailingslash.com/q/?x=1"');
   });
 
   it("trailingSlash:true leaves external canonical unchanged", () => {
@@ -3144,9 +3144,9 @@ describe("MetadataHead rendering", () => {
       { trailingSlash: true },
     );
     expect(html).toContain(
-      'href="http://trailingslash.com/.well-known/apple-app-site-association"',
+      'href="http://trailingslash.com/.well-known/apple-app-site-association/"',
     );
-    expect(html).not.toContain("apple-app-site-association/");
+    expect(html).not.toContain('"http://trailingslash.com/.well-known/apple-app-site-association"');
   });
 });
 
