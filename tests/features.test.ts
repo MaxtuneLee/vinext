@@ -3133,8 +3133,10 @@ describe("MetadataHead rendering", () => {
     expect(html).not.toContain("sitemap.xml/");
   });
 
-  it("trailingSlash:true does not append slash to .well-known canonical urls", () => {
-    // canonical='/.well-known/apple-app-site-association' → href='http://trailingslash.com/.well-known/apple-app-site-association'
+  it("trailingSlash:true appends slash to .well-known canonical urls", () => {
+    // Ported from Next.js: packages/next/src/lib/metadata/resolvers/resolve-url.test.ts
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/metadata/resolvers/resolve-url.test.ts
+    // .well-known is excluded from the file regex, so it is treated as a normal path.
     const html = renderMetadataToHtml(
       {
         metadataBase: new URL("http://trailingslash.com"),
@@ -3147,6 +3149,28 @@ describe("MetadataHead rendering", () => {
       'href="http://trailingslash.com/.well-known/apple-app-site-association/"',
     );
     expect(html).not.toContain('"http://trailingslash.com/.well-known/apple-app-site-association"');
+  });
+
+  it("trailingSlash:true appends slash to openGraph.url and alternate urls", () => {
+    // Ported from the resolver call sites in Next.js:
+    // packages/next/src/lib/metadata/resolvers/resolve-opengraph.ts and resolve-basics.ts
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        openGraph: { url: "/og" },
+        alternates: {
+          languages: { en: "/en" },
+          media: { print: "/print" },
+          types: { "application/rss+xml": "/feed" },
+        },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('property="og:url" content="http://trailingslash.com/og/"');
+    expect(html).toContain('href="http://trailingslash.com/en/" hreflang="en"');
+    expect(html).toContain('href="http://trailingslash.com/print/" media="print"');
+    expect(html).toContain('href="http://trailingslash.com/feed/" type="application/rss+xml"');
   });
 });
 

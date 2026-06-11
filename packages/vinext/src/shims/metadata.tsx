@@ -966,7 +966,15 @@ export function MetadataHead({ metadata, pathname = "/", trailingSlash }: Metada
     if (og.title) elements.push(<meta key={key++} property="og:title" content={og.title} />);
     if (og.description)
       elements.push(<meta key={key++} property="og:description" content={og.description} />);
-    if (og.url) elements.push(<meta key={key++} property="og:url" content={resolveUrl(og.url)} />);
+    if (og.url) {
+      elements.push(
+        <meta
+          key={key++}
+          property="og:url"
+          content={resolveCanonicalUrl(og.url, base, pathname, trailingSlash)}
+        />,
+      );
+    }
     if (og.siteName)
       elements.push(<meta key={key++} property="og:site_name" content={og.siteName} />);
     if (og.type) elements.push(<meta key={key++} property="og:type" content={og.type} />);
@@ -1206,17 +1214,38 @@ export function MetadataHead({ metadata, pathname = "/", trailingSlash }: Metada
     }
     if (alt.languages) {
       for (const [lang, href] of Object.entries(alt.languages)) {
-        elements.push(<link key={key++} rel="alternate" hrefLang={lang} href={resolveUrl(href)} />);
+        elements.push(
+          <link
+            key={key++}
+            rel="alternate"
+            hrefLang={lang}
+            href={resolveCanonicalUrl(href, base, pathname, trailingSlash)}
+          />,
+        );
       }
     }
     if (alt.media) {
       for (const [media, href] of Object.entries(alt.media)) {
-        elements.push(<link key={key++} rel="alternate" media={media} href={resolveUrl(href)} />);
+        elements.push(
+          <link
+            key={key++}
+            rel="alternate"
+            media={media}
+            href={resolveCanonicalUrl(href, base, pathname, trailingSlash)}
+          />,
+        );
       }
     }
     if (alt.types) {
       for (const [type, href] of Object.entries(alt.types)) {
-        elements.push(<link key={key++} rel="alternate" type={type} href={resolveUrl(href)} />);
+        elements.push(
+          <link
+            key={key++}
+            rel="alternate"
+            type={type}
+            href={resolveCanonicalUrl(href, base, pathname, trailingSlash)}
+          />,
+        );
       }
     }
   }
