@@ -695,12 +695,18 @@ function resolveMetadataUrl(
   trailingSlash?: boolean,
 ): string {
   const value = stringifyUrl(url);
-  if (isAbsoluteOrProtocolRelativeUrl(value) || !metadataBase) {
+  if (!metadataBase) {
     return value;
   }
 
   try {
-    const composed = new URL(joinMetadataPath(metadataBase.pathname, value), metadataBase);
+    const isAbsolute = isAbsoluteOrProtocolRelativeUrl(value);
+    const composed = isAbsolute
+      ? new URL(value, metadataBase)
+      : new URL(joinMetadataPath(metadataBase.pathname, value), metadataBase);
+    if (isAbsolute && composed.origin !== metadataBase.origin) {
+      return value;
+    }
     // Match Next.js's resolveAbsoluteUrlWithPathname: only ADD a trailing slash
     // when trailingSlash is true; never strip when false. See
     // packages/next/src/lib/metadata/resolvers/resolve-url.ts.
@@ -735,6 +741,20 @@ function resolveCanonicalUrl(
     return resolveMetadataUrl(url, metadataBase, trailingSlash);
   }
   return resolveMetadataUrl(resolveRelativeMetadataUrl(url, pathname), metadataBase, trailingSlash);
+}
+
+function resolveAlternateUrl(
+  url: string | URL,
+  metadataBase: URL | null | undefined,
+  pathname: string,
+  trailingSlash?: boolean,
+): string {
+  if (url instanceof URL) {
+    const resolvedUrl = new URL(pathname, url);
+    url.searchParams.forEach((value, key) => resolvedUrl.searchParams.set(key, value));
+    return resolveMetadataUrl(resolvedUrl, metadataBase, trailingSlash);
+  }
+  return resolveCanonicalUrl(url, metadataBase, pathname, trailingSlash);
 }
 
 function isSocialImageDescriptor(
@@ -1219,7 +1239,7 @@ export function MetadataHead({ metadata, pathname = "/", trailingSlash }: Metada
             key={key++}
             rel="alternate"
             hrefLang={lang}
-            href={resolveCanonicalUrl(href, base, pathname, trailingSlash)}
+            href={resolveAlternateUrl(href, base, pathname, trailingSlash)}
           />,
         );
       }
@@ -1231,7 +1251,7 @@ export function MetadataHead({ metadata, pathname = "/", trailingSlash }: Metada
             key={key++}
             rel="alternate"
             media={media}
-            href={resolveCanonicalUrl(href, base, pathname, trailingSlash)}
+            href={resolveAlternateUrl(href, base, pathname, trailingSlash)}
           />,
         );
       }
@@ -1243,7 +1263,7 @@ export function MetadataHead({ metadata, pathname = "/", trailingSlash }: Metada
             key={key++}
             rel="alternate"
             type={type}
-            href={resolveCanonicalUrl(href, base, pathname, trailingSlash)}
+            href={resolveAlternateUrl(href, base, pathname, trailingSlash)}
           />,
         );
       }

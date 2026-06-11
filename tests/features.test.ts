@@ -3119,6 +3119,18 @@ describe("MetadataHead rendering", () => {
     expect(html).toContain('href="http://trailingslash.com/a/"');
   });
 
+  it("trailingSlash:true appends slash to same-origin absolute canonical urls", () => {
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "http://trailingslash.com/a" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
   it("trailingSlash:true does not append slash to file-like canonical urls", () => {
     // canonical='/sitemap.xml' → href='http://trailingslash.com/sitemap.xml'
     const html = renderMetadataToHtml(
@@ -3171,6 +3183,24 @@ describe("MetadataHead rendering", () => {
     expect(html).toContain('href="http://trailingslash.com/en/" hreflang="en"');
     expect(html).toContain('href="http://trailingslash.com/print/" media="print"');
     expect(html).toContain('href="http://trailingslash.com/feed/" type="application/rss+xml"');
+  });
+
+  it("resolves URL-object alternates as bases for the current pathname", () => {
+    // Ported from Next.js: packages/next/src/lib/metadata/resolvers/resolve-basics.ts
+    // URL-object alternates are bases for pathname resolution and retain their query params.
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: {
+          languages: { en: new URL("http://trailingslash.com/base") },
+          media: { print: new URL("http://trailingslash.com/base?source=print") },
+        },
+      },
+      "/docs",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/docs/" hreflang="en"');
+    expect(html).toContain('href="http://trailingslash.com/docs?source=print" media="print"');
   });
 });
 
