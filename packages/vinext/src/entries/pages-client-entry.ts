@@ -109,7 +109,7 @@ const appLoader = undefined;
 // Object.keys(pageLoaders), exposed separately so navigateClient() can iterate
 // it without re-keying the map. Ordering is the insertion order of pageRoutes,
 // which pagesRouter() has already sorted by specificity (static → dynamic →
-// catch-all → optional catch-all) via compareRoutes — so matchPagesPattern()
+// catch-all → optional catch-all) via sortRoutes — so matchPagesPattern()
 // can iterate in order and trust the first match.
 window.__VINEXT_PAGE_LOADERS__ = pageLoaders;
 window.__VINEXT_PAGE_PATTERNS__ = Object.keys(pageLoaders);

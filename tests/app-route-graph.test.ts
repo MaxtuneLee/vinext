@@ -152,6 +152,44 @@ describe("App Router route graph builder", () => {
     });
   });
 
+  // Guards the scan-scoped fs-probe cache (issue #1912): sibling routes share
+  // ancestor layouts/boundaries, and a missing root-level convention (the
+  // not-found probe at app/) is memoized as `null`. Every route must still
+  // resolve the same shared ancestor files and the same nearest boundary —
+  // proving the cache returns identical results, including the null-miss path.
+  it("resolves shared ancestors and nearest boundaries for sibling routes (probe cache)", async () => {
+    await withTempApp(async (appDir) => {
+      await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);
+      await writeAppFile(appDir, "dashboard/layout.tsx", EMPTY_LAYOUT);
+      // not-found lives at the shared dashboard ancestor; app/not-found is absent
+      // (its probe is memoized as null and must stay null for every descendant).
+      await writeAppFile(appDir, "dashboard/not-found.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "dashboard/reports/page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "dashboard/reports/details/page.tsx", EMPTY_PAGE);
+      await writeAppFile(appDir, "dashboard/settings/page.tsx", EMPTY_PAGE);
+
+      const graph = await buildAppRouteGraph(appDir, createValidFileMatcher());
+
+      const sharedLayouts = [
+        path.join(appDir, "layout.tsx"),
+        path.join(appDir, "dashboard/layout.tsx"),
+      ];
+      const nearestNotFound = path.join(appDir, "dashboard/not-found.tsx");
+
+      for (const pattern of [
+        "/dashboard/reports",
+        "/dashboard/reports/details",
+        "/dashboard/settings",
+      ]) {
+        const route = findRoute(graph.routes, pattern);
+        // Shared ancestor layouts resolve identically for every sibling.
+        expect(route.layouts).toEqual(sharedLayouts);
+        // Nearest not-found walks up to the shared dashboard boundary.
+        expect(route.notFoundPath).toBe(nearestNotFound);
+      }
+    });
+  });
+
   it("materializes synthetic routes from nested parallel slot pages", async () => {
     await withTempApp(async (appDir) => {
       await writeAppFile(appDir, "layout.tsx", EMPTY_LAYOUT);

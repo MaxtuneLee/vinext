@@ -635,7 +635,7 @@ function findRouteManifestRouteByMatchedUrl(
 ): RouteManifestRoute | null {
   const urlParts = splitMatchedUrlIntoRouteParts(matchedUrl);
 
-  // RouteManifest preserves buildAppRouteGraph's compareRoutes() order, so the
+  // RouteManifest preserves buildAppRouteGraph's sortRoutes() order, so the
   // first pattern match follows the same static/dynamic/catch-all precedence as
   // request-time route matching instead of raw filesystem scan order.
   for (const route of routeManifest.segmentGraph.routes.values()) {

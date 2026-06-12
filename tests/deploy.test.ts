@@ -1924,11 +1924,38 @@ describe("detectProject — new detection features", () => {
     expect(info.nativeModulesToStub).toContain("satori");
   });
 
+  it("detects native modules listed only in devDependencies", () => {
+    mkdir(tmpDir, "app");
+    writeFile(
+      tmpDir,
+      "package.json",
+      JSON.stringify({ devDependencies: { sharp: "^0.33.0", lightningcss: "^1.0.0" } }),
+    );
+    const info = detectProject(tmpDir);
+    expect(info.nativeModulesToStub).toContain("sharp");
+    expect(info.nativeModulesToStub).toContain("lightningcss");
+  });
+
   it("nativeModulesToStub is empty when no native deps", () => {
     mkdir(tmpDir, "app");
     writeFile(tmpDir, "package.json", JSON.stringify({ dependencies: { react: "^19.0.0" } }));
     const info = detectProject(tmpDir);
     expect(info.nativeModulesToStub).toEqual([]);
+  });
+
+  it("detects ISR and MDX from a single app/ tree walk", () => {
+    // ISR (`export const revalidate`) and a `.mdx` file live in the same tree;
+    // detection shares one recursive walk and reports both.
+    mkdir(tmpDir, "app");
+    writeFile(
+      tmpDir,
+      "app/posts/page.tsx",
+      "export const revalidate = 60;\nexport default function() { return <div/> }",
+    );
+    writeFile(tmpDir, "app/about/page.mdx", "# About");
+    const info = detectProject(tmpDir);
+    expect(info.hasISR).toBe(true);
+    expect(info.hasMDX).toBe(true);
   });
 });
 

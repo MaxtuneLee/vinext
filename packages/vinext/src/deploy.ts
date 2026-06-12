@@ -227,14 +227,36 @@ export function detectProject(root: string): ProjectInfo {
       .replace(/^-|-$/g, "");
   }
 
-  // Detect ISR usage (rough heuristic: search for `revalidate` exports)
-  const hasISR = detectISR(root, isAppRouter);
-
   // Detect "type": "module" in package.json
   const hasTypeModule = pkg?.type === "module";
 
-  // Detect MDX usage
-  const hasMDX = detectMDX(root, isAppRouter, hasPages);
+  // Detect ISR (`export const revalidate`) and MDX usage. Both scan the same
+  // app/ tree, so they share a single recursive walk per directory instead of
+  // walking it twice. ISR is App-Router-only (Pages Router ISR isn't detected
+  // here — see note below); MDX may also be declared in next.config.
+  let hasISR = false;
+  let hasMDX = detectMDXFromConfig(root);
+
+  if (isAppRouter) {
+    // ISR detection is only implemented for App Router (scans for
+    // `export const revalidate`). Pages Router ISR (getStaticProps + revalidate)
+    // is not detected here — wrangler.jsonc will not include the KV namespace
+    // binding for Pages Router projects even if they use ISR. This is a known
+    // gap; KV must be configured manually for Pages Router ISR.
+    const appDir = resolveProjectDir(root, "app");
+    if (appDir) {
+      const found = scanTreeForDetection(appDir, { isr: true, mdx: !hasMDX });
+      hasISR = found.isr;
+      hasMDX = hasMDX || found.mdx;
+    }
+  }
+
+  if (hasPages && !hasMDX) {
+    const pagesDir = resolveProjectDir(root, "pages");
+    if (pagesDir) {
+      hasMDX = scanTreeForDetection(pagesDir, { isr: false, mdx: true }).mdx;
+    }
+  }
 
   // Detect CodeHike dependency
   const allDeps = {
@@ -243,8 +265,9 @@ export function detectProject(root: string): ProjectInfo {
   };
   const hasCodeHike = "codehike" in allDeps;
 
-  // Detect native Node modules that need stubbing for Workers
-  const nativeModulesToStub = detectNativeModules(root);
+  // Detect native Node modules that need stubbing for Workers. Reuses the
+  // already-merged dependency map instead of re-reading/re-parsing package.json.
+  const nativeModulesToStub = detectNativeModules(allDeps);
 
   return {
     root,
@@ -265,50 +288,85 @@ export function detectProject(root: string): ProjectInfo {
   };
 }
 
-function detectISR(root: string, isAppRouter: boolean): boolean {
-  // ISR detection is only implemented for App Router (scans for `export const revalidate`).
-  // Pages Router ISR (getStaticProps + revalidate) is not detected here — wrangler.jsonc
-  // will not include the KV namespace binding for Pages Router projects even if they use ISR.
-  // This is a known gap; KV must be configured manually for Pages Router ISR.
-  if (!isAppRouter) return false;
-  try {
-    // Check root-level app/ first, then fall back to src/app/
-    let appDir = path.join(root, "app");
-    if (!fs.existsSync(appDir)) {
-      appDir = path.join(root, "src", "app");
-    }
-    if (!fs.existsSync(appDir)) return false;
-    // Quick check: search .ts/.tsx files in app/ for `export const revalidate`
-    return scanDirForPattern(appDir, /export\s+const\s+revalidate\s*=/);
-  } catch {
-    return false;
-  }
-}
+/** Matches `export const revalidate = …` (ISR opt-in) in App Router source. */
+const ISR_REVALIDATE_PATTERN = /export\s+const\s+revalidate\s*=/;
 
-function scanDirForPattern(dir: string, pattern: RegExp): boolean {
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules") {
-      if (scanDirForPattern(fullPath, pattern)) return true;
-    } else if (entry.isFile() && /\.(ts|tsx|js|jsx)$/.test(entry.name)) {
-      try {
-        const content = fs.readFileSync(fullPath, "utf-8");
-        if (pattern.test(content)) return true;
-      } catch {
-        // skip unreadable files
-      }
-    }
-  }
-  return false;
+/** Source extensions whose contents are scanned for the ISR pattern. */
+const ISR_SCANNABLE_EXTENSION = /\.(ts|tsx|js|jsx)$/;
+
+/**
+ * Resolve a project subdirectory (`app`/`pages`), preferring the root-level
+ * location and falling back to the `src/` variant. Returns null when neither
+ * exists.
+ */
+function resolveProjectDir(root: string, name: string): string | null {
+  const rootDir = path.join(root, name);
+  if (fs.existsSync(rootDir)) return rootDir;
+  const srcDir = path.join(root, "src", name);
+  if (fs.existsSync(srcDir)) return srcDir;
+  return null;
 }
 
 /**
- * Detect .mdx files in the project's app/ or pages/ directory,
- * or `pageExtensions` including "mdx" in next.config.
+ * Recursively walk `dir` once, evaluating the requested detection predicates
+ * per entry. Each flag short-circuits independently: an `.mdx` file sets `mdx`;
+ * a scannable source file containing `export const revalidate` sets `isr`. The
+ * walk stops as soon as every requested flag is satisfied, so callers that only
+ * want one signal don't pay for the other.
+ *
+ * Replaces the previous pair of single-purpose recursive walkers
+ * (`scanDirForPattern` + `scanDirForExtension`) that traversed the same tree
+ * twice. Detection semantics are unchanged: same dirs skipped (dotfiles,
+ * node_modules), same extension and content tests.
  */
-function detectMDX(root: string, isAppRouter: boolean, hasPages: boolean): boolean {
-  // Check next.config for pageExtensions with mdx
+function scanTreeForDetection(
+  dir: string,
+  want: { isr: boolean; mdx: boolean },
+): { isr: boolean; mdx: boolean } {
+  const found = { isr: false, mdx: false };
+
+  const walk = (current: string): void => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(current, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      // Stop early once every requested flag is satisfied.
+      if ((!want.isr || found.isr) && (!want.mdx || found.mdx)) return;
+
+      const fullPath = path.join(current, entry.name);
+      if (entry.isDirectory()) {
+        if (entry.name.startsWith(".") || entry.name === "node_modules") continue;
+        walk(fullPath);
+      } else if (entry.isFile()) {
+        if (want.mdx && !found.mdx && entry.name.endsWith(".mdx")) {
+          found.mdx = true;
+        }
+        if (want.isr && !found.isr && ISR_SCANNABLE_EXTENSION.test(entry.name)) {
+          try {
+            if (ISR_REVALIDATE_PATTERN.test(fs.readFileSync(fullPath, "utf-8"))) {
+              found.isr = true;
+            }
+          } catch {
+            // skip unreadable files
+          }
+        }
+      }
+    }
+  };
+
+  walk(dir);
+  return found;
+}
+
+/**
+ * Detect MDX usage declared in next.config (`pageExtensions` including "mdx" or
+ * an `@next/mdx` import). Filesystem `.mdx` detection is handled separately by
+ * the shared app/pages tree walk in `detectProject`.
+ */
+function detectMDXFromConfig(root: string): boolean {
   // Mirror the Next.js-compatible set in shims/constants.ts. We accept
   // `.cjs` and `.cts` defensively in case a user has them — Next.js itself
   // does not, but `findNextConfigPath` will only return the first match in
@@ -331,39 +389,6 @@ function detectMDX(root: string, isAppRouter: boolean, hasPages: boolean): boole
       }
     }
   }
-
-  // Check for .mdx files in app/ or pages/ (with src/ fallback)
-  const dirs: string[] = [];
-  if (isAppRouter) {
-    const appDir = fs.existsSync(path.join(root, "app"))
-      ? path.join(root, "app")
-      : path.join(root, "src", "app");
-    dirs.push(appDir);
-  }
-  if (hasPages) {
-    const pagesDir = fs.existsSync(path.join(root, "pages"))
-      ? path.join(root, "pages")
-      : path.join(root, "src", "pages");
-    dirs.push(pagesDir);
-  }
-
-  for (const dir of dirs) {
-    if (fs.existsSync(dir) && scanDirForExtension(dir, ".mdx")) return true;
-  }
-
-  return false;
-}
-
-function scanDirForExtension(dir: string, ext: string): boolean {
-  const entries = fs.readdirSync(dir, { withFileTypes: true });
-  for (const entry of entries) {
-    const fullPath = path.join(dir, entry.name);
-    if (entry.isDirectory() && !entry.name.startsWith(".") && entry.name !== "node_modules") {
-      if (scanDirForExtension(fullPath, ext)) return true;
-    } else if (entry.isFile() && entry.name.endsWith(ext)) {
-      return true;
-    }
-  }
   return false;
 }
 
@@ -377,19 +402,12 @@ const NATIVE_MODULES_TO_STUB = [
 ];
 
 /**
- * Detect native Node modules in dependencies that need stubbing for Workers.
+ * Detect native Node modules in the project's merged dependency map that need
+ * stubbing for Workers. Accepts the already-built `allDeps` (dependencies +
+ * devDependencies) so package.json is not re-read or re-parsed.
  */
-function detectNativeModules(root: string): string[] {
-  const pkgPath = path.join(root, "package.json");
-  if (!fs.existsSync(pkgPath)) return [];
-
-  try {
-    const pkg = JSON.parse(fs.readFileSync(pkgPath, "utf-8"));
-    const allDeps = { ...pkg.dependencies, ...pkg.devDependencies };
-    return NATIVE_MODULES_TO_STUB.filter((mod) => mod in allDeps);
-  } catch {
-    return [];
-  }
+function detectNativeModules(allDeps: Record<string, unknown>): string[] {
+  return NATIVE_MODULES_TO_STUB.filter((mod) => mod in allDeps);
 }
 
 // ─── Project Preparation (pre-build transforms) ─────────────────────────────

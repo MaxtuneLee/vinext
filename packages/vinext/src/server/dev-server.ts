@@ -413,7 +413,7 @@ export function createSSRHandler(
   const matcher = fileMatcher ?? createValidFileMatcher();
 
   // Page route patterns in Next.js bracket format, sorted by specificity
-  // (compareRoutes via pagesRouter). Mirrors the production client entry's
+  // (sortRoutes via pagesRouter). Mirrors the production client entry's
   // `window.__VINEXT_PAGE_PATTERNS__ = Object.keys(pageLoaders)` so the
   // `next/navigation` compat hooks (resolvePagesRoutePatternForPath in
   // shims/router.ts) can resolve a dynamic pattern from a resolved path in

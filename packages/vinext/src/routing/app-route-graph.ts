@@ -7,7 +7,7 @@
 import path from "node:path";
 import fs from "node:fs";
 import { createHash } from "node:crypto";
-import { compareRoutes, decodeRouteSegment, isInvisibleSegment } from "./utils.js";
+import { decodeRouteSegment, isInvisibleSegment, sortRoutes } from "./utils.js";
 import { findFileWithExts, scanWithExtensions, type ValidFileMatcher } from "./file-matcher.js";
 import { validateRoutePatterns } from "./route-validation.js";
 import { compareStrings } from "../utils/compare.js";
@@ -883,6 +883,16 @@ export async function buildAppRouteGraph(
   // See https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/router/utils/interception-routes.ts
   const routes: AppRouteGraphRoute[] = [];
 
+  // Per-scan matcher clone used as the cache key for `findFileProbeCache` (and,
+  // transitively, the slot-subpage cache). Cloning gives every scan a fresh
+  // key, so the convention-file probe memo is scoped to exactly this
+  // `buildAppRouteGraph` call: it captures the heavy cross-route re-probing of
+  // shared ancestor directories, then becomes unreachable when the scan returns.
+  // The clone carries the same extensions/regexes/methods, so probe and scan
+  // results are identical to using `matcher` directly.
+  const scanMatcher: ValidFileMatcher = { ...matcher };
+  findFileProbeCache.set(scanMatcher, new Map());
+
   const excludeDir = (name: string) =>
     (name.startsWith("@") && name !== "@children") ||
     name.startsWith("_") ||
@@ -890,14 +900,24 @@ export async function buildAppRouteGraph(
 
   // Process page files in a single pass
   // Use function form of exclude for Node < 22.14 compatibility (string arrays require >= 22.14)
-  for await (const file of scanWithExtensions("**/page", appDir, matcher.extensions, excludeDir)) {
-    const route = fileToAppRoute(file, appDir, "page", matcher);
+  for await (const file of scanWithExtensions(
+    "**/page",
+    appDir,
+    scanMatcher.extensions,
+    excludeDir,
+  )) {
+    const route = fileToAppRoute(file, appDir, "page", scanMatcher);
     if (route) routes.push(route);
   }
 
   // Process route handler files (API routes) in a single pass
-  for await (const file of scanWithExtensions("**/route", appDir, matcher.extensions, excludeDir)) {
-    const route = fileToAppRoute(file, appDir, "route", matcher);
+  for await (const file of scanWithExtensions(
+    "**/route",
+    appDir,
+    scanMatcher.extensions,
+    excludeDir,
+  )) {
+    const route = fileToAppRoute(file, appDir, "route", scanMatcher);
     if (route) routes.push(route);
   }
 
@@ -914,15 +934,15 @@ export async function buildAppRouteGraph(
   for await (const file of scanWithExtensions(
     "**/layout",
     appDir,
-    matcher.extensions,
+    scanMatcher.extensions,
     excludeDir,
   )) {
     const dir = path.dirname(file);
     const routeDir = dir === "." ? appDir : path.join(appDir, dir);
     if (!hasParallelSlotDirectory(routeDir)) continue;
-    if (discoverParallelSlots(routeDir, appDir, matcher).length === 0) continue;
+    if (discoverParallelSlots(routeDir, appDir, scanMatcher).length === 0) continue;
 
-    const route = directoryToAppRoute(dir, appDir, matcher, null, null);
+    const route = directoryToAppRoute(dir, appDir, scanMatcher, null, null);
     if (!route) continue;
     if (routePatterns.has(route.pattern)) {
       ghostParentRoutes.push(route);
@@ -937,11 +957,11 @@ export async function buildAppRouteGraph(
   // In Next.js, pages nested inside @slot directories create additional URL routes.
   // For example, @audience/demographics/page.tsx at app/parallel-routes/ creates
   // a route at /parallel-routes/demographics.
-  const slotSubRoutes = discoverSlotSubRoutes(routes, matcher, ghostParentRoutes);
+  const slotSubRoutes = discoverSlotSubRoutes(routes, scanMatcher, ghostParentRoutes);
   routes.push(...slotSubRoutes);
 
   // Discover sibling-style interception markers (markers not inside an @slot directory).
-  discoverSiblingInterceptingRoutes(routes, appDir, matcher);
+  discoverSiblingInterceptingRoutes(routes, appDir, scanMatcher);
 
   validatePageRouteConflicts(routes, appDir);
   validateRoutePatterns(routes.map((route) => route.pattern));
@@ -958,7 +978,7 @@ export async function buildAppRouteGraph(
   validateRoutePatterns(interceptTargetPatterns);
 
   // Sort: static routes first, then dynamic, then catch-all
-  routes.sort(compareRoutes);
+  sortRoutes(routes);
 
   return { routes, routeManifest: createRouteManifest(routes) };
 }
@@ -1261,14 +1281,14 @@ function discoverSlotSubRoutes(
  */
 type SlotSubPageEntry = { relativePath: string; pagePath: string };
 
-// Per-build memo: a slot directory's sub-pages depend only on the directory
+// Per-scan memo: a slot directory's sub-pages depend only on the directory
 // contents and the matcher's accepted extensions. Inherited slots get scanned
 // once per descendant route, so without memoization a route N segments deep
 // pays O(N) full subtree walks for every shared ancestor slot.
 //
-// Keyed by matcher (one matcher per build) so the cache is naturally scoped
-// to a single build run and gets collected when the build finishes — no
-// cross-build pollution in long-lived dev servers.
+// Keyed by the per-scan matcher clone that `buildAppRouteGraph` registers, so
+// the cache is naturally scoped to a single scan and gets collected when the
+// scan finishes — no cross-scan pollution in long-lived dev servers.
 const findSlotSubPagesCache = new WeakMap<ValidFileMatcher, Map<string, SlotSubPageEntry[]>>();
 
 function findSlotSubPages(slotDir: string, matcher: ValidFileMatcher): SlotSubPageEntry[] {
@@ -2558,10 +2578,43 @@ function markerForInterceptionConvention(convention: string): string {
 }
 
 /**
- * Find a file by name (without extension) in a directory.
- * Checks configured pageExtensions.
+ * Scan-scoped cache of convention-file probes, keyed by the per-scan matcher
+ * created in `buildAppRouteGraph`. A single scan walks the appDir→leaf chain
+ * separately for every route (layouts, templates, errors, boundaries, slots),
+ * so shared ancestor directories — the `app/` root above all — get re-probed
+ * once per descendant route. The probe result is deterministic within one scan
+ * (the filesystem does not change mid-build), so memoizing it removes the
+ * dominant cross-route redundancy.
+ *
+ * Keyed by matcher so the cache lifetime is exactly one `buildAppRouteGraph`
+ * call: the scan registers a fresh matcher clone, and the entry is unreachable
+ * (and GC-eligible) once the scan returns. A fresh key per scan is also what
+ * makes this concurrency-safe — overlapping builds never share probe state.
  */
-const findFile = findFileWithExts;
+const findFileProbeCache = new WeakMap<ValidFileMatcher, Map<string, string | null>>();
+
+/**
+ * Find a file by name (without extension) in a directory, checking configured
+ * pageExtensions. Memoizes through `findFileProbeCache` when the matcher has a
+ * registered per-scan cache; otherwise falls back to a direct probe (identical
+ * result). The `null` "not found" outcome is cached too, so repeated misses on
+ * shared ancestors cost a single set of `existsSync` calls per scan.
+ */
+function findFile(dir: string, name: string, matcher: ValidFileMatcher): string | null {
+  const cache = findFileProbeCache.get(matcher);
+  if (!cache) return findFileWithExts(dir, name, matcher);
+
+  const key = `${dir}\0${name}`;
+  // `findFileWithExts` returns `string | null`, so a stored miss reads back as
+  // `null` (not `undefined`). Only a genuinely absent key yields `undefined`,
+  // which is what distinguishes a cache miss from a cached not-found result.
+  const cached = cache.get(key);
+  if (cached !== undefined) return cached;
+
+  const result = findFileWithExts(dir, name, matcher);
+  cache.set(key, result);
+  return result;
+}
 
 /**
  * Convert filesystem path segments to URL route parts, skipping invisible segments

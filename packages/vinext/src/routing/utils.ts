@@ -72,14 +72,29 @@ function routePrecedence(pattern: string): number {
 }
 
 /**
- * Sort comparator for routes — lower precedence score sorts first (higher priority).
- * Lexicographic tiebreaker on pattern for determinism.
+ * Sort routes by precedence — lower score sorts first (higher priority), with a
+ * lexicographic tiebreaker on the pattern for determinism. Sorts in place and
+ * returns the same array (mirrors `Array.prototype.sort`).
  *
- * Usage: routes.sort(compareRoutes)
+ * `routePrecedence` is a pure function of the pattern, so each pattern's score
+ * is computed exactly once up front (decorate-sort) instead of ~2·log n times
+ * by a comparator that re-parses on every comparison. The `localeCompare`
+ * tiebreaker already guarantees a total order, so the result is byte-identical
+ * to comparing precedence inline.
+ *
+ * Usage: sortRoutes(routes)
  */
-export function compareRoutes<T extends { pattern: string }>(a: T, b: T): number {
-  const diff = routePrecedence(a.pattern) - routePrecedence(b.pattern);
-  return diff !== 0 ? diff : a.pattern.localeCompare(b.pattern);
+export function sortRoutes<T extends { pattern: string }>(routes: T[]): T[] {
+  const scores = new Map<string, number>();
+  for (const route of routes) {
+    if (!scores.has(route.pattern)) {
+      scores.set(route.pattern, routePrecedence(route.pattern));
+    }
+  }
+  return routes.sort((a, b) => {
+    const diff = (scores.get(a.pattern) ?? 0) - (scores.get(b.pattern) ?? 0);
+    return diff !== 0 ? diff : a.pattern.localeCompare(b.pattern);
+  });
 }
 
 // Matches literal delimiter characters and their percent-encoded equivalents.
