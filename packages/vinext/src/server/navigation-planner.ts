@@ -1412,10 +1412,127 @@ function planNavigation(input: NavigationPlannerInput): NavigationDecisionV0 {
   }
 }
 
+export type ServerActionResultFactsV0 = {
+  actionRedirectHref: string | null;
+  actionRedirectType: "push" | "replace";
+  clientCompatibilityId: string | null;
+  compatibilityIdHeader: string | null;
+  currentHref: string;
+  isRscContentType: boolean;
+  origin: string;
+  responseUrl: string | null;
+};
+
+export type ServerActionResultDecisionV0 =
+  | { kind: "proceed"; trace: NavigationTrace }
+  | {
+      kind: "hardNavigate";
+      url: string;
+      historyMode?: "assign" | "replace";
+      clearClientNavigationCaches: boolean;
+      reason: "serverActionRedirectCompatibilityMismatch" | "serverActionRscCompatibilityMismatch";
+      trace: NavigationTrace;
+    };
+
+export type RscNavigationErrorFactsV0 = {
+  currentHref: string;
+};
+
+export type RscNavigationErrorDecisionV0 = {
+  kind: "hardNavigate";
+  url: string;
+  reason: "rscNavigationError";
+  trace: NavigationTrace;
+};
+
+function classifyServerActionResult(
+  facts: ServerActionResultFactsV0,
+): ServerActionResultDecisionV0 {
+  // A client without a compatibility id cannot prove skew.
+  if (facts.clientCompatibilityId === null) {
+    return {
+      kind: "proceed",
+      trace: createNavigationTrace(NavigationTraceReasonCodes.proceedToCommit, {}),
+    };
+  }
+
+  // Non-RSC action responses are not subject to the cache-busting compatibility
+  // check; the executor will handle them directly.
+  if (!facts.isRscContentType) {
+    return {
+      kind: "proceed",
+      trace: createNavigationTrace(NavigationTraceReasonCodes.proceedToCommit, {}),
+    };
+  }
+
+  const compatibilityDecision = resolveRscCompatibilityNavigationDecision({
+    clientCompatibilityId: facts.clientCompatibilityId,
+    currentHref: facts.currentHref,
+    origin: facts.origin,
+    responseCompatibilityId: facts.compatibilityIdHeader,
+    responseUrl: facts.responseUrl,
+  });
+
+  if (compatibilityDecision.kind === "compatible") {
+    return {
+      kind: "proceed",
+      trace: createNavigationTrace(NavigationTraceReasonCodes.proceedToCommit, {}),
+    };
+  }
+
+  // compatibilityDecision.hardNavigationTarget (derived from responseUrl with _rsc stripped)
+  // is intentionally not used here. For server actions, responseUrl is the action endpoint URL,
+  // not the page URL the user should land on. The authoritative destinations are actionRedirectHref
+  // (explicit redirect) and currentHref (reload in place) — both are set below.
+
+  if (facts.actionRedirectHref !== null) {
+    return {
+      kind: "hardNavigate",
+      url: facts.actionRedirectHref,
+      historyMode: facts.actionRedirectType === "push" ? "assign" : "replace",
+      clearClientNavigationCaches: true,
+      reason: "serverActionRedirectCompatibilityMismatch",
+      trace: createNavigationTrace(
+        NavigationTraceReasonCodes.serverActionRedirectCompatibilityMismatch,
+        { targetHref: facts.actionRedirectHref },
+      ),
+    };
+  }
+
+  // For a no-redirect RSC response, the executor should reload the current
+  // document so the user stays on the same URL (including search params).
+  const targetUrl = facts.currentHref;
+
+  return {
+    kind: "hardNavigate",
+    url: targetUrl,
+    clearClientNavigationCaches: false,
+    reason: "serverActionRscCompatibilityMismatch",
+    trace: createNavigationTrace(NavigationTraceReasonCodes.serverActionRscCompatibilityMismatch, {
+      targetHref: targetUrl,
+    }),
+  };
+}
+
+function classifyRscNavigationError(
+  facts: RscNavigationErrorFactsV0,
+): RscNavigationErrorDecisionV0 {
+  return {
+    kind: "hardNavigate",
+    url: facts.currentHref,
+    reason: "rscNavigationError",
+    trace: createNavigationTrace(NavigationTraceReasonCodes.rscNavigationError, {
+      targetHref: facts.currentHref,
+    }),
+  };
+}
+
 export const navigationPlanner = {
   classifyEarlyNavigationIntent,
   classifyRscFetchResult,
+  classifyRscNavigationError,
   classifyRootBoundaryTransition,
+  classifyServerActionResult,
   plan: planNavigation,
   resolveCurrentRootBoundaryElementPersistence,
   resolveMountedParallelSlotPersistence,

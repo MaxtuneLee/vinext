@@ -87,16 +87,16 @@ import {
 import {
   createDiscardedServerActionRefreshScheduler,
   createServerActionInitiationSnapshot,
+  createServerActionResultFacts,
   isServerActionResult,
   normalizeServerActionThrownValue,
   parseServerActionRevalidationHeader,
   readInvalidServerActionResponseError,
-  resolveServerActionRedirectCompatibilityHardNavigationTarget,
-  shouldCheckRscCompatibilityForServerActionResponse,
   shouldClearClientNavigationCachesForServerActionResult,
   type ServerActionRevalidationKind,
   type AppBrowserServerActionResult,
 } from "./app-browser-action-result.js";
+import { applyServerActionResultDecision } from "./app-browser-server-action-navigation.js";
 import {
   consumeInitialFormState,
   createVinextHydrateRootOptions,
@@ -154,7 +154,6 @@ import {
   createRscRequestUrl,
   createServerActionRequestUrl,
   getVinextRscCompatibilityId,
-  resolveRscCompatibilityNavigationDecision,
   VINEXT_RSC_COMPATIBILITY_ID_HEADER,
   VINEXT_RSC_CONTENT_TYPE,
 } from "./app-rsc-cache-busting.js";
@@ -1390,33 +1389,25 @@ function registerServerActionCallback(): void {
       return undefined;
     }
 
-    const actionRedirectCompatibilityHardNavigationTarget =
-      resolveServerActionRedirectCompatibilityHardNavigationTarget({
-        actionRedirectHref: actionRedirectTarget?.href ?? null,
-        clientCompatibilityId: CLIENT_RSC_COMPATIBILITY_ID,
-        response: fetchResponse,
-      });
-    if (actionRedirectCompatibilityHardNavigationTarget) {
-      clearClientNavigationCaches();
-      browserNavigationController.performHardNavigation(
-        actionRedirectCompatibilityHardNavigationTarget,
-        actionRedirectTarget?.type === "push" ? "assign" : "replace",
-      );
-      return undefined;
-    }
-
+    const actionResultFacts = createServerActionResultFacts({
+      actionRedirectHref: actionRedirectTarget?.href ?? null,
+      actionRedirectType: actionRedirectTarget?.type ?? null,
+      clientCompatibilityId: CLIENT_RSC_COMPATIBILITY_ID,
+      compatibilityIdHeader: fetchResponse.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
+      contentTypeHeader: fetchResponse.headers.get("content-type"),
+      currentHref: actionInitiation.href,
+      origin: window.location.origin,
+      responseUrl: fetchResponse.url,
+    });
+    const fetchResponseIsRsc = actionResultFacts.isRscContentType;
+    const actionResultDecision = navigationPlanner.classifyServerActionResult(actionResultFacts);
     if (
-      !actionRedirectTarget &&
-      shouldCheckRscCompatibilityForServerActionResponse(fetchResponse) &&
-      resolveRscCompatibilityNavigationDecision({
-        clientCompatibilityId: CLIENT_RSC_COMPATIBILITY_ID,
-        currentHref: actionInitiation.href,
-        origin: window.location.origin,
-        responseCompatibilityId: fetchResponse.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
-        responseUrl: fetchResponse.url,
-      }).kind === "hard-navigate"
+      applyServerActionResultDecision(
+        actionResultDecision,
+        clearClientNavigationCaches,
+        (url, historyMode) => browserNavigationController.performHardNavigation(url, historyMode),
+      )
     ) {
-      browserNavigationController.performHardNavigation(actionInitiation.href);
       return undefined;
     }
 
@@ -1435,10 +1426,7 @@ function registerServerActionCallback(): void {
     if (invalidResponseError) {
       throw invalidResponseError;
     }
-    if (
-      actionRedirectTarget &&
-      !shouldCheckRscCompatibilityForServerActionResponse(fetchResponse)
-    ) {
+    if (actionRedirectTarget && !fetchResponseIsRsc) {
       browserNavigationController.performHardNavigation(actionRedirectTarget.href);
       return undefined;
     }
@@ -2089,7 +2077,10 @@ function bootstrapHydration(rscStream: ReadableStream<Uint8Array>): void {
       if (!isPageUnloading) {
         console.error("[vinext] RSC navigation error:", error);
       }
-      performHardNavigationForScrollIntent(currentHref);
+      const errorDecision = navigationPlanner.classifyRscNavigationError({
+        currentHref,
+      });
+      performHardNavigationForScrollIntent(errorDecision.url);
     } finally {
       // Single settlement site: covers normal return, early returns on stale-id
       // checks, and error paths. The finally runs even when the catch returns.

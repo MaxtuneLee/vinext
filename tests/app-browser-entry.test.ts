@@ -4,14 +4,14 @@ import {
   createOnUncaughtError,
   prodOnCaughtError,
 } from "../packages/vinext/src/server/app-browser-error.js";
+import { applyServerActionResultDecision } from "../packages/vinext/src/server/app-browser-server-action-navigation.js";
 import {
   createDiscardedServerActionRefreshScheduler,
   createServerActionInitiationSnapshot,
+  createServerActionResultFacts,
   normalizeServerActionThrownValue,
   parseServerActionRevalidationHeader,
   readInvalidServerActionResponseError,
-  resolveServerActionRedirectCompatibilityHardNavigationTarget,
-  shouldCheckRscCompatibilityForServerActionResponse,
   shouldClearClientNavigationCachesForServerActionResult,
   shouldScheduleRefreshForDiscardedServerAction,
 } from "../packages/vinext/src/server/app-browser-action-result.js";
@@ -112,9 +112,12 @@ import {
   NavigationTraceTransactionCodes,
   createNavigationTrace,
 } from "../packages/vinext/src/server/navigation-trace.js";
+import { navigationPlanner } from "../packages/vinext/src/server/navigation-planner.js";
 import { createCacheEntryReuseProof } from "../packages/vinext/src/server/cache-proof.js";
 import {
   ACTION_REVALIDATED_HEADER,
+  ACTION_REDIRECT_HEADER,
+  ACTION_REDIRECT_TYPE_HEADER,
   VINEXT_MOUNTED_SLOTS_HEADER,
   VINEXT_PARAMS_HEADER,
 } from "../packages/vinext/src/server/headers.js";
@@ -763,33 +766,63 @@ describe("app browser entry navigation scheduling", () => {
     ).toEqual({ kind: "compatible" });
   });
 
-  it("does not classify non-Flight action HTTP errors as RSC compatibility failures", () => {
-    // Ported from Next.js: test/e2e/app-dir/actions/app-action.test.ts
-    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/actions/app-action.test.ts
-    expect(
-      shouldCheckRscCompatibilityForServerActionResponse(
-        new Response("Custom error!", {
-          headers: { "content-type": "text/plain" },
-          status: 500,
-        }),
-      ),
-    ).toBe(false);
-    expect(
-      shouldCheckRscCompatibilityForServerActionResponse(
-        new Response(JSON.stringify({ error: "Custom error!" }), {
-          headers: { "content-type": "application/json" },
-          status: 500,
-        }),
-      ),
-    ).toBe(false);
-    expect(
-      shouldCheckRscCompatibilityForServerActionResponse(
-        new Response("flight", {
-          headers: { "content-type": "text/x-component" },
-          status: 200,
-        }),
-      ),
-    ).toBe(true);
+  it("createServerActionResultFacts normalises raw response data into planner facts", () => {
+    const currentHref = "https://example.com/current";
+
+    // RSC redirect with push type
+    const pushFacts = createServerActionResultFacts({
+      actionRedirectHref: "https://example.com/target",
+      actionRedirectType: "push",
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: "server-build",
+      contentTypeHeader: "text/x-component",
+      currentHref,
+      origin: "https://example.com",
+      responseUrl: currentHref,
+    });
+    expect(pushFacts.actionRedirectHref).toBe("https://example.com/target");
+    expect(pushFacts.actionRedirectType).toBe("push");
+    expect(pushFacts.isRscContentType).toBe(true);
+
+    // RSC redirect with unknown type normalises to replace
+    const replaceFacts = createServerActionResultFacts({
+      actionRedirectHref: "https://example.com/target",
+      actionRedirectType: "unknown",
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: "server-build",
+      contentTypeHeader: "text/x-component",
+      currentHref,
+      origin: "https://example.com",
+      responseUrl: currentHref,
+    });
+    expect(replaceFacts.actionRedirectType).toBe("replace");
+
+    // No redirect — the raw type is still normalized for the planner contract
+    const noRedirectFacts = createServerActionResultFacts({
+      actionRedirectHref: null,
+      actionRedirectType: null,
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: "server-build",
+      contentTypeHeader: "text/x-component",
+      currentHref,
+      origin: "https://example.com",
+      responseUrl: currentHref,
+    });
+    expect(noRedirectFacts.actionRedirectHref).toBeNull();
+    expect(noRedirectFacts.actionRedirectType).toBe("replace");
+
+    // Non-RSC response — isRscContentType should be false
+    const nonRscFacts = createServerActionResultFacts({
+      actionRedirectHref: null,
+      actionRedirectType: null,
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: "server-build",
+      contentTypeHeader: "text/plain",
+      currentHref,
+      origin: "https://example.com",
+      responseUrl: currentHref,
+    });
+    expect(nonRscFacts.isRscContentType).toBe(false);
   });
 
   it("creates replayable cached RSC snapshots with compatibility IDs", async () => {
@@ -873,34 +906,202 @@ describe("app browser entry navigation scheduling", () => {
     expect(error?.message).toBe("Custom error!");
   });
 
-  it("hard-navigates incompatible RSC action redirect responses to the redirect target", () => {
-    const target = resolveServerActionRedirectCompatibilityHardNavigationTarget({
-      actionRedirectHref: "https://example.com/target",
-      clientCompatibilityId: "client-build",
-      response: new Response("flight", {
-        headers: {
-          "content-type": "text/x-component",
-          [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "server-build",
-        },
-      }),
-    });
+  it("applyServerActionResultDecision clears caches and hard-navigates for a redirect mismatch", () => {
+    // Executor regression: verifies the wiring between classifyServerActionResult output and
+    // the executor's performHardNavigation + clearClientNavigationCaches dispatch.
+    const clearCaches = vi.fn();
+    const performHardNavigation = vi.fn();
 
-    expect(target).toBe("https://example.com/target");
+    // push redirect with an incompatible build — executor should hard-navigate and clear caches
+    const pushDecision = navigationPlanner.classifyServerActionResult({
+      actionRedirectHref: "https://example.com/target?tab=1",
+      actionRedirectType: "push",
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: "server-build",
+      currentHref: "https://example.com/current",
+      isRscContentType: true,
+      origin: "https://example.com",
+      responseUrl: "https://example.com/current",
+    });
+    expect(applyServerActionResultDecision(pushDecision, clearCaches, performHardNavigation)).toBe(
+      true,
+    );
+    expect(clearCaches).toHaveBeenCalledOnce();
+    expect(performHardNavigation).toHaveBeenCalledWith(
+      "https://example.com/target?tab=1",
+      "assign",
+    );
+
+    clearCaches.mockClear();
+    performHardNavigation.mockClear();
+
+    // replace redirect with an incompatible build — executor should use replace history mode
+    const replaceDecision = navigationPlanner.classifyServerActionResult({
+      actionRedirectHref: "https://example.com/replaced",
+      actionRedirectType: "replace",
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: "server-build",
+      currentHref: "https://example.com/current",
+      isRscContentType: true,
+      origin: "https://example.com",
+      responseUrl: "https://example.com/current",
+    });
+    expect(
+      applyServerActionResultDecision(replaceDecision, clearCaches, performHardNavigation),
+    ).toBe(true);
+    expect(performHardNavigation).toHaveBeenCalledWith("https://example.com/replaced", "replace");
+
+    clearCaches.mockClear();
+    performHardNavigation.mockClear();
+
+    // no-redirect RSC mismatch — executor reloads current href, does NOT clear caches
+    const noRedirectDecision = navigationPlanner.classifyServerActionResult({
+      actionRedirectHref: null,
+      actionRedirectType: "replace",
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: "server-build",
+      currentHref: "https://example.com/dashboard?view=grid",
+      isRscContentType: true,
+      origin: "https://example.com",
+      responseUrl: "https://example.com/dashboard?view=grid",
+    });
+    expect(
+      applyServerActionResultDecision(noRedirectDecision, clearCaches, performHardNavigation),
+    ).toBe(true);
+    expect(clearCaches).not.toHaveBeenCalled();
+    expect(performHardNavigation).toHaveBeenCalledWith(
+      "https://example.com/dashboard?view=grid",
+      undefined,
+    );
+
+    clearCaches.mockClear();
+    performHardNavigation.mockClear();
+
+    // compatible build — executor should proceed, not hard-navigate
+    const proceedDecision = navigationPlanner.classifyServerActionResult({
+      actionRedirectHref: "https://example.com/target",
+      actionRedirectType: "push",
+      clientCompatibilityId: "same-build",
+      compatibilityIdHeader: "same-build",
+      currentHref: "https://example.com/current",
+      isRscContentType: true,
+      origin: "https://example.com",
+      responseUrl: "https://example.com/current",
+    });
+    expect(
+      applyServerActionResultDecision(proceedDecision, clearCaches, performHardNavigation),
+    ).toBe(false);
+    expect(clearCaches).not.toHaveBeenCalled();
+    expect(performHardNavigation).not.toHaveBeenCalled();
   });
 
-  it("does not hard-navigate compatible RSC action redirect responses", () => {
-    const target = resolveServerActionRedirectCompatibilityHardNavigationTarget({
-      actionRedirectHref: "https://example.com/target",
-      clientCompatibilityId: "same-build",
-      response: new Response("flight", {
-        headers: {
-          "content-type": "text/x-component",
-          [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "same-build",
-        },
-      }),
-    });
+  it("wiring: createServerActionResultFacts + classifyServerActionResult end-to-end", () => {
+    // Regression for the browser-entry seam: production derives facts via
+    // createServerActionResultFacts and passes them to the planner. This test
+    // exercises the real helper against synthetic responses so the seam cannot
+    // drift out of sync.
+    const currentHref = "https://example.com/current";
+    const origin = "https://example.com";
 
-    expect(target).toBeNull();
+    // Incompatible RSC action redirect — mimics the headers a real server would return.
+    const redirectResponse = new Response("flight", {
+      headers: {
+        "content-type": "text/x-component",
+        [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "server-build",
+        [ACTION_REDIRECT_HEADER]: "https://example.com/target",
+        [ACTION_REDIRECT_TYPE_HEADER]: "push",
+      },
+    });
+    const pushFacts = createServerActionResultFacts({
+      actionRedirectHref: redirectResponse.headers.get(ACTION_REDIRECT_HEADER),
+      actionRedirectType: redirectResponse.headers.get(ACTION_REDIRECT_TYPE_HEADER),
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: redirectResponse.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
+      contentTypeHeader: redirectResponse.headers.get("content-type"),
+      currentHref,
+      origin,
+      responseUrl: currentHref,
+    });
+    const pushDecision = navigationPlanner.classifyServerActionResult(pushFacts);
+    expect(pushDecision.kind).toBe("hardNavigate");
+    if (pushDecision.kind === "hardNavigate") {
+      expect(pushDecision.url).toBe("https://example.com/target");
+      expect(pushDecision.historyMode).toBe("assign");
+      expect(pushDecision.clearClientNavigationCaches).toBe(true);
+      expect(pushDecision.reason).toBe("serverActionRedirectCompatibilityMismatch");
+    }
+
+    // Non-standard redirect type (e.g. misspelled header) should normalise to "replace".
+    const weirdRedirectResponse = new Response("flight", {
+      headers: {
+        "content-type": "text/x-component",
+        [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "server-build",
+        [ACTION_REDIRECT_HEADER]: "https://example.com/target",
+        [ACTION_REDIRECT_TYPE_HEADER]: "unknown",
+      },
+    });
+    const weirdFacts = createServerActionResultFacts({
+      actionRedirectHref: weirdRedirectResponse.headers.get(ACTION_REDIRECT_HEADER),
+      actionRedirectType: weirdRedirectResponse.headers.get(ACTION_REDIRECT_TYPE_HEADER),
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: weirdRedirectResponse.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
+      contentTypeHeader: weirdRedirectResponse.headers.get("content-type"),
+      currentHref,
+      origin,
+      responseUrl: currentHref,
+    });
+    const weirdDecision = navigationPlanner.classifyServerActionResult(weirdFacts);
+    expect(weirdDecision.kind).toBe("hardNavigate");
+    if (weirdDecision.kind === "hardNavigate") {
+      expect(weirdDecision.url).toBe("https://example.com/target");
+      expect(weirdDecision.historyMode).toBe("replace");
+      expect(weirdDecision.clearClientNavigationCaches).toBe(true);
+      expect(weirdDecision.reason).toBe("serverActionRedirectCompatibilityMismatch");
+    }
+
+    // No-redirect incompatible RSC response — should reload current href without clearing caches.
+    const noRedirectResponse = new Response("flight", {
+      headers: {
+        "content-type": "text/x-component",
+        [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "server-build",
+      },
+    });
+    const noRedirectFacts = createServerActionResultFacts({
+      actionRedirectHref: null,
+      actionRedirectType: null,
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: noRedirectResponse.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
+      contentTypeHeader: noRedirectResponse.headers.get("content-type"),
+      currentHref,
+      origin,
+      responseUrl: currentHref,
+    });
+    const noRedirectDecision = navigationPlanner.classifyServerActionResult(noRedirectFacts);
+    expect(noRedirectDecision.kind).toBe("hardNavigate");
+    if (noRedirectDecision.kind === "hardNavigate") {
+      expect(noRedirectDecision.url).toBe(currentHref);
+      expect(noRedirectDecision.clearClientNavigationCaches).toBe(false);
+      expect(noRedirectDecision.reason).toBe("serverActionRscCompatibilityMismatch");
+    }
+
+    // Non-RSC response should always proceed regardless of compatibility header.
+    const nonRscResponse = new Response(JSON.stringify({ ok: true }), {
+      headers: {
+        "content-type": "application/json",
+        [VINEXT_RSC_COMPATIBILITY_ID_HEADER]: "server-build",
+      },
+    });
+    const nonRscFacts = createServerActionResultFacts({
+      actionRedirectHref: null,
+      actionRedirectType: null,
+      clientCompatibilityId: "client-build",
+      compatibilityIdHeader: nonRscResponse.headers.get(VINEXT_RSC_COMPATIBILITY_ID_HEADER),
+      contentTypeHeader: nonRscResponse.headers.get("content-type"),
+      currentHref,
+      origin,
+      responseUrl: currentHref,
+    });
+    expect(navigationPlanner.classifyServerActionResult(nonRscFacts).kind).toBe("proceed");
   });
 
   it("uses a stable generic error for non-RSC action responses", async () => {
