@@ -254,6 +254,60 @@ export type EarlyNavigationIntentDecisionV0 =
       trace: NavigationTrace;
     };
 
+type NavigationReuseNavigationKind = "navigate" | "refresh" | "traverse";
+
+export type VisitedResponseCacheCandidateFactsV0 =
+  | {
+      candidate: "missing";
+      navigationKind: NavigationReuseNavigationKind;
+    }
+  | {
+      candidate: "present";
+      fresh: boolean;
+      mountedSlotsMatch: boolean;
+      navigationKind: NavigationReuseNavigationKind;
+    };
+
+type VisitedResponseCacheCandidateDecisionV0 =
+  | { kind: "miss" }
+  | {
+      kind: "evict";
+      reason: "mountedSlotsMismatch" | "refresh" | "stale";
+    }
+  | { kind: "reuse" };
+
+type NavigationReuseCandidateAvailability = { status: "available" } | { status: "unavailable" };
+type OptimisticRouteShellCandidateAvailability =
+  | { status: "available" }
+  | { status: "unavailable"; reason: "routeManifestMissing" };
+
+export type NavigationReuseFactsV0 = {
+  bypassNavigationCache: boolean;
+  navigationKind: NavigationReuseNavigationKind;
+  optimisticRouteShell: OptimisticRouteShellCandidateAvailability;
+  prefetch: NavigationReuseCandidateAvailability;
+  targetHref: string;
+  visitedResponse: NavigationReuseCandidateAvailability;
+};
+
+type FreshFetchReason = "cacheBypassed" | "cacheMiss" | "refresh" | "routeManifestMissing";
+
+export type NavigationReuseDecisionV0 =
+  | { kind: "reuseVisitedResponse"; trace: NavigationTrace }
+  | { kind: "consumePrefetch"; trace: NavigationTrace }
+  | { kind: "attemptOptimisticRouteShell"; trace: NavigationTrace }
+  | { kind: "fetchFresh"; reason: FreshFetchReason; trace: NavigationTrace };
+
+type NavigationPrefetchProbeFactsV0 = {
+  bypassNavigationCache: boolean;
+  navigationKind: NavigationReuseNavigationKind;
+  visitedResponse: NavigationReuseCandidateAvailability;
+};
+
+type NavigationPrefetchProbeDecisionV0 =
+  | { kind: "probe" }
+  | { kind: "skip"; reason: "cacheBypassed" | "refresh" | "visitedResponseAvailable" };
+
 export type NavigationPlannerInput = {
   // Graph-owned route topology is the semantic authority for root/layout/slot
   // decisions whenever the caller can supply it. Null keeps the legacy
@@ -599,6 +653,120 @@ function classifyEarlyNavigationIntent(
     kind: "flightNavigation",
     trace: createEarlyNavigationIntentTrace(NavigationTraceReasonCodes.crossDocumentFlight, facts),
   };
+}
+
+function classifyVisitedResponseCacheCandidate(
+  facts: VisitedResponseCacheCandidateFactsV0,
+): VisitedResponseCacheCandidateDecisionV0 {
+  if (facts.candidate === "missing") {
+    return { kind: "miss" };
+  }
+
+  if (!facts.mountedSlotsMatch) {
+    return {
+      kind: "evict",
+      reason: "mountedSlotsMismatch",
+    };
+  }
+
+  if (facts.navigationKind === "refresh") {
+    return {
+      kind: "evict",
+      reason: "refresh",
+    };
+  }
+
+  if (!facts.fresh) {
+    return {
+      kind: "evict",
+      reason: "stale",
+    };
+  }
+
+  return { kind: "reuse" };
+}
+
+function createNavigationReuseTrace(
+  code: NavigationTraceReasonCode,
+  facts: NavigationReuseFactsV0,
+  fields: NavigationTraceFields = {},
+): NavigationTrace {
+  return createNavigationTrace(code, {
+    eventKind: facts.navigationKind,
+    targetHref: facts.targetHref,
+    ...fields,
+  });
+}
+
+function createFreshFetchDecision(
+  facts: NavigationReuseFactsV0,
+  reason: FreshFetchReason,
+): NavigationReuseDecisionV0 {
+  return {
+    kind: "fetchFresh",
+    reason,
+    trace: createNavigationReuseTrace(NavigationTraceReasonCodes.fetchFresh, facts, {
+      freshFetchReason: reason,
+    }),
+  };
+}
+
+function classifyNavigationReuse(facts: NavigationReuseFactsV0): NavigationReuseDecisionV0 {
+  if (facts.navigationKind === "refresh") {
+    return createFreshFetchDecision(facts, "refresh");
+  }
+
+  if (!facts.bypassNavigationCache && facts.visitedResponse.status === "available") {
+    return {
+      kind: "reuseVisitedResponse",
+      trace: createNavigationReuseTrace(NavigationTraceReasonCodes.visitedResponseReuse, facts),
+    };
+  }
+
+  if (!facts.bypassNavigationCache && facts.prefetch.status === "available") {
+    return {
+      kind: "consumePrefetch",
+      trace: createNavigationReuseTrace(NavigationTraceReasonCodes.prefetchResponseReuse, facts),
+    };
+  }
+
+  if (facts.navigationKind === "navigate") {
+    if (facts.optimisticRouteShell.status === "available") {
+      return {
+        kind: "attemptOptimisticRouteShell",
+        trace: createNavigationReuseTrace(NavigationTraceReasonCodes.optimisticRouteShell, facts),
+      };
+    }
+
+    return createFreshFetchDecision(
+      facts,
+      facts.bypassNavigationCache ? "cacheBypassed" : facts.optimisticRouteShell.reason,
+    );
+  }
+
+  if (facts.bypassNavigationCache) {
+    return createFreshFetchDecision(facts, "cacheBypassed");
+  }
+
+  return createFreshFetchDecision(facts, "cacheMiss");
+}
+
+function classifyNavigationPrefetchProbe(
+  facts: NavigationPrefetchProbeFactsV0,
+): NavigationPrefetchProbeDecisionV0 {
+  if (facts.visitedResponse.status === "available") {
+    return { kind: "skip", reason: "visitedResponseAvailable" };
+  }
+
+  if (facts.navigationKind === "refresh") {
+    return { kind: "skip", reason: "refresh" };
+  }
+
+  if (facts.bypassNavigationCache) {
+    return { kind: "skip", reason: "cacheBypassed" };
+  }
+
+  return { kind: "probe" };
 }
 
 function createSnapshotRouteTopology(snapshot: RouteSnapshotV0): RouteTopologySnapshot {
@@ -1529,10 +1697,13 @@ function classifyRscNavigationError(
 
 export const navigationPlanner = {
   classifyEarlyNavigationIntent,
+  classifyNavigationPrefetchProbe,
+  classifyNavigationReuse,
   classifyRscFetchResult,
   classifyRscNavigationError,
   classifyRootBoundaryTransition,
   classifyServerActionResult,
+  classifyVisitedResponseCacheCandidate,
   plan: planNavigation,
   resolveCurrentRootBoundaryElementPersistence,
   resolveMountedParallelSlotPersistence,
