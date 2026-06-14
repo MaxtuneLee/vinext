@@ -952,12 +952,16 @@ describe("Pages Router entry template", () => {
     }
   });
 
-  it("keeps the Pages Router client tree shape stable after hydration", async () => {
-    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-client-entry-hydrated-"));
+  it("hydrates _app with the full Pages props envelope", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-client-entry-props-"));
     const pagesDir = path.join(tmpDir, "pages");
 
     try {
       fs.mkdirSync(pagesDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(pagesDir, "_app.tsx"),
+        "export default function App({ Component, pageProps }) { return <Component {...pageProps} />; }",
+      );
       fs.writeFileSync(
         path.join(pagesDir, "index.tsx"),
         "export default function Page() { return null; }",
@@ -969,9 +973,23 @@ describe("Pages Router entry template", () => {
         createValidFileMatcher(),
       );
 
+      expect(code).toContain(
+        'const props = nextData.props && typeof nextData.props === "object" ? nextData.props : {};',
+      );
+      expect(code).toContain("const rawPageProps = props.pageProps;");
+      expect(code).toContain(
+        'const pageProps = rawPageProps && typeof rawPageProps === "object" ? rawPageProps : {};',
+      );
+      expect(code).toContain('import Router, { wrapWithRouterContext } from "next/router";');
+      expect(code).toContain("router: Router,");
+      expect(code).toContain("pageProps: rawPageProps,");
+      expect(code).toContain("element = wrapWithRouterContext(element, resolveHydrationCommit);");
+      expect(code).toContain("await hydrationCommitted;");
+      expect(code).toContain("if (nextData.isFallback) {");
+      expect(code).toContain("await Router.replace(");
+      expect(code).toContain("{ _h: 1, scroll: false },");
       expect(code).not.toContain("function VinextHydrationMarker");
       expect(code).not.toContain("React.createElement(VinextHydrationMarker");
-      expect(code).toContain("element = wrapWithRouterContext(element);");
       expect(code).toContain("hydrateRoot(container, element, hydrateRootOptions)");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });

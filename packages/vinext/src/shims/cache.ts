@@ -112,6 +112,7 @@ export type CachedPagesValue = {
   kind: "PAGES";
   html: string;
   pageData: object;
+  generatedFromDataRequest?: boolean;
   headers: Record<string, string | string[]> | undefined;
   status: number | undefined;
 };

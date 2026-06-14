@@ -100,7 +100,21 @@ export function buildNextDataJsonResponse(
   safeJsonStringify: (value: unknown) => string,
   init?: ResponseInit,
 ): Response {
-  const body = safeJsonStringify({ pageProps });
+  return buildNextDataPropsJsonResponse({ pageProps }, safeJsonStringify, init);
+}
+
+/**
+ * Build a `_next/data` JSON response from the full Pages props object returned
+ * through `_app.getInitialProps`. Next.js serializes the same outer props
+ * object that would be passed to `<App />`, so custom app-level props remain
+ * siblings of `pageProps` in the data envelope.
+ */
+export function buildNextDataPropsJsonResponse(
+  props: Record<string, unknown>,
+  safeJsonStringify: (value: unknown) => string,
+  init?: ResponseInit,
+): Response {
+  const body = safeJsonStringify(props);
   return new Response(body, {
     status: init?.status ?? 200,
     statusText: init?.statusText,

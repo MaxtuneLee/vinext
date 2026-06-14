@@ -22,10 +22,11 @@ import {
   isResponseSent,
   loadPagesGetInitialProps,
 } from "./pages-get-initial-props.js";
-import { buildNextDataJsonResponse } from "./pages-data-route.js";
+import { buildNextDataPropsJsonResponse } from "./pages-data-route.js";
 import { NEXTJS_DEPLOYMENT_ID_HEADER } from "./headers.js";
 import { isSerializableProps } from "./pages-serializable-props.js";
 import { isBotUserAgent } from "../utils/html-limited-bots.js";
+import { isUnknownRecord } from "../utils/record.js";
 
 type PagesRedirectResult = {
   destination: string;
@@ -62,6 +63,10 @@ type PagesGsspContextResponse = {
   req: unknown;
   res: PagesMutableGsspResponse;
   responsePromise: Promise<Response>;
+};
+
+type PagesRenderProps = Record<string, unknown> & {
+  pageProps: unknown;
 };
 
 export type PagesPageModule = {
@@ -114,9 +119,10 @@ export type PagesPageModule = {
 type RenderPagesIsrHtmlOptions = {
   buildId: string | null;
   cachedHtml: string;
-  createPageElement: (pageProps: Record<string, unknown>) => ReactNode;
+  createPageElement: (props: Record<string, unknown>) => ReactNode;
   i18n: PagesI18nRenderContext;
   pageProps: Record<string, unknown>;
+  props?: Record<string, unknown>;
   params: Record<string, unknown>;
   renderIsrPassToStringAsync: (element: ReactNode) => Promise<string>;
   routePattern: string;
@@ -139,7 +145,8 @@ export type ResolvePagesPageDataOptions = {
   isDataReq?: boolean;
   err?: unknown;
   createGsspReqRes: () => PagesGsspContextResponse;
-  createPageElement: (pageProps: Record<string, unknown>) => ReactNode;
+  createAppTree?: (props: Record<string, unknown>) => ReactNode;
+  createPageElement: (props: Record<string, unknown>) => ReactNode;
   fontLinkHeader: string;
   i18n: PagesI18nRenderContext;
   isrCacheKey: (router: string, pathname: string) => string;
@@ -186,9 +193,11 @@ export type ResolvePagesPageDataOptions = {
   deploymentId?: string;
   htmlLimitedBots?: string;
   pageModule: PagesPageModule;
+  AppComponent?: unknown;
   params: Record<string, unknown>;
   query: Record<string, unknown>;
   asPath?: string;
+  resolvedUrl?: string;
   route: Pick<Route, "isDynamic">;
   routePattern: string;
   routeUrl: string;
@@ -233,6 +242,7 @@ type ResolvePagesPageDataRenderResult = {
   gsspRes: PagesGsspResponse | null;
   isrRevalidateSeconds: number | null;
   pageProps: Record<string, unknown>;
+  props: PagesRenderProps;
   /**
    * True when `getStaticPaths` returned `fallback: true` AND the requested path
    * is not in the pre-rendered list. The caller renders a loading shell with
@@ -289,6 +299,84 @@ function resolvePagesRedirectStatus(redirect: PagesRedirectResult): number {
   return redirect.statusCode != null ? redirect.statusCode : redirect.permanent ? 308 : 307;
 }
 
+function normalizePagesRenderProps(props: Record<string, unknown>): PagesRenderProps {
+  return {
+    ...props,
+    pageProps: props.pageProps,
+  };
+}
+
+type PagesAppInitialPropsResult =
+  | { kind: "props"; pageProps: Record<string, unknown>; renderProps: PagesRenderProps }
+  | { kind: "response"; response: Promise<Response> };
+
+/**
+ * Load `_app.getInitialProps` and return the normalized render props and the
+ * extracted `pageProps`. This is shared between the foreground render path and
+ * the stale-while-revalidate background regeneration path so both produce the
+ * same full props envelope (app-level props plus the page's `pageProps`).
+ *
+ * `getSharedReqRes` lets callers share the same mock req/res with other
+ * data-fetching steps (e.g. `getServerSideProps`) when they run in the same
+ * request context.
+ */
+async function loadPagesAppInitialRenderProps(
+  options: Pick<
+    ResolvePagesPageDataOptions,
+    | "AppComponent"
+    | "createAppTree"
+    | "createPageElement"
+    | "err"
+    | "i18n"
+    | "pageModule"
+    | "query"
+    | "routePattern"
+    | "routeUrl"
+    | "asPath"
+  >,
+  getSharedReqRes: () => PagesGsspContextResponse,
+): Promise<PagesAppInitialPropsResult> {
+  let pageProps: Record<string, unknown> = {};
+  let renderProps: PagesRenderProps = { pageProps };
+
+  if (!hasPagesGetInitialProps(options.AppComponent)) {
+    return { kind: "props", pageProps, renderProps };
+  }
+
+  const { req, res, responsePromise } = getSharedReqRes();
+  const initialProps = await loadPagesGetInitialProps(options.AppComponent, {
+    AppTree: options.createAppTree ?? options.createPageElement,
+    Component: options.pageModule.default,
+    router: {
+      pathname: options.routePattern,
+      query: options.query,
+      asPath: options.asPath ?? options.routeUrl,
+    },
+    ctx: {
+      req,
+      res,
+      err: options.err,
+      pathname: options.routePattern,
+      query: options.query,
+      asPath: options.asPath ?? options.routeUrl,
+      locale: options.i18n.locale,
+      locales: options.i18n.locales,
+      defaultLocale: options.i18n.defaultLocale,
+    },
+  });
+
+  if (isResponseSent(res)) {
+    return { kind: "response", response: responsePromise };
+  }
+
+  if (initialProps) {
+    renderProps = normalizePagesRenderProps(initialProps);
+    pageProps = isUnknownRecord(renderProps.pageProps) ? renderProps.pageProps : {};
+  }
+
+  return { kind: "props", pageProps, renderProps };
+}
+
 /**
  * Build the response for a `getServerSideProps` / `getStaticProps`
  * `{ redirect }` result.
@@ -316,6 +404,7 @@ function buildPagesRedirectResponse(
     ResolvePagesPageDataOptions,
     "isDataReq" | "sanitizeDestination" | "safeJsonStringify" | "deploymentId"
   >,
+  props: PagesRenderProps = { pageProps: {} },
 ): Response {
   const destination = options.sanitizeDestination(redirect.destination);
 
@@ -326,10 +415,14 @@ function buildPagesRedirectResponse(
     if (options.deploymentId) {
       init.headers[NEXTJS_DEPLOYMENT_ID_HEADER] = options.deploymentId;
     }
-    return buildNextDataJsonResponse(
+    return buildNextDataPropsJsonResponse(
       {
-        __N_REDIRECT: destination,
-        __N_REDIRECT_STATUS: resolvePagesRedirectStatus(redirect),
+        ...props,
+        pageProps: {
+          ...(isUnknownRecord(props.pageProps) ? props.pageProps : {}),
+          __N_REDIRECT: destination,
+          __N_REDIRECT_STATUS: resolvePagesRedirectStatus(redirect),
+        },
       },
       options.safeJsonStringify,
       init,
@@ -484,13 +577,15 @@ function rewritePagesCachedHtml(
 }
 
 export async function renderPagesIsrHtml(options: RenderPagesIsrHtmlOptions): Promise<string> {
+  const renderProps = options.props ?? { pageProps: options.pageProps };
   const freshBody = await options.renderIsrPassToStringAsync(
-    options.createPageElement(options.pageProps),
+    options.createPageElement(renderProps),
   );
   const nextDataScript = buildPagesNextDataScript({
     buildId: options.buildId,
     i18n: options.i18n,
     pageProps: options.pageProps,
+    props: renderProps,
     params: options.params,
     routePattern: options.routePattern,
     safeJsonStringify: options.safeJsonStringify,
@@ -524,6 +619,7 @@ export async function resolvePagesPageData(
   // (`/_next/data/...json`) still call `getStaticProps` so the client can
   // hydrate the page after the fallback shell ships.
   let isFallback = false;
+  let shouldPersistFallbackData = false;
 
   if (typeof options.pageModule.getStaticPaths === "function" && options.route.isDynamic) {
     const pathsResult = await options.pageModule.getStaticPaths({
@@ -551,29 +647,65 @@ export async function resolvePagesPageData(
     if (fallback === true && !isValidPath && !options.isDataReq && !isBotRequest) {
       isFallback = true;
     }
+    shouldPersistFallbackData = fallback === true && !isValidPath && options.isDataReq === true;
   }
 
   let pageProps: Record<string, unknown> = {};
   let gsspRes: PagesMutableGsspResponse | null = null;
 
+  let sharedReqRes: PagesGsspContextResponse | null = null;
+  function getSharedReqRes(): PagesGsspContextResponse {
+    sharedReqRes ??= options.createGsspReqRes();
+    return sharedReqRes;
+  }
+
+  let renderProps: PagesRenderProps = { pageProps };
+
+  async function loadForegroundAppInitialRenderProps(): Promise<ResolvePagesPageDataResult | null> {
+    const result = await loadPagesAppInitialRenderProps(options, getSharedReqRes);
+    if (result.kind === "response") {
+      return {
+        kind: "response",
+        response: await result.response,
+      };
+    }
+    renderProps = result.renderProps;
+    pageProps = result.pageProps;
+    return null;
+  }
+
   if (isFallback) {
-    return {
-      kind: "render",
-      gsspRes: null,
-      isrRevalidateSeconds: null,
-      pageProps,
-      isFallback: true,
-    };
+    const pathname = options.routeUrl.split("?")[0];
+    const cached = await options.isrGet(options.isrCacheKey("pages", pathname));
+    if (cached?.value.value?.kind !== "PAGES") {
+      const appShortCircuit = await loadForegroundAppInitialRenderProps();
+      if (appShortCircuit) return appShortCircuit;
+      pageProps = {};
+      renderProps = { ...renderProps, pageProps };
+      return {
+        kind: "render",
+        gsspRes: null,
+        isrRevalidateSeconds: null,
+        pageProps,
+        props: renderProps,
+        isFallback: true,
+      };
+    }
   }
 
   if (typeof options.pageModule.getServerSideProps === "function") {
-    const { req, res, responsePromise } = options.createGsspReqRes();
+    const shortCircuit = await loadForegroundAppInitialRenderProps();
+    if (shortCircuit) {
+      return shortCircuit;
+    }
+    renderProps = { ...renderProps, __N_SSP: true };
+    const { req, res, responsePromise } = getSharedReqRes();
     const result = await options.pageModule.getServerSideProps({
       params: userFacingParams,
       req,
       res,
       query: options.query,
-      resolvedUrl: options.routeUrl,
+      resolvedUrl: options.resolvedUrl ?? options.routeUrl,
       locale: options.i18n.locale,
       locales: options.i18n.locales,
       defaultLocale: options.i18n.defaultLocale,
@@ -591,13 +723,17 @@ export async function resolvePagesPageData(
       // before serialising; otherwise pageProps would be a Promise and the
       // rendered page would receive empty props. See
       // packages/next/src/server/render.tsx (deferredContent).
-      pageProps = (await Promise.resolve(result.props)) as Record<string, unknown>;
+      pageProps = {
+        ...pageProps,
+        ...((await Promise.resolve(result.props)) as Record<string, unknown>),
+      };
+      renderProps = { ...renderProps, pageProps };
     }
 
     if (result?.redirect) {
       return {
         kind: "response",
-        response: buildPagesRedirectResponse(result.redirect, options),
+        response: buildPagesRedirectResponse(result.redirect, options, renderProps),
       };
     }
 
@@ -635,7 +771,9 @@ export async function resolvePagesPageData(
     // handling in render.tsx / base-server.ts.
     if (
       !options.isOnDemandRevalidate &&
+      cached?.isStale === false &&
       cachedValue?.kind === "PAGES" &&
+      !cachedValue.generatedFromDataRequest &&
       cached &&
       !cached.isStale &&
       !options.scriptNonce &&
@@ -665,6 +803,7 @@ export async function resolvePagesPageData(
     if (
       !options.isOnDemandRevalidate &&
       cachedValue?.kind === "PAGES" &&
+      !cachedValue.generatedFromDataRequest &&
       cached &&
       cached.isStale &&
       !options.scriptNonce &&
@@ -674,6 +813,22 @@ export async function resolvePagesPageData(
         cacheKey,
         async function () {
           return options.runInFreshUnifiedContext(async () => {
+            options.applyRequestContexts();
+            // Rebuild the full App render props before re-running getStaticProps
+            // so the regenerated HTML / __NEXT_DATA__ still contains app-level
+            // props from _app.getInitialProps. Mirrors the foreground path.
+            const freshAppResult = await loadPagesAppInitialRenderProps(options, () =>
+              options.createGsspReqRes(),
+            );
+            if (freshAppResult.kind === "response") {
+              // _app.getInitialProps short-circuited the request during background
+              // regeneration. We cannot turn that into an HTTP response here, so
+              // skip the cache write and let the stale entry remain.
+              return;
+            }
+            let freshPageProps = freshAppResult.pageProps;
+            let freshRenderProps = freshAppResult.renderProps;
+
             const freshResult = await options.pageModule.getStaticProps?.({
               params: userFacingParams,
               locale: options.i18n.locale,
@@ -686,18 +841,24 @@ export async function resolvePagesPageData(
               revalidateReason: "stale",
             });
 
-            if (
-              freshResult?.props &&
-              typeof freshResult.revalidate === "number" &&
-              freshResult.revalidate > 0
-            ) {
-              options.applyRequestContexts();
+            if (freshResult?.props) {
+              freshPageProps = { ...freshPageProps, ...freshResult.props };
+              freshRenderProps = { ...freshRenderProps, pageProps: freshPageProps };
+            }
+
+            const freshRevalidateSeconds =
+              typeof freshResult?.revalidate === "number" && freshResult.revalidate > 0
+                ? freshResult.revalidate
+                : cached.value.cacheControl?.revalidate;
+
+            if (freshResult?.props && freshRevalidateSeconds && freshRevalidateSeconds > 0) {
               const freshHtml = await renderPagesIsrHtml({
                 buildId: options.buildId,
                 cachedHtml: cachedValue.html,
                 createPageElement: options.createPageElement,
                 i18n: options.i18n,
-                pageProps: freshResult.props,
+                pageProps: freshPageProps,
+                props: freshRenderProps,
                 params: options.params,
                 renderIsrPassToStringAsync: options.renderIsrPassToStringAsync,
                 routePattern: options.routePattern,
@@ -708,8 +869,8 @@ export async function resolvePagesPageData(
 
               await options.isrSet(
                 cacheKey,
-                buildPagesCacheValue(freshHtml, freshResult.props, options.statusCode),
-                freshResult.revalidate,
+                buildPagesCacheValue(freshHtml, freshRenderProps, options.statusCode),
+                freshRevalidateSeconds,
                 undefined,
                 options.expireSeconds,
               );
@@ -742,32 +903,46 @@ export async function resolvePagesPageData(
       };
     }
 
-    const result = await options.pageModule.getStaticProps({
-      params: userFacingParams,
-      locale: options.i18n.locale,
-      locales: options.i18n.locales,
-      defaultLocale: options.i18n.defaultLocale,
-      // Maps Next.js's resolution in `render.tsx`:
-      //   isOnDemandRevalidate ? "on-demand"
-      //     : isBuildTimeSSG    ? "build"
-      //                         : "stale"
-      // We pick "stale" as the default at runtime so existing-but-missing
-      // (cache evicted) entries surface as a regeneration rather than a build.
-      revalidateReason: options.isOnDemandRevalidate
-        ? "on-demand"
-        : options.isBuildTimePrerendering
-          ? "build"
-          : "stale",
-    });
+    const generatedPageData =
+      !options.isOnDemandRevalidate &&
+      cached?.isStale === false &&
+      cachedValue?.kind === "PAGES" &&
+      cachedValue.generatedFromDataRequest &&
+      isUnknownRecord(cachedValue.pageData)
+        ? cachedValue.pageData
+        : null;
+    if (!generatedPageData) {
+      const shortCircuit = await loadForegroundAppInitialRenderProps();
+      if (shortCircuit) return shortCircuit;
+    }
+    const result = generatedPageData
+      ? null
+      : await options.pageModule.getStaticProps({
+          params: userFacingParams,
+          locale: options.i18n.locale,
+          locales: options.i18n.locales,
+          defaultLocale: options.i18n.defaultLocale,
+          revalidateReason: options.isOnDemandRevalidate
+            ? "on-demand"
+            : options.isBuildTimePrerendering
+              ? "build"
+              : "stale",
+        });
+
+    if (generatedPageData) {
+      renderProps = generatedPageData as PagesRenderProps;
+      pageProps = isUnknownRecord(renderProps.pageProps) ? renderProps.pageProps : {};
+    }
 
     if (result?.props) {
-      pageProps = result.props;
+      pageProps = { ...pageProps, ...result.props };
+      renderProps = { ...renderProps, pageProps };
     }
 
     if (result?.redirect) {
       return {
         kind: "response",
-        response: buildPagesRedirectResponse(result.redirect, options),
+        response: buildPagesRedirectResponse(result.redirect, options, renderProps),
       };
     }
 
@@ -789,15 +964,47 @@ export async function resolvePagesPageData(
 
     if (typeof result?.revalidate === "number" && result.revalidate > 0) {
       isrRevalidateSeconds = result.revalidate;
+    } else if (cachedValue?.kind === "PAGES" && cachedValue.generatedFromDataRequest) {
+      isrRevalidateSeconds = cached?.value.cacheControl?.revalidate ?? 31_536_000;
+    }
+
+    if (shouldPersistFallbackData) {
+      const revalidateSeconds = isrRevalidateSeconds ?? 31_536_000;
+      await options.isrSet(
+        cacheKey,
+        {
+          kind: "PAGES",
+          html: "",
+          pageData: renderProps,
+          generatedFromDataRequest: true,
+          headers: undefined,
+          status: undefined,
+        },
+        revalidateSeconds,
+        undefined,
+        options.expireSeconds,
+      );
     }
   }
 
   if (
     typeof options.pageModule.getServerSideProps !== "function" &&
     typeof options.pageModule.getStaticProps !== "function" &&
+    hasPagesGetInitialProps(options.AppComponent)
+  ) {
+    const shortCircuit = await loadForegroundAppInitialRenderProps();
+    if (shortCircuit) {
+      return shortCircuit;
+    }
+  }
+
+  if (
+    typeof options.pageModule.getServerSideProps !== "function" &&
+    typeof options.pageModule.getStaticProps !== "function" &&
+    !hasPagesGetInitialProps(options.AppComponent) &&
     hasPagesGetInitialProps(options.pageModule.default)
   ) {
-    const { req, res, responsePromise } = options.createGsspReqRes();
+    const { req, res, responsePromise } = getSharedReqRes();
     const initialProps = await loadPagesGetInitialProps(options.pageModule.default, {
       req,
       res,
@@ -819,6 +1026,7 @@ export async function resolvePagesPageData(
 
     if (initialProps) {
       pageProps = { ...pageProps, ...initialProps };
+      renderProps = { ...renderProps, pageProps };
     }
   }
 
@@ -827,6 +1035,7 @@ export async function resolvePagesPageData(
     gsspRes,
     isrRevalidateSeconds,
     pageProps,
+    props: renderProps,
     isFallback: false,
   };
 }

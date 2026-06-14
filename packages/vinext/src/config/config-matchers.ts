@@ -798,6 +798,8 @@ export function matchConfigPattern(
   //     the simple catch-all branch cannot express,
   //   - a named param is followed by a dot (the simple branch would treat
   //     "slug.md" as the whole param name),
+  //   - a named param is embedded after a literal prefix in the same path
+  //     segment (e.g. `/blog-:slug`),
   //   - the pattern has multiple named params and any of them is a catch-all
   //     (e.g. `/:locale/files/:path*`). The simple catch-all branch only
   //     handles trailing-catch-all-with-static-prefix; mixed cases need regex.
@@ -808,6 +810,7 @@ export function matchConfigPattern(
     pattern.includes("\\") ||
     /:[\w-]+[*+][^/]/.test(pattern) ||
     /:[\w-]+\./.test(pattern) ||
+    /[^/]:[\w-]+/.test(pattern) ||
     (catchAllAnchor && namedParamCount > 1)
   ) {
     try {
@@ -1089,11 +1092,12 @@ export function matchRewrite(
           ? collectConditionParams(rewrite.has, rewrite.missing, ctx)
           : _emptyParams();
       if (!conditionParams) continue;
-      // Collapse protocol-relative URLs (e.g. //evil.com from decoded %2F in catch-all params).
-      return substituteAndSanitizeDestination(rewrite.destination, {
+      const rewriteParams = {
         ...params,
         ...conditionParams,
-      });
+      };
+      // Collapse protocol-relative URLs (e.g. //evil.com from decoded %2F in catch-all params).
+      return substituteAndSanitizeRewriteDestination(rewrite.destination, rewriteParams);
     }
   }
   return null;
@@ -1139,6 +1143,94 @@ function substituteAndSanitizeDestination(
   params: Record<string, string>,
 ): string {
   return sanitizeDestination(substituteDestinationParams(destination, params));
+}
+
+/**
+ * Match Next.js's rewrite-specific prepareDestination behavior: source params
+ * that are not consumed by the destination path/host are exposed to the target
+ * page through query.
+ *
+ * https://github.com/vercel/next.js/blob/canary/packages/next/src/shared/lib/router/utils/prepare-destination.ts
+ */
+function substituteAndSanitizeRewriteDestination(
+  destination: string,
+  params: Record<string, string>,
+): string {
+  const rewritten = substituteAndSanitizeDestination(destination, params);
+  if (!shouldAppendRewriteParamsToQuery(destination, params)) return rewritten;
+
+  const existingQueryKeys = getDestinationQueryKeys(destination);
+  const paramsToAppend: [string, string][] = [];
+  for (const [key, value] of Object.entries(params)) {
+    if (key === "nextInternalLocale" || existingQueryKeys.has(key)) continue;
+    paramsToAppend.push([key, value]);
+  }
+
+  if (paramsToAppend.length === 0) return rewritten;
+  return appendQueryParams(rewritten, paramsToAppend);
+}
+
+function shouldAppendRewriteParamsToQuery(
+  destination: string,
+  params: Record<string, string>,
+): boolean {
+  const keys = Object.keys(params).filter((key) => key !== "nextInternalLocale");
+  if (keys.length === 0) return false;
+  return !destinationPathOrHostUsesParam(destination, keys);
+}
+
+function destinationPathOrHostUsesParam(destination: string, keys: string[]): boolean {
+  const pathAndHost = getDestinationPathAndHost(destination);
+  if (!pathAndHost) return false;
+  for (const key of keys) {
+    const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (new RegExp(`:${escapedKey}([+*])?(?![A-Za-z0-9_])`).test(pathAndHost)) return true;
+  }
+  return false;
+}
+
+function getDestinationPathAndHost(destination: string): string {
+  const hashIndex = destination.indexOf("#");
+  const beforeHash = hashIndex === -1 ? destination : destination.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : destination.slice(hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  const beforeQuery = queryIndex === -1 ? beforeHash : beforeHash.slice(0, queryIndex);
+
+  const schemeMatch = /^[a-z][a-z0-9+.-]*:\/\//i.exec(beforeQuery);
+  if (!schemeMatch) return `${beforeQuery}${hash}`;
+
+  const withoutScheme = beforeQuery.slice(schemeMatch[0].length);
+  const slashIndex = withoutScheme.indexOf("/");
+  if (slashIndex === -1) return `${withoutScheme}${hash}`;
+  return `${withoutScheme.slice(0, slashIndex)}${withoutScheme.slice(slashIndex)}${hash}`;
+}
+
+function getDestinationQueryKeys(destination: string): Set<string> {
+  const hashIndex = destination.indexOf("#");
+  const beforeHash = hashIndex === -1 ? destination : destination.slice(0, hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  if (queryIndex === -1) return new Set();
+
+  const query = beforeHash.slice(queryIndex + 1);
+  return new Set(new URLSearchParams(query).keys());
+}
+
+function appendQueryParams(url: string, params: Iterable<[string, string]>): string {
+  const hashIndex = url.indexOf("#");
+  const beforeHash = hashIndex === -1 ? url : url.slice(0, hashIndex);
+  const hash = hashIndex === -1 ? "" : url.slice(hashIndex);
+
+  const queryIndex = beforeHash.indexOf("?");
+  const base = queryIndex === -1 ? beforeHash : beforeHash.slice(0, queryIndex);
+  const query = queryIndex === -1 ? "" : beforeHash.slice(queryIndex + 1);
+
+  const merged = new URLSearchParams(query);
+  for (const [key, value] of params) {
+    merged.append(key, value);
+  }
+
+  const search = merged.toString();
+  return `${base}${search ? `?${search}` : ""}${hash}`;
 }
 
 /**

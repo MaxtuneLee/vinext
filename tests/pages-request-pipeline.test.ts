@@ -164,6 +164,65 @@ describe("middleware", () => {
     );
   });
 
+  it("exposes the middleware rewrite target on Pages data responses", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/to-blog/post"),
+      baseDeps({
+        isDataRequest: true,
+        runMiddleware: makeMiddleware({
+          continue: true,
+          rewriteUrl: "/fallback-true-blog/post",
+        }),
+        renderPage: makeRenderPage(200, '{"pageProps":{"slug":"post"}}'),
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/fallback-true-blog/post");
+  });
+
+  it("does not expose the middleware rewrite target on HTML responses", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/to-blog/post"),
+      baseDeps({
+        runMiddleware: makeMiddleware({
+          continue: true,
+          rewriteUrl: "/fallback-true-blog/post",
+        }),
+        renderPage: makeRenderPage(200),
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBeNull();
+  });
+
+  it("exposes the final config rewrite URL with appended source params", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/config-rewrite-to-dynamic-static/post-2"),
+      baseDeps({
+        isDataRequest: true,
+        configRewrites: {
+          beforeFiles: [
+            {
+              source: "/config-rewrite-to-dynamic-static/:rewriteSlug",
+              destination: "/ssg",
+            },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+        renderPage: makeRenderPage(200),
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/ssg?rewriteSlug=post-2");
+  });
+
   // 6. Middleware response short-circuit → {type:"response"} with middleware response
   it("middleware response short-circuit returns the middleware response", async () => {
     const middlewareResponse = new Response("blocked", { status: 403 });
@@ -316,6 +375,35 @@ describe("beforeFiles rewrites", () => {
       undefined,
       expect.any(Headers),
     );
+  });
+
+  it("applies every matching beforeFiles rewrite in sequence", async () => {
+    const renderPage = makeRenderPage(200);
+    const result = await runPagesRequest(
+      makeRequest("/start"),
+      baseDeps({
+        isDataRequest: true,
+        configRewrites: {
+          beforeFiles: [
+            { source: "/start", destination: "/middle?first=1" },
+            { source: "/middle", destination: "/destination?second=2" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/destination?first=1&second=2",
+      undefined,
+      expect.any(Headers),
+    );
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/destination?first=1&second=2");
   });
 });
 
@@ -518,6 +606,31 @@ describe("render intent", () => {
     expect(result.isDataReq).toBe(true);
     expect(result.renderOptions).toEqual({ isDataReq: true });
   });
+
+  it("stages the final dev fallback rewrite target for data navigation", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/to-blog/post"),
+      baseDeps({
+        isDataReq: true,
+        matchPageRoute: () => null,
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [
+            {
+              source: "/to-blog/:slug",
+              destination: "/fallback-true-blog/:slug",
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(result.type).toBe("render");
+    if (result.type !== "render") return;
+    expect(result.resolvedUrl).toBe("/fallback-true-blog/post");
+    expect(result.stagedHeaders["x-nextjs-rewrite"]).toBe("/fallback-true-blog/post");
+  });
 });
 
 // 15. {type:"response"} from renderPage (happy path)
@@ -617,6 +730,40 @@ describe("deferred error page re-render on 404", () => {
     // Rendered exactly once with no defer option, and the fallback never fired.
     expect(renderPage).toHaveBeenCalledTimes(1);
     expect(renderPage.mock.calls[0][2]).toBeUndefined();
+  });
+
+  it("resolves fallback rewrites before rendering a production data request", async () => {
+    const renderPage = vi.fn(
+      async (_request: Request, url: string) => new Response(`data ${url}`, { status: 200 }),
+    );
+    const matchPageRoute = vi.fn((pathname: string) =>
+      pathname === "/fallback-target" ? ({ route: { isDynamic: false } } as any) : null,
+    );
+
+    const result = await runPagesRequest(
+      makeRequest("/missing-page"),
+      baseDeps({
+        isDataRequest: true,
+        matchPageRoute,
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [{ source: "/missing-page", destination: "/fallback-target?from=fallback" }],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(renderPage).toHaveBeenCalledOnce();
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/fallback-target?from=fallback",
+      undefined,
+      expect.any(Headers),
+    );
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/fallback-target?from=fallback");
   });
 });
 

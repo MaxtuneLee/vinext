@@ -44,6 +44,7 @@ import { addBasePathToPathname, hasBasePath } from "../utils/base-path.js";
 export type PagesRenderOptions = {
   isDataReq?: boolean;
   renderErrorPageOnMiss?: boolean;
+  originalUrl?: string;
 };
 
 export type MiddlewareResult = {
@@ -270,7 +271,8 @@ export async function runPagesRequest(
   }
 
   // Step 5: Middleware
-  let resolvedUrl = pathname + search;
+  const originalResolvedUrl = pathname + search;
+  let resolvedUrl = originalResolvedUrl;
   const middlewareHeaders: HeaderRecord = {};
   let middlewareStatus: number | undefined;
 
@@ -408,13 +410,14 @@ export async function runPagesRequest(
   // Step 9: beforeFiles rewrites
   let configRewriteFired = false;
   if (configRewrites.beforeFiles?.length) {
-    const rewritten = matchRewrite(
-      matchResolvedPathname(resolvedPathname),
-      configRewrites.beforeFiles,
-      postMwReqCtx,
-      basePathState,
-    );
-    if (rewritten) {
+    for (const rewrite of configRewrites.beforeFiles) {
+      const rewritten = matchRewrite(
+        matchResolvedPathname(resolvedPathname),
+        [rewrite],
+        postMwReqCtx,
+        basePathState,
+      );
+      if (!rewritten) continue;
       if (isExternalUrl(rewritten)) {
         // Bare proxy — no middleware-header merge (see Step 8 asymmetry note).
         return { type: "response", response: await proxyExternal(request, rewritten) };
@@ -493,14 +496,49 @@ export async function runPagesRequest(
     }
   }
 
+  const refreshDataRewriteHeader = () => {
+    if (
+      (isDataReq || isDataRequest) &&
+      resolvedUrl !== originalResolvedUrl &&
+      !isExternalUrl(resolvedUrl)
+    ) {
+      middlewareHeaders["x-nextjs-rewrite"] = resolvedUrl;
+    } else {
+      delete middlewareHeaders["x-nextjs-rewrite"];
+    }
+  };
+  refreshDataRewriteHeader();
+
   // Step 13: Render + fallback rewrites
   if (typeof deps.renderPage === "function") {
     // Reuse the Step 12 match unless afterFiles changed the pathname.
-    const renderPageMatch = resolvedPathnameChanged
+    let renderPageMatch = resolvedPathnameChanged
       ? deps.matchPageRoute
         ? deps.matchPageRoute(resolvedPathname, request)
         : null
       : pageMatch;
+    if ((isDataReq || isDataRequest) && !renderPageMatch && configRewrites.fallback?.length) {
+      const fallbackRewrite = matchRewrite(
+        matchResolvedPathname(resolvedPathname),
+        configRewrites.fallback,
+        postMwReqCtx,
+        basePathState,
+      );
+      if (fallbackRewrite) {
+        if (isExternalUrl(fallbackRewrite)) {
+          return {
+            type: "response",
+            response: await proxyExternal(request, fallbackRewrite),
+          };
+        }
+        resolvedUrl = mergeRewriteQuery(resolvedUrl, fallbackRewrite);
+        resolvedPathname = resolvedUrl.split("?")[0];
+        renderPageMatch = deps.matchPageRoute
+          ? deps.matchPageRoute(resolvedPathname, request)
+          : null;
+        refreshDataRewriteHeader();
+      }
+    }
     // A data request must not defer-render the error page or run fallback rewrites.
     // Node/dev signal this via `isDataReq` (set when a `/_next/data/` path is
     // normalized); the worker never normalizes those paths (no buildId at request
@@ -598,6 +636,7 @@ export async function runPagesRequest(
       resolvedUrl = mergeRewriteQuery(resolvedUrl, fallbackRewrite);
     }
   }
+  refreshDataRewriteHeader();
 
   return {
     type: "render",

@@ -84,7 +84,7 @@ import { hydrateRoot } from "react-dom/client";
 // Mirrors Next.js's bootstrap order: client/next.ts statically imports
 // from './' before calling initialize/hydrate, so window.next is set up
 // before any async work.
-import { wrapWithRouterContext } from "next/router";
+import Router, { wrapWithRouterContext } from "next/router";
 
 const pageLoaders = {
 ${loaderEntries.join(",\n")}
@@ -149,7 +149,9 @@ async function hydrate() {
     };
   }
 
-  const { pageProps } = nextData.props;
+  const props = nextData.props && typeof nextData.props === "object" ? nextData.props : {};
+  const rawPageProps = props.pageProps;
+  const pageProps = rawPageProps && typeof rawPageProps === "object" ? rawPageProps : {};
   const loader = pageLoaders[nextData.page];
   if (!loader) {
     console.error("[vinext] No page loader for route:", nextData.page);
@@ -171,7 +173,12 @@ async function hydrate() {
     const appModule = await appLoader();
     const AppComponent = appModule.default;
     window.__VINEXT_APP__ = AppComponent;
-    element = React.createElement(AppComponent, { Component: PageComponent, pageProps });
+    element = React.createElement(AppComponent, {
+      ...props,
+      Component: PageComponent,
+      pageProps: rawPageProps,
+      router: Router,
+    });
   } catch {
     element = React.createElement(PageComponent, pageProps);
   }
@@ -181,8 +188,13 @@ async function hydrate() {
   `
   }
 
+  let resolveHydrationCommit;
+  const hydrationCommitted = new Promise((resolve) => {
+    resolveHydrationCommit = resolve;
+  });
+
   // Wrap with RouterContext.Provider so next/router and next/compat/router work during hydration.
-  element = wrapWithRouterContext(element);
+  element = wrapWithRouterContext(element, resolveHydrationCommit);
 
   const container = document.getElementById("__next");
   if (!container) {
@@ -192,6 +204,20 @@ async function hydrate() {
 
   const root = hydrateRoot(container, element, hydrateRootOptions);
   window.__VINEXT_ROOT__ = root;
+  await hydrationCommitted;
+  const hydratedAt = performance.now();
+  window.__VINEXT_HYDRATED_AT = hydratedAt;
+  window.__NEXT_HYDRATED = true;
+  window.__NEXT_HYDRATED_AT = hydratedAt;
+  window.__NEXT_HYDRATED_CB?.();
+
+  if (nextData.isFallback) {
+    await Router.replace(
+      window.location.pathname + window.location.search + window.location.hash,
+      undefined,
+      { _h: 1, scroll: false },
+    );
+  }
 }
 
 hydrate();

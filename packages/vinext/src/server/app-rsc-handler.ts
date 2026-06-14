@@ -33,6 +33,7 @@ import { pickRootParams, setRootParams, type RootParams } from "vinext/shims/roo
 import { createRequestContext, runWithRequestContext } from "vinext/shims/unified-request-context";
 import { flattenErrorCauses } from "../utils/error-cause.js";
 import { hasBasePath } from "../utils/base-path.js";
+import { mergeRewriteQuery } from "../utils/query.js";
 import { applyAppMiddleware, type AppMiddlewareContext } from "./app-middleware.js";
 import { mergeMiddlewareResponseHeaders } from "./app-page-response.js";
 import { handleAppPrerenderEndpoint } from "./app-prerender-endpoints.js";
@@ -353,6 +354,20 @@ async function applyRewrite(
   return rewritten;
 }
 
+function applyInternalRewriteDestination(rewritten: string, url: URL): string {
+  const merged = mergeRewriteQuery(`${url.pathname}${url.search}`, rewritten);
+  const hashIndex = merged.indexOf("#");
+  const beforeHash = hashIndex === -1 ? merged : merged.slice(0, hashIndex);
+  const queryIndex = beforeHash.indexOf("?");
+  if (queryIndex === -1) {
+    url.search = "";
+    return beforeHash;
+  }
+
+  url.search = beforeHash.slice(queryIndex);
+  return beforeHash.slice(0, queryIndex);
+}
+
 function applyConfigHeadersToMiddlewareRedirect(
   response: Response,
   options: {
@@ -580,7 +595,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     matchPathname(cleanPathname),
   );
   if (beforeFilesRewrite instanceof Response) return beforeFilesRewrite;
-  if (beforeFilesRewrite) cleanPathname = beforeFilesRewrite;
+  if (beforeFilesRewrite) cleanPathname = applyInternalRewriteDestination(beforeFilesRewrite, url);
 
   if (isImageOptimizationPath(cleanPathname)) {
     const imageRedirect = resolveDevImageRedirect(
@@ -701,7 +716,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     );
     if (afterFilesRewrite instanceof Response) return afterFilesRewrite;
     if (afterFilesRewrite) {
-      cleanPathname = afterFilesRewrite;
+      cleanPathname = applyInternalRewriteDestination(afterFilesRewrite, url);
       match = options.matchRoute(cleanPathname);
     }
   }
@@ -720,7 +735,7 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     );
     if (fallbackRewrite instanceof Response) return fallbackRewrite;
     if (fallbackRewrite) {
-      cleanPathname = fallbackRewrite;
+      cleanPathname = applyInternalRewriteDestination(fallbackRewrite, url);
       match = options.matchRoute(cleanPathname);
     }
   }

@@ -220,7 +220,7 @@ import React from "react";
 import { renderToReadableStream } from "react-dom/server.edge";
 import { resetSSRHead, getSSRHeadHTML, setDocumentInitialHead } from "next/head";
 import { flushPreloads } from "next/dynamic";
-import { setSSRContext, wrapWithRouterContext, getPagesNavigationIsReadyFromSerializedState } from "next/router";
+import Router, { setSSRContext, wrapWithRouterContext, getPagesNavigationIsReadyFromSerializedState } from "next/router";
 import { _runWithCacheState, configureMemoryCacheHandler as __configureMemoryCacheHandler } from "next/cache";
 import { registerConfiguredCacheAdapters as __registerConfiguredCacheAdapters } from "virtual:vinext-cache-adapters";
 import { runWithPrivateCache } from "vinext/cache-runtime";
@@ -406,18 +406,36 @@ const _renderPage = __createPagesPageHandler({
   renderIsrPassToStringAsync: _renderIsrPassToStringAsync,
   safeJsonStringify,
   sanitizeDestination: sanitizeDestinationLocal,
-  createPageElement(PageComponent, AppComponent, pageProps) {
+  createPageElement(PageComponent, AppComponent, props) {
+    const rawPageProps = props?.pageProps;
+    const pageProps = rawPageProps && typeof rawPageProps === "object"
+      ? props.pageProps
+      : {};
     return AppComponent
-      ? React.createElement(AppComponent, { Component: PageComponent, pageProps })
+      ? React.createElement(AppComponent, {
+          ...props,
+          Component: PageComponent,
+          pageProps: rawPageProps,
+          router: Router,
+        })
       : React.createElement(PageComponent, pageProps);
   },
-  enhancePageElement(PageComponent, AppComponent, pageProps, opts) {
+  enhancePageElement(PageComponent, AppComponent, props, opts) {
+    const rawPageProps = props?.pageProps;
+    const pageProps = rawPageProps && typeof rawPageProps === "object"
+      ? props.pageProps
+      : {};
     let FinalApp = AppComponent;
     let FinalComp = PageComponent;
     if (opts && typeof opts.enhanceApp === "function" && FinalApp) FinalApp = opts.enhanceApp(FinalApp);
     if (opts && typeof opts.enhanceComponent === "function") FinalComp = opts.enhanceComponent(FinalComp);
     return FinalApp
-      ? React.createElement(FinalApp, { Component: FinalComp, pageProps })
+      ? React.createElement(FinalApp, {
+          ...props,
+          Component: FinalComp,
+          pageProps: rawPageProps,
+          router: Router,
+        })
       : React.createElement(FinalComp, pageProps);
   },
   AppComponent,

@@ -183,6 +183,7 @@ type RenderPagesPageResponseOptions = {
    */
   isFallback?: boolean;
   pageProps: Record<string, unknown>;
+  props?: Record<string, unknown>;
   params: Record<string, unknown>;
   renderDocumentToString: (element: ReactNode) => Promise<string>;
   renderToReadableStream: (element: ReactNode) => Promise<ReadableStream<Uint8Array>>;
@@ -249,6 +250,7 @@ export function buildPagesNextDataScript(
     | "i18n"
     | "isFallback"
     | "pageProps"
+    | "props"
     | "params"
     | "routePattern"
     | "safeJsonStringify"
@@ -259,7 +261,7 @@ export function buildPagesNextDataScript(
   },
 ): string {
   const nextDataPayload: Record<string, unknown> = {
-    props: { pageProps: options.pageProps },
+    props: options.props ?? { pageProps: options.pageProps },
     page: options.routePattern,
     query: options.params,
     buildId: options.buildId,
@@ -471,6 +473,7 @@ function applyGsspHeaders(
 export async function renderPagesPageResponse(
   options: RenderPagesPageResponseOptions,
 ): Promise<Response> {
+  const renderProps = options.props ?? { pageProps: options.pageProps };
   options.resetSSRHead?.();
   await options.flushPreloads?.();
 
@@ -485,6 +488,7 @@ export async function renderPagesPageResponse(
     i18n: options.i18n,
     isFallback: options.isFallback,
     pageProps: options.pageProps,
+    props: renderProps,
     params: options.params,
     routePattern: options.routePattern,
     safeJsonStringify: options.safeJsonStringify,
@@ -540,7 +544,7 @@ export async function renderPagesPageResponse(
     // (`rendered`), this element is never used, so there's no point
     // constructing the tree on that path.
     const pageElement = withScriptNonce(
-      React.createElement(React.Fragment, null, options.createPageElement(options.pageProps)),
+      React.createElement(React.Fragment, null, options.createPageElement(renderProps)),
       options.scriptNonce,
     );
     bodyStream = await options.renderToReadableStream(pageElement);

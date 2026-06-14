@@ -115,6 +115,13 @@ const nextConfig: NextConfig = {
           has: [{ type: "cookie", key: "mw-before-user" }],
           destination: "/about",
         },
+        // Used by Vitest: app-router-next-config-dev.test.ts — unused source
+        // params must be appended to the destination query and exposed through
+        // App Router searchParams, matching Next.js prepareDestination.
+        {
+          source: "/rewrite-search-param/:term",
+          destination: "/search?q=from-rewrite",
+        },
       ],
       afterFiles: [
         // Used by Vitest: app-router.test.ts
