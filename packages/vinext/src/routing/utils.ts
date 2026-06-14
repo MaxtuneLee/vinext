@@ -97,6 +97,70 @@ export function sortRoutes<T extends { pattern: string }>(routes: T[]): T[] {
   });
 }
 
+/**
+ * Single source of truth for hybrid App/Pages route ownership.
+ *
+ * Mirrors Next.js's DefaultRouteMatcherManager ordering: Pages providers
+ * are registered before App providers, then merged dynamic matchers sort
+ * together. Returns the router that should own a request/navigation to
+ * a URL that matched BOTH routers.
+ *
+ * Centralised so the server's request handling and the client's link /
+ * prefetch / programmatic-navigation paths all reach the same owner for
+ * the same (pages pattern, app pattern) pair. This intentionally implements
+ * Next.js's segment-tree ordering directly instead of vinext's broader
+ * `sortRoutes()` score heuristic. It only arbitrates two routes that already
+ * matched the same URL; each router's own trie ordering remains unchanged.
+ *
+ * Usage:
+ *   compareHybridRoutePatterns("/:slug", true, "/:slug", true)  // → "pages"
+ *   compareHybridRoutePatterns("/_sites/:slug*", true, "/:slug*", true)  // → "pages"
+ *   compareHybridRoutePatterns("/:path+", true, "/dashboard", false)  // → "app"
+ *   compareHybridRoutePatterns("/", false, "/", false)  // → "app"
+ */
+export function compareHybridRoutePatterns(
+  pagesPattern: string,
+  pagesIsDynamic: boolean,
+  appPattern: string,
+  appIsDynamic: boolean,
+): "app" | "pages" {
+  if (pagesPattern === appPattern) {
+    throw new Error(`Conflicting app and page routes found for "${pagesPattern}"`);
+  }
+
+  // Static-only paths: if Pages is static and App is also static, both have
+  // a literal route, but the App's catch-all is irrelevant — App still owns
+  // the literal hit (Next.js registers App providers after Pages but a
+  // static App segment always beats a static Pages segment when both match
+  // the same URL). If App is dynamic, Pages wins because Pages has the
+  // literal and App only has a catch-all.
+  if (!pagesIsDynamic) return appIsDynamic ? "pages" : "app";
+  // Pages is dynamic, App is static: App's literal always wins.
+  if (!appIsDynamic) return "app";
+  const pagesSegments = pagesPattern.split("/").filter(Boolean);
+  const appSegments = appPattern.split("/").filter(Boolean);
+  const segmentRank = (segment: string): number => {
+    if (!segment.startsWith(":")) return 0;
+    if (segment.endsWith("*")) return 3;
+    if (segment.endsWith("+")) return 2;
+    return 1;
+  };
+
+  for (let index = 0; index < Math.min(pagesSegments.length, appSegments.length); index++) {
+    const pagesRank = segmentRank(pagesSegments[index]);
+    const appRank = segmentRank(appSegments[index]);
+    if (pagesRank !== appRank) return pagesRank < appRank ? "pages" : "app";
+  }
+
+  if (pagesSegments.length !== appSegments.length) {
+    return pagesSegments.length < appSegments.length ? "pages" : "app";
+  }
+
+  // Matching dynamic routes with the same structural specificity retain
+  // provider order. Next.js registers Pages providers before App providers.
+  return "pages";
+}
+
 // Matches literal delimiter characters and their percent-encoded equivalents.
 // Literal `/`, `#`, `?` can appear after decodeURIComponent when the input was
 // originally encoded (e.g. `%2F` → `/`); they are re-encoded to preserve their

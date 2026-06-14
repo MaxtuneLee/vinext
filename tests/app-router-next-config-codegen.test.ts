@@ -144,6 +144,9 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     expect(code).toContain("renderPagesFallback as __renderPagesFallback");
     expect(code).toContain("server/app-pages-bridge.js");
     expect(code).toContain("return __renderPagesFallback(");
+    expect(code).toContain(
+      "{ allowRscDocumentFallback, appRouteMatch, isRscRequest, matchKind, middlewareContext, pathname, request, url }",
+    );
     expect(code).toContain('return import.meta.viteRsc.loadModule("ssr", "index");');
     expect(code).toContain("buildRequestHeaders: __buildRequestHeadersFromMiddlewareResponse");
     expect(code).toContain(
@@ -170,9 +173,7 @@ describe("App Router next.config.js features (generateRscEntry)", () => {
     // dispatcher as well as page rendering.
     const code = generateSsrEntry(true);
 
-    expect(code).toContain(
-      'export { handleApiRoute, pageRoutes, renderPage } from "virtual:vinext-server-entry";',
-    );
+    expect(code).toContain("handleApiRoute, matchApiRoute, matchPageRoute, pageRoutes, renderPage");
   });
 
   it("embeds basePath and trailingSlash alongside config", () => {

@@ -123,6 +123,17 @@ const minimalAppRoutes: AppRoute[] = [
 // ── App Router manifest construction ─────────────────────────────────
 
 describe("App Router generated manifest construction", () => {
+  it("embeds client rewrite rules in the App browser entry", () => {
+    const code = generateBrowserEntry([], null, [], {
+      afterFiles: [],
+      beforeFiles: [{ source: "/legacy", destination: "/about" }],
+      fallback: [],
+    });
+
+    expect(code).toContain('window.__VINEXT_CLIENT_REWRITES__ = {"afterFiles":[],"beforeFiles"');
+    expect(code).toContain('"source":"/legacy","destination":"/about"');
+  });
+
   it("embeds the Link auto-prefetch route manifest in the browser entry", () => {
     const code = generateBrowserEntry([
       ...minimalAppRoutes,

@@ -54,6 +54,7 @@ import { assertSafeNavigationUrl } from "./url-safety.js";
 import { markPprFallbackShellDynamicBoundary } from "./ppr-fallback-shell.js";
 import { AppRouterContext, type AppRouterInstance } from "./internal/app-router-context.js";
 import { getPagesNavigationContext as _getPagesNavigationContext } from "./internal/pages-router-accessor.js";
+import { resolveHybridClientRouteOwner } from "./internal/hybrid-client-route-owner.js";
 import { retryScrollTo, scrollToHashTarget } from "./hash-scroll.js";
 import {
   beginAppRouterScrollIntent,
@@ -1761,6 +1762,19 @@ function restoreScrollPosition(state: unknown): void {
 }
 
 /**
+ * Hard-navigate to a URL via `window.location`, preserving push/replace
+ * semantics. Used for URLs the App Router cannot serve (Pages-owned
+ * targets in a hybrid build) and for catch-all RSC failures.
+ */
+function hardNavigateTo(fullHref: string, mode: "push" | "replace"): void {
+  if (mode === "replace") {
+    window.location.replace(fullHref);
+  } else {
+    window.location.assign(fullHref);
+  }
+}
+
+/**
  * Navigate to a URL, handling external URLs, hash-only changes, and RSC navigation.
  */
 export async function navigateClientSide(
@@ -1788,15 +1802,32 @@ export async function navigateClientSide(
         return;
       }
 
-      if (mode === "replace") {
-        window.location.replace(href);
-      } else {
-        window.location.assign(href);
-      }
+      hardNavigateTo(href, mode);
       await new Promise<void>(() => {});
       return;
     }
     normalizedHref = localPath;
+  }
+
+  // Hybrid ownership: when both an App and a Pages route can match the
+  // destination, defer to the shared `compareHybridRoutePatterns` decision
+  // (the same logic the server uses for direct document loads). If Pages
+  // owns the URL, hard-navigate so the Pages handler renders the page
+  // instead of the App catch-all — soft-navigating through RSC would
+  // either return null (because `renderPagesFallback` short-circuits RSC
+  // requests) or render the App catch-all's path array. This is the
+  // programmatic equivalent of the link click / prefetch check in
+  // `link.tsx`.
+  const hybridOwner = resolveHybridClientRouteOwner(normalizedHref, __basePath);
+  if (hybridOwner === "pages" || hybridOwner === "document") {
+    const fullHref = toBrowserNavigationHref(normalizedHref, window.location.href, __basePath);
+    notifyAppRouterTransitionStart(fullHref, mode);
+    if (mode === "push") {
+      saveScrollPosition();
+    }
+    hardNavigateTo(fullHref, mode);
+    await new Promise<void>(() => {});
+    return;
   }
 
   const fullHref = toBrowserNavigationHref(normalizedHref, window.location.href, __basePath);
@@ -1841,11 +1872,7 @@ export async function navigateClientSide(
       return;
     }
 
-    if (mode === "replace") {
-      window.location.replace(fullHref);
-    } else {
-      window.location.assign(fullHref);
-    }
+    hardNavigateTo(fullHref, mode);
     await new Promise<void>(() => {});
     return;
   }
@@ -2025,6 +2052,17 @@ const _appRouter: AppRouterInstance = {
         const localPath = toSameOriginAppPath(href, __basePath);
         if (localPath == null) return;
         prefetchHref = localPath;
+      }
+
+      // Hybrid ownership: when a Pages route owns the URL, the App Router
+      // cannot serve it (Pages produces HTML documents / `_next/data` JSON,
+      // not RSC streams). Prefetching an RSC URL would either 404 or warm
+      // an unusable cache entry. The matching `push`/`replace` call will
+      // hard-navigate via `window.location`, so a no-op here is correct —
+      // the document prefetch the link shim emits on hover still runs.
+      const hybridOwner = resolveHybridClientRouteOwner(prefetchHref, __basePath);
+      if (hybridOwner === "pages" || hybridOwner === "document") {
+        return;
       }
 
       // Prefetch the RSC payload for the target route and store in cache.

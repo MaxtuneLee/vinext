@@ -11211,6 +11211,50 @@ describe("matchRewrite with external URLs", () => {
     });
     expect(result).toBe("/home?authorized=yes&path=docs/intro");
   });
+
+  it("appends source params not referenced by the rewrite destination", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const result = matchRewrite(
+      "/query-rewrite/hello/world",
+      [
+        {
+          source: "/query-rewrite/:section/:name",
+          destination: "/with-params?first=:section&second=:name",
+        },
+      ],
+      emptyCtx,
+    );
+
+    expect(result).toBe("/with-params?first=hello&second=world&section=hello&name=world");
+  });
+
+  it("appends unused condition captures to the rewrite destination query", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const result = matchRewrite(
+      "/source",
+      [
+        {
+          source: "/source",
+          destination: "/target",
+          has: [{ type: "query", key: "preview", value: "(?<mode>draft)" }],
+        },
+      ],
+      { ...emptyCtx, query: new URLSearchParams("preview=draft") },
+    );
+
+    expect(result).toBe("/target?mode=draft");
+  });
+
+  it("does not append rewrite params consumed by the destination fragment", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const result = matchRewrite(
+      "/docs/500",
+      [{ source: "/docs/:code", destination: "/status#:code" }],
+      emptyCtx,
+    );
+
+    expect(result).toBe("/status#500");
+  });
 });
 
 describe("matchRedirect destination param substitution", () => {

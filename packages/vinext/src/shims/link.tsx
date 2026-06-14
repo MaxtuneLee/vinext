@@ -70,6 +70,7 @@ import {
   resolvePagesDataNavigationTarget,
 } from "./internal/pages-data-target.js";
 import { markAppRouteDetectedOnPrefetch } from "./internal/app-route-detection.js";
+import { resolveHybridClientRouteOwner } from "./internal/hybrid-client-route-owner.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
 import {
   clearLinkForCurrentNavigation,
@@ -391,6 +392,17 @@ function prefetchUrl(href: string, mode: LinkPrefetchMode, priority: "low" | "hi
   schedule(() => {
     void (async () => {
       if (hasAppNavigationRuntime()) {
+        // Hybrid ownership: skip the App RSC prefetch when Pages owns the
+        // URL. The App's `__VINEXT_LINK_PREFETCH_ROUTES__` may include an
+        // App catch-all that also matches the same path, so a naive
+        // prefetch would fetch an RSC stream for a Pages route — that
+        // stream is never consumed (the click path now hard-navigates to
+        // Pages) and would also race the request the browser will issue on
+        // the actual navigation.
+        const hybridOwner = resolveHybridClientRouteOwner(prefetchHref, __basePath);
+        if (hybridOwner === "pages" || hybridOwner === "document") {
+          return;
+        }
         const autoPrefetch =
           mode === "auto"
             ? resolveAutoAppRoutePrefetch(prefetchHref)
@@ -975,6 +987,30 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       } catch {
         // Ignore URL parsing errors for relative/hash hrefs
       }
+    }
+
+    // Hybrid ownership check: when the App Router runtime is installed and
+    // the target URL is owned by the Pages Router, soft-navigating with RSC
+    // would either (a) hit the App catch-all, or (b) bounce off
+    // `renderPagesFallback` returning null for RSC requests. Either way the
+    // user lands on the wrong route. Pages only renders HTML documents or
+    // `_next/data` JSON, so the only correct path is a document navigation.
+    //
+    // We compare ownership here, not in `navigateClientSide`, because the
+    // document navigation is committed synchronously by the browser — there
+    // is no RSC stream to suspend on, so the soft-navigation bookkeeping
+    // (`setPending`, `setLinkForCurrentNavigation`) would be a no-op at best
+    // and a stale `useLinkStatus` indicator at worst.
+    if (
+      getNavigationRuntime()?.functions.navigate &&
+      ["pages", "document"].includes(resolveHybridClientRouteOwner(navigateHref, __basePath) ?? "")
+    ) {
+      if (replace) {
+        window.location.replace(absoluteFullHref);
+      } else {
+        window.location.assign(absoluteFullHref);
+      }
+      return;
     }
 
     // App Router: delegate to navigateClientSide which handles scroll save,

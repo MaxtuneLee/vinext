@@ -49,6 +49,11 @@ type FakeWindow = {
     patternParts: string[];
     isDynamic: boolean;
   }>;
+  __VINEXT_PAGES_LINK_PREFETCH_ROUTES__?: Array<{
+    canPrefetchLoadingShell: boolean;
+    patternParts: string[];
+    isDynamic: boolean;
+  }>;
   __VINEXT_LOCALES__?: string[];
   __VINEXT_DEFAULT_LOCALE__?: string;
   next?: unknown;
@@ -230,7 +235,7 @@ describe("Pages Router records app routes as detected on prefetch", () => {
     ["query and hash", "/about?from=pages#details", ["about"]],
     ["interception target", "/photos/123", ["photos", ":id"]],
   ])("synchronously detects %s destinations", async (_label, href, patternParts) => {
-    const fakeWindow = installFakeBrowserGlobals([
+    installFakeBrowserGlobals([
       {
         canPrefetchLoadingShell: false,
         patternParts,
@@ -238,11 +243,16 @@ describe("Pages Router records app routes as detected on prefetch", () => {
       },
     ]);
 
-    const { matchesAppRoute } =
+    const { getPagesRouterComponentsMap, markAppRouteDetectedOnPrefetch } =
       await import("../packages/vinext/src/shims/internal/app-route-detection.js");
 
-    expect(matchesAppRoute(href, "")).toBe(true);
-    expect(fakeWindow.location.assign).not.toHaveBeenCalled();
+    markAppRouteDetectedOnPrefetch(href, "");
+
+    expect(
+      getPagesRouterComponentsMap()[new URL(href, "http://localhost").pathname.replace(/\/$/, "")],
+    ).toEqual({
+      __appRouter: true,
+    });
   });
 
   it("strips basePath and locale prefixes before matching App routes", async () => {
@@ -252,11 +262,10 @@ describe("Pages Router records app routes as detected on prefetch", () => {
     fakeWindow.__VINEXT_LOCALES__ = ["en", "fr"];
     fakeWindow.__VINEXT_DEFAULT_LOCALE__ = "en";
 
-    const { matchesAppRoute, markAppRouteDetectedOnPrefetch } =
+    const { markAppRouteDetectedOnPrefetch } =
       await import("../packages/vinext/src/shims/internal/app-route-detection.js");
 
-    expect(matchesAppRoute("/docs/fr/about?from=pages#details", "/docs")).toBe(true);
-    markAppRouteDetectedOnPrefetch("/docs/fr/about", "/docs");
+    markAppRouteDetectedOnPrefetch("/docs/fr/about?from=pages#details", "/docs");
 
     const routerModule = await import("../packages/vinext/src/shims/router.js");
     expect(routerModule.default.components["/about"]).toEqual({ __appRouter: true });
@@ -267,9 +276,32 @@ describe("Pages Router records app routes as detected on prefetch", () => {
       { canPrefetchLoadingShell: false, patternParts: ["about"], isDynamic: false },
     ]);
 
-    const { matchesAppRoute } =
+    const { getPagesRouterComponentsMap, markAppRouteDetectedOnPrefetch } =
       await import("../packages/vinext/src/shims/internal/app-route-detection.js");
 
-    expect(matchesAppRoute("https://example.com/about", "")).toBe(false);
+    markAppRouteDetectedOnPrefetch("https://example.com/about", "");
+    expect(getPagesRouterComponentsMap()).toEqual({});
+  });
+
+  it("does not mark or hard-navigate a Pages-owned overlap", async () => {
+    const fakeWindow = installFakeBrowserGlobals([
+      { canPrefetchLoadingShell: false, patternParts: [":path+"], isDynamic: true },
+    ]);
+    fakeWindow.__VINEXT_PAGES_LINK_PREFETCH_ROUTES__ = [
+      {
+        canPrefetchLoadingShell: false,
+        patternParts: ["pages-dir", ":dynamic"],
+        isDynamic: true,
+      },
+    ];
+    const { markAppRouteDetectedOnPrefetch } =
+      await import("../packages/vinext/src/shims/internal/app-route-detection.js");
+    const routerModule = await import("../packages/vinext/src/shims/router.js");
+
+    markAppRouteDetectedOnPrefetch("/pages-dir/foobar", "");
+    expect(routerModule.default.components["/pages-dir/foobar"]).toBeUndefined();
+
+    void routerModule.default.push("/pages-dir/foobar");
+    expect(fakeWindow.location.assign).not.toHaveBeenCalled();
   });
 });

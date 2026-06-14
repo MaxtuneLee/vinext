@@ -15,7 +15,12 @@ import {
 } from "./routing/pages-router.js";
 import { generateServerEntry as _generateServerEntry } from "./entries/pages-server-entry.js";
 import { generateClientEntry as _generateClientEntry } from "./entries/pages-client-entry.js";
-import { appRouteGraph, appRouter, invalidateAppRouteCache } from "./routing/app-router.js";
+import {
+  appRouteGraph,
+  appRouter,
+  invalidateAppRouteCache,
+  matchAppRoute,
+} from "./routing/app-router.js";
 import type { NitroRouteRuleConfig } from "./build/nitro-route-rules.js";
 import {
   buildViteResolveExtensions,
@@ -46,6 +51,7 @@ import {
 import {
   generateBrowserEntry,
   isLinkPrefetchRoute,
+  toDocumentOnlyAppRoute,
   toLinkPrefetchRoute,
 } from "./entries/app-browser-entry.js";
 import {
@@ -103,6 +109,10 @@ import {
   type PagesPipelineDeps,
   type MiddlewareResult,
 } from "./server/pages-request-pipeline.js";
+import {
+  pagesRouteHasPriorityOverAppRoute,
+  validateHybridRouteConflicts,
+} from "./server/hybrid-route-priority.js";
 import { proxyExternalRequest } from "./config/config-matchers.js";
 import { detectPackageManager } from "./utils/project.js";
 import { isUnknownRecord as isRecord } from "./utils/record.js";
@@ -843,9 +853,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
     // with `{ __appRouter: true }`. See `pages-client-entry.ts` and issue
     // #1526 for the Next.js parity rationale.
     const appPrefetchRoutes = hasAppDir
-      ? (await appRouter(appDir, nextConfig?.pageExtensions, fileMatcher))
-          .filter(isLinkPrefetchRoute)
-          .map(toLinkPrefetchRoute)
+      ? (await appRouter(appDir, nextConfig?.pageExtensions, fileMatcher)).map((route) =>
+          isLinkPrefetchRoute(route) ? toLinkPrefetchRoute(route) : toDocumentOnlyAppRoute(route),
+        )
       : [];
     return _generateClientEntry(pagesDir, nextConfig, fileMatcher, {
       appPrefetchRoutes,
@@ -2390,7 +2400,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         return null;
       },
 
-      configResolved(config) {
+      async configResolved(config) {
         // Provide the resolved config to the Sass-aware CSS Modules Loader so
         // it can call Vite's `preprocessCSS` when processing SCSS files
         // referenced by `composes: className from './file.module.scss'`.
@@ -2398,6 +2408,26 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         // work begins, but after the config is fully resolved so that Sass
         // preprocessor options and `css.modules` settings are in place.
         sassComposesLoader.setResolvedConfig(config);
+
+        if (config.command === "build" && hasAppDir && hasPagesDir) {
+          const [appRoutes, pageRoutes, apiRoutes] = await Promise.all([
+            appRouter(appDir, nextConfig?.pageExtensions, fileMatcher),
+            pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+            apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+          ]);
+          validateHybridRouteConflicts(
+            [...pageRoutes, ...apiRoutes].map((route) => ({
+              ...route,
+              sourcePath: path.relative(root, route.filePath),
+            })),
+            appRoutes
+              .filter((route) => route.pagePath !== null || route.routePath !== null)
+              .map((route) => ({
+                ...route,
+                sourcePath: path.relative(root, route.pagePath ?? route.routePath!),
+              })),
+          );
+        }
 
         // When the user sets `ssr.external: true`, strip React entries from
         // `environments.ssr.resolve.noExternal`. @vitejs/plugin-rsc populates
@@ -2684,7 +2714,34 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         }
         if (id === RESOLVED_APP_BROWSER_ENTRY && hasAppDir) {
           const graph = await appRouteGraph(appDir, nextConfig?.pageExtensions, fileMatcher);
-          return generateBrowserEntry(graph.routes, graph.routeManifest);
+          // In a hybrid build, the App browser entry also exposes the Pages
+          // route manifest so a user who lands on an App page can still
+          // see Pages ownership from a `<Link>` click.
+          const pagesPrefetchRoutes = hasPagesDir
+            ? [
+                ...(await pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher)).map(
+                  (route) => ({
+                    canPrefetchLoadingShell: false as const,
+                    isDynamic: route.isDynamic,
+                    patternParts: [...route.patternParts],
+                  }),
+                ),
+                ...(await apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher)).map(
+                  (route) => ({
+                    canPrefetchLoadingShell: false as const,
+                    documentOnly: true,
+                    isDynamic: route.isDynamic,
+                    patternParts: [...route.patternParts],
+                  }),
+                ),
+              ]
+            : [];
+          return generateBrowserEntry(
+            graph.routes,
+            graph.routeManifest,
+            pagesPrefetchRoutes,
+            nextConfig.rewrites,
+          );
         }
         if (id.startsWith(RESOLVED_VIRTUAL_GOOGLE_FONTS + "?")) {
           return generateGoogleFontsVirtualModule(id, _fontGoogleShimPath);
@@ -3068,10 +3125,75 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           }
         }
 
+        function invalidateHybridClientEntries() {
+          if (!hasAppDir || !hasPagesDir) return;
+          for (const env of Object.values(server.environments)) {
+            for (const id of [RESOLVED_CLIENT_ENTRY, RESOLVED_APP_BROWSER_ENTRY]) {
+              const mod = env.moduleGraph.getModuleById(id);
+              if (mod) env.moduleGraph.invalidateModule(mod);
+            }
+          }
+          server.ws.send({ type: "full-reload" });
+        }
+
+        function invalidatePagesServerEntry() {
+          for (const env of Object.values(server.environments)) {
+            const mod = env.moduleGraph.getModuleById(RESOLVED_SERVER_ENTRY);
+            if (mod) env.moduleGraph.invalidateModule(mod);
+          }
+          pagesRunner?.clearCache();
+        }
+
         function invalidateAppRoutingModules() {
           invalidateAppRouteCache();
           invalidateRscEntryModule();
           invalidateRootParamsModule();
+        }
+
+        let hybridRouteValidation: Promise<void> = Promise.resolve();
+        let hybridRouteValidationError: Error | null = null;
+        function sendHybridRouteValidationError(error: Error) {
+          server.ws.send({
+            type: "error",
+            err: { message: error.message, stack: error.stack ?? error.message },
+          });
+        }
+        server.ws.on("connection", () => {
+          if (hybridRouteValidationError)
+            sendHybridRouteValidationError(hybridRouteValidationError);
+        });
+        function revalidateHybridRoutes() {
+          if (!hasAppDir || !hasPagesDir) return;
+          hybridRouteValidation = hybridRouteValidation
+            .catch(() => {})
+            .then(async () => {
+              const [appRoutes, pageRoutes, apiRoutes] = await Promise.all([
+                appRouter(appDir, nextConfig?.pageExtensions, fileMatcher),
+                pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+                apiRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher),
+              ]);
+              validateHybridRouteConflicts(
+                [...pageRoutes, ...apiRoutes].map((route) => ({
+                  ...route,
+                  sourcePath: path.relative(root, route.filePath),
+                })),
+                appRoutes
+                  .filter((route) => route.pagePath !== null || route.routePath !== null)
+                  .map((route) => ({
+                    ...route,
+                    sourcePath: path.relative(root, route.pagePath ?? route.routePath!),
+                  })),
+              );
+              if (hybridRouteValidationError) {
+                hybridRouteValidationError = null;
+                server.ws.send({ type: "full-reload" });
+              }
+            })
+            .catch((error) => {
+              const err = error instanceof Error ? error : new Error(String(error));
+              hybridRouteValidationError = err;
+              sendHybridRouteValidationError(err);
+            });
         }
 
         let appRouteTypeGeneration: Promise<void> | null = null;
@@ -3109,6 +3231,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         }
 
         regenerateAppRouteTypes();
+        revalidateHybridRoutes();
 
         // Node throws on unhandled 'error' events on sockets. When a browser
         // drops the connection mid-response (common in dev: HMR triggers a
@@ -3123,21 +3246,37 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
         });
 
         server.watcher.on("add", (filePath: string) => {
+          let routeChanged = false;
           if (hasPagesDir && filePath.startsWith(pagesDir) && pageExtensions.test(filePath)) {
             invalidateRouteCache(pagesDir);
+            routeChanged = true;
           }
           if (hasAppDir && shouldInvalidateAppRouteFile(appDir, filePath, fileMatcher)) {
             invalidateAppRoutingModules();
             regenerateAppRouteTypes();
+            routeChanged = true;
+          }
+          if (routeChanged) {
+            invalidatePagesServerEntry();
+            invalidateHybridClientEntries();
+            revalidateHybridRoutes();
           }
         });
         server.watcher.on("unlink", (filePath: string) => {
+          let routeChanged = false;
           if (hasPagesDir && filePath.startsWith(pagesDir) && pageExtensions.test(filePath)) {
             invalidateRouteCache(pagesDir);
+            routeChanged = true;
           }
           if (hasAppDir && shouldInvalidateAppRouteFile(appDir, filePath, fileMatcher)) {
             invalidateAppRoutingModules();
             regenerateAppRouteTypes();
+            routeChanged = true;
+          }
+          if (routeChanged) {
+            invalidatePagesServerEntry();
+            invalidateHybridClientEntries();
+            revalidateHybridRoutes();
           }
         });
 
@@ -3750,6 +3889,20 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 // request, wiping the hybrid app+pages middleware context
                 // (VINEXT_MW_CTX_HEADER, set on req.headers) that the app RSC plugin reads.
                 const apiMatch = matchRoute(pipelineResult.apiUrl, apiRoutes);
+                if (apiMatch && hasAppDir && appDir) {
+                  const appRoutes = await appRouter(
+                    appDir,
+                    nextConfig?.pageExtensions,
+                    fileMatcher,
+                  );
+                  const appMatch = matchAppRoute(pipelineResult.apiUrl, appRoutes);
+                  if (
+                    appMatch &&
+                    !pagesRouteHasPriorityOverAppRoute(apiMatch.route, appMatch.route)
+                  ) {
+                    return next();
+                  }
+                }
                 if (apiMatch) {
                   flushStagedHeaders();
                   flushRequestHeaders();
@@ -3785,11 +3938,28 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
                 const routes = await pagesRouter(pagesDir, nextConfig?.pageExtensions, fileMatcher);
                 // Hybrid app+pages dev: if the resolved URL matches no pages route
                 // and an app/ dir exists, defer to the RSC plugin (app routes live
-                // there). Mirrors the original hasAppDir fallthrough gates that the
-                // refactor centralised into the pipeline owner.
-                const renderMatch = matchRoute(pipelineResult.resolvedUrl.split("?")[0], routes);
-                if (!renderMatch && hasAppDir) {
-                  return next();
+                // there). If both routers match, apply Next.js's merged route
+                // precedence before choosing which plugin owns the request.
+                const resolvedPathname = pipelineResult.resolvedUrl
+                  .split("#", 1)[0]
+                  .split("?", 1)[0];
+                const renderMatch = matchRoute(resolvedPathname, routes);
+                if (hasAppDir && appDir) {
+                  if (!renderMatch) {
+                    return next();
+                  }
+                  const appRoutes = await appRouter(
+                    appDir,
+                    nextConfig?.pageExtensions,
+                    fileMatcher,
+                  );
+                  const appMatch = matchAppRoute(resolvedPathname, appRoutes);
+                  if (
+                    appMatch &&
+                    !pagesRouteHasPriorityOverAppRoute(renderMatch.route, appMatch.route)
+                  ) {
+                    return next();
+                  }
                 }
                 const handler = createSSRHandler(
                   server,

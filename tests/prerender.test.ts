@@ -1542,19 +1542,23 @@ describe("Cloudflare Workers hybrid build (cf-app-basic)", () => {
   // ── Pages Router ────────────────────────────────────────────────────────────
 
   describe("prerenderPages — pages router via prod server HTTP", () => {
-    it("renders static index page", () => {
-      const r = findRoute(allResults, "/");
-      expect(r).toMatchObject({ route: "/", status: "rendered", revalidate: false });
+    it("renders static Pages home", () => {
+      const r = findRoute(allResults, "/pages-home");
+      expect(r).toMatchObject({ route: "/pages-home", status: "rendered", revalidate: false });
       if (r?.status === "rendered") {
-        expect(r.outputFiles).toContain("index.html");
+        expect(r.outputFiles).toContain("pages-home.html");
       }
     });
 
-    it("renders static about page", () => {
-      const r = findRoute(allResults, "/about");
-      expect(r).toMatchObject({ route: "/about", status: "rendered", revalidate: false });
+    it("renders static Pages about", () => {
+      const r = findRoute(allResults, "/pages-about");
+      expect(r).toMatchObject({
+        route: "/pages-about",
+        status: "rendered",
+        revalidate: false,
+      });
       if (r?.status === "rendered") {
-        expect(r.outputFiles).toContain("about.html");
+        expect(r.outputFiles).toContain("pages-about.html");
       }
     });
 

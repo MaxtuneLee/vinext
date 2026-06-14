@@ -1042,9 +1042,9 @@ export default __createAppRscHandler({
   },
   ${
     hasPagesDir
-      ? `async renderPagesFallback({ isRscRequest, middlewareContext, request, url }) {
+      ? `async renderPagesFallback({ allowRscDocumentFallback, appRouteMatch, isRscRequest, matchKind, middlewareContext, pathname, request, url }) {
     return __renderPagesFallback(
-      { isRscRequest, middlewareContext, request, url },
+      { allowRscDocumentFallback, appRouteMatch, isRscRequest, matchKind, middlewareContext, pathname, request, url },
       {
         loadPagesEntry() {
           return import.meta.viteRsc.loadModule("ssr", "index");

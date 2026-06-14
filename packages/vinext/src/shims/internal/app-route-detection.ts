@@ -35,11 +35,9 @@
  * Issue: https://github.com/cloudflare/vinext/issues/1526
  */
 import type { VinextLinkPrefetchRoute } from "../../client/vinext-next-data.js";
-import { createRouteTrieCache, matchRouteWithTrie } from "../../routing/route-matching.js";
 import { stripBasePath, removeTrailingSlash } from "../../utils/base-path.js";
 import { getLocalePathPrefix } from "../../utils/domain-locale.js";
-
-const appRouteTrieCache = createRouteTrieCache<VinextLinkPrefetchRoute>();
+import { resolveHybridClientRouteOwner } from "./hybrid-client-route-owner.js";
 
 declare global {
   // oxlint-disable-next-line typescript-eslint/consistent-type-definitions
@@ -101,22 +99,6 @@ function resolveSameOriginPathname(href: string, basePath: string): string | nul
 }
 
 /**
- * Returns true when the prefetch href matches any route in the App Router
- * prefetch manifest (static or dynamic). Returns false when the manifest is
- * absent (Pages-Router-only build), the URL is external, or no route matches.
- */
-export function matchesAppRoute(href: string, basePath: string): boolean {
-  if (typeof window === "undefined") return false;
-  const routes = window.__VINEXT_LINK_PREFETCH_ROUTES__;
-  if (!routes || routes.length === 0) return false;
-
-  const pathname = resolveSameOriginPathname(href, basePath);
-  if (pathname === null) return false;
-
-  return matchRouteWithTrie(pathname, routes, appRouteTrieCache) !== null;
-}
-
-/**
  * Record `components[pathname] = { __appRouter: true }` on the shared
  * Pages Router map when the href matches an App Router route. No-op when the
  * manifest is absent, the URL is external, or no app route matches.
@@ -130,7 +112,7 @@ export function matchesAppRoute(href: string, basePath: string): boolean {
  */
 export function markAppRouteDetectedOnPrefetch(href: string, basePath: string): void {
   if (typeof window === "undefined") return;
-  if (!matchesAppRoute(href, basePath)) return;
+  if (resolveHybridClientRouteOwner(href, basePath) !== "app") return;
 
   const rawPathname = resolveSameOriginPathname(href, basePath);
   if (rawPathname === null) return;

@@ -49,6 +49,25 @@ describe("renderPagesFallback", () => {
     expect(loadPagesEntry).not.toHaveBeenCalled();
   });
 
+  it("allows middleware-rewritten RSC requests to return a Pages document", async () => {
+    const renderPage = vi.fn(
+      () => new Response("pages", { headers: { "content-type": "text/html" } }),
+    );
+    const response = await renderPagesFallback(
+      {
+        allowRscDocumentFallback: true,
+        isRscRequest: true,
+        middlewareContext: { headers: null, requestHeaders: null, status: null },
+        pathname: "/pages",
+        request: new Request("http://localhost/source"),
+        url: new URL("http://localhost/source"),
+      },
+      { ...defaultDeps, loadPagesEntry: () => ({ renderPage }) },
+    );
+
+    expect(await response!.text()).toBe("pages");
+  });
+
   it("rebuilds request when middleware request headers are present", async () => {
     const handleApiRoute = vi.fn((_req: Request, _url: string) => new Response("api"));
     const deps = {
@@ -197,6 +216,143 @@ describe("renderPagesFallback", () => {
     expect(renderPage.mock.calls[0][1]).toBe("/about us?foo=bar");
     expect(res).not.toBeNull();
     expect(await res!.text()).toBe("page-response");
+  });
+
+  it("filters static and dynamic Pages matches by ownership phase", async () => {
+    const renderPage = vi.fn(() => new Response("page"));
+    const request = new Request("http://localhost/blog/hello");
+    const url = new URL(request.url);
+    const deps = {
+      ...defaultDeps,
+      loadPagesEntry: () => ({
+        matchPageRoute: () => ({ route: { isDynamic: true, pattern: "/blog/:slug" } }),
+        renderPage,
+      }),
+    };
+
+    expect(
+      await renderPagesFallback(
+        {
+          isRscRequest: false,
+          matchKind: "static",
+          middlewareContext: { headers: null, requestHeaders: null, status: null },
+          request,
+          url,
+        },
+        deps,
+      ),
+    ).toBeNull();
+    expect(
+      await renderPagesFallback(
+        {
+          isRscRequest: false,
+          matchKind: "dynamic",
+          middlewareContext: { headers: null, requestHeaders: null, status: null },
+          request,
+          url,
+        },
+        deps,
+      ),
+    ).not.toBeNull();
+  });
+
+  it("filters static and dynamic Pages API matches by ownership phase", async () => {
+    const handleApiRoute = vi.fn(() => new Response("api"));
+    const request = new Request("http://localhost/api/posts/hello");
+    const url = new URL(request.url);
+    const deps = {
+      ...defaultDeps,
+      loadPagesEntry: () => ({
+        handleApiRoute,
+        matchApiRoute: () => ({ route: { isDynamic: true, pattern: "/api/posts/:slug" } }),
+      }),
+    };
+
+    expect(
+      await renderPagesFallback(
+        {
+          isRscRequest: false,
+          matchKind: "static",
+          middlewareContext: { headers: null, requestHeaders: null, status: null },
+          request,
+          url,
+        },
+        deps,
+      ),
+    ).toBeNull();
+    expect(handleApiRoute).not.toHaveBeenCalled();
+
+    expect(
+      await renderPagesFallback(
+        {
+          isRscRequest: false,
+          matchKind: "dynamic",
+          middlewareContext: { headers: null, requestHeaders: null, status: null },
+          request,
+          url,
+        },
+        deps,
+      ),
+    ).not.toBeNull();
+    expect(handleApiRoute).toHaveBeenCalledTimes(1);
+  });
+
+  it("decodes rewritten page paths without decoding their query", async () => {
+    const matchPageRoute = vi.fn(() => ({
+      route: { isDynamic: false, pattern: "/café" },
+    }));
+    const renderPage = vi.fn(() => new Response("page"));
+    const request = new Request("http://localhost/legacy?original=1");
+    const url = new URL(request.url);
+
+    await renderPagesFallback(
+      {
+        isRscRequest: false,
+        middlewareContext: { headers: null, requestHeaders: null, status: null },
+        pathname: "/caf%C3%A9?value=hello%20world",
+        request,
+        url,
+      },
+      {
+        ...defaultDeps,
+        loadPagesEntry: () => ({ matchPageRoute, renderPage }),
+      },
+    );
+
+    expect(matchPageRoute).toHaveBeenCalledWith("/café?value=hello%20world", request);
+    expect(renderPage).toHaveBeenCalledWith(
+      request,
+      "/café?value=hello%20world",
+      {},
+      undefined,
+      null,
+    );
+  });
+
+  it("decodes rewritten API paths without decoding their query", async () => {
+    const matchApiRoute = vi.fn(() => ({
+      route: { isDynamic: false, pattern: "/api/café" },
+    }));
+    const handleApiRoute = vi.fn(() => new Response("api"));
+    const request = new Request("http://localhost/api/legacy?original=1");
+    const url = new URL(request.url);
+
+    await renderPagesFallback(
+      {
+        isRscRequest: false,
+        middlewareContext: { headers: null, requestHeaders: null, status: null },
+        pathname: "/api/caf%C3%A9?value=hello%20world",
+        request,
+        url,
+      },
+      {
+        ...defaultDeps,
+        loadPagesEntry: () => ({ handleApiRoute, matchApiRoute }),
+      },
+    );
+
+    expect(matchApiRoute).toHaveBeenCalledWith("/api/café?value=hello%20world", request);
+    expect(handleApiRoute).toHaveBeenCalledWith(request, "/api/café?value=hello%20world");
   });
 
   it("appends the middleware draft cookie to an API fallback response (#1520)", async () => {

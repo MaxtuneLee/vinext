@@ -377,6 +377,36 @@ describe("beforeFiles rewrites", () => {
     );
   });
 
+  it("applies chained beforeFiles rewrites with accumulated query conditions", async () => {
+    const renderPage = makeRenderPage(200);
+    const result = await runPagesRequest(
+      makeRequest("/from?keep=1"),
+      baseDeps({
+        configRewrites: {
+          beforeFiles: [
+            { source: "/from", destination: "/middle?stage=1" },
+            {
+              source: "/middle",
+              destination: "/to",
+              has: [{ type: "query", key: "stage", value: "1" }],
+            },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/to?keep=1&stage=1",
+      undefined,
+      expect.any(Headers),
+    );
+  });
+
   it("applies every matching beforeFiles rewrite in sequence", async () => {
     const renderPage = makeRenderPage(200);
     const result = await runPagesRequest(
@@ -404,6 +434,27 @@ describe("beforeFiles rewrites", () => {
       expect.any(Headers),
     );
     expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/destination?first=1&second=2");
+  });
+
+  it("excludes beforeFiles fragments from Pages route matching", async () => {
+    const matchPageRoute = vi.fn((pathname: string) =>
+      pathname === "/to" ? { route: { isDynamic: false } } : null,
+    );
+    await runPagesRequest(
+      makeRequest("/from"),
+      baseDeps({
+        configRewrites: {
+          beforeFiles: [{ source: "/from", destination: "/to#section" }],
+          afterFiles: [],
+          fallback: [],
+        },
+        matchPageRoute,
+        renderPage: makeRenderPage(200),
+      }),
+    );
+
+    expect(matchPageRoute).toHaveBeenCalledWith("/to", expect.any(Request));
+    expect(matchPageRoute).not.toHaveBeenCalledWith("/to#section", expect.any(Request));
   });
 });
 
@@ -585,6 +636,36 @@ describe("afterFiles rewrites", () => {
       expect.any(Headers),
     );
   });
+
+  it("continues afterFiles rewrites until a Pages destination resolves", async () => {
+    const renderPage = makeRenderPage(200);
+    const matchPageRoute = vi.fn((pathname: string) =>
+      pathname === "/resolved" ? { route: { isDynamic: false } } : null,
+    );
+    await runPagesRequest(
+      makeRequest("/from"),
+      baseDeps({
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [
+            { source: "/from", destination: "/missing" },
+            { source: "/missing", destination: "/resolved#section" },
+          ],
+          fallback: [],
+        },
+        matchPageRoute,
+        renderPage,
+      }),
+    );
+
+    expect(matchPageRoute).toHaveBeenCalledWith("/resolved", expect.any(Request));
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/resolved#section",
+      undefined,
+      expect.any(Headers),
+    );
+  });
 });
 
 // 14. Render intent when renderPage absent → {type:"render"}
@@ -676,6 +757,38 @@ describe("fallback rewrites on 404", () => {
     if (result.type !== "response") return;
     expect(result.response.status).toBe(200);
     expect(callCount).toBe(2);
+  });
+
+  it("continues fallback rewrites after an unresolved destination", async () => {
+    const renderPage = vi.fn(
+      async (_req: Request, resolvedUrl: string) =>
+        new Response(resolvedUrl, { status: resolvedUrl.startsWith("/resolved") ? 200 : 404 }),
+    );
+    const result = await runPagesRequest(
+      makeRequest("/from"),
+      baseDeps({
+        matchPageRoute: vi.fn().mockReturnValue(null),
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [
+            { source: "/from", destination: "/missing" },
+            { source: "/missing", destination: "/resolved#section" },
+          ],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.status).toBe(200);
+    expect(renderPage).toHaveBeenLastCalledWith(
+      expect.any(Request),
+      "/resolved#section",
+      undefined,
+      expect.any(Headers),
+    );
   });
 });
 

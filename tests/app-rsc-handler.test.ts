@@ -592,6 +592,95 @@ describe("createAppRscHandler", () => {
     expect(dispatchMatchedPage).not.toHaveBeenCalled();
   });
 
+  it("propagates middleware rewrite query parameters to App pages", async () => {
+    let pageOptions: Parameters<HandlerOptions["dispatchMatchedPage"]>[0] | undefined;
+    const handler = createHandler({
+      configHeaders: [],
+      dispatchMatchedPage: async (options) => {
+        pageOptions = options;
+        return new Response("page");
+      },
+      middlewareModule: {
+        default: () =>
+          new Response(null, {
+            headers: {
+              "x-middleware-rewrite": "https://example.test/docs/about?destination=2&same=new",
+            },
+          }),
+      },
+    });
+
+    await handler(new Request("https://example.test/docs/source?original=1&same=old"), null);
+
+    expect(Object.fromEntries(pageOptions!.searchParams)).toEqual({
+      destination: "2",
+      same: "new",
+    });
+  });
+
+  it("evaluates config rewrite conditions against middleware rewrite queries", async () => {
+    let pageOptions: Parameters<HandlerOptions["dispatchMatchedPage"]>[0] | undefined;
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [
+          {
+            source: "/intermediate",
+            destination: "/about?destination=2",
+            has: [{ type: "query", key: "stage", value: "1" }],
+          },
+        ],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage: async (options) => {
+        pageOptions = options;
+        return new Response("page");
+      },
+      middlewareModule: {
+        default: () =>
+          new Response(null, {
+            headers: {
+              "x-middleware-rewrite": "https://example.test/docs/intermediate?stage=1",
+            },
+          }),
+      },
+    });
+
+    await handler(new Request("https://example.test/docs/source"), null);
+
+    expect(Object.fromEntries(pageOptions!.searchParams)).toEqual({
+      destination: "2",
+      stage: "1",
+    });
+  });
+
+  it("allows middleware-rewritten RSC requests to hand off to Pages HTML", async () => {
+    const headers = createRscRequestHeaders();
+    const rscUrl = await createRscRequestUrl("/docs/source", headers);
+    const renderPagesFallback = vi.fn(async ({ allowRscDocumentFallback, pathname }) =>
+      allowRscDocumentFallback && pathname === "/pages"
+        ? new Response("pages", { headers: { "content-type": "text/html" } })
+        : null,
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      matchRoute: () => null,
+      middlewareModule: {
+        default: () =>
+          new Response(null, {
+            headers: { "x-middleware-rewrite": "https://example.test/docs/pages" },
+          }),
+      },
+      renderPagesFallback,
+    });
+
+    const response = await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(response.headers.get("content-type")).toBe("text/html");
+    expect(await response.text()).toBe("pages");
+  });
+
   it("does not duplicate additive config headers on non-redirect middleware responses", async () => {
     const handler = createHandler({
       configHeaders: [
@@ -1008,6 +1097,31 @@ describe("createAppRscHandler", () => {
     expect(context?.searchParams.has("_rsc")).toBe(false);
   });
 
+  it("preserves beforeFiles destination query while stripping the RSC cache key", async () => {
+    const headers = createRscRequestHeaders();
+    const rscUrl = await createRscRequestUrl("/docs/legacy?original=1", headers);
+    let pageOptions: Parameters<HandlerOptions["dispatchMatchedPage"]>[0] | undefined;
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [{ source: "/legacy", destination: "/about?destination=2" }],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage: async (options) => {
+        pageOptions = options;
+        return new Response("page");
+      },
+    });
+
+    await handler(new Request(`https://example.test${rscUrl}`, { headers }), null);
+
+    expect(Object.fromEntries(pageOptions!.searchParams)).toEqual({
+      destination: "2",
+      original: "1",
+    });
+  });
+
   it("runs beforeFiles rewrites before route matching", async () => {
     const matchRoute = vi.fn((pathname: string) =>
       pathname === "/about"
@@ -1017,7 +1131,10 @@ describe("createAppRscHandler", () => {
           }
         : null,
     );
-    const dispatchMatchedPage = vi.fn(async () => new Response("rewritten", { status: 200 }));
+    const dispatchMatchedPage = vi.fn(
+      async (_options: Parameters<HandlerOptions["dispatchMatchedPage"]>[0]) =>
+        new Response("rewritten", { status: 200 }),
+    );
     const handler = createHandler({
       configHeaders: [],
       configRewrites: {
@@ -1037,6 +1154,171 @@ describe("createAppRscHandler", () => {
     expect(dispatchMatchedPage).toHaveBeenCalledWith(
       expect.objectContaining({ cleanPathname: "/about" }),
     );
+  });
+
+  it("propagates rewritten query parameters to App pages", async () => {
+    const setNavigationContext = vi.fn();
+    let pageOptions: Parameters<HandlerOptions["dispatchMatchedPage"]>[0] | undefined;
+    const dispatchMatchedPage = vi.fn(
+      async (options: Parameters<HandlerOptions["dispatchMatchedPage"]>[0]) => {
+        pageOptions = options;
+        return new Response("rewritten", { status: 200 });
+      },
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [{ source: "/legacy", destination: "/about?destination=2&same=new" }],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage,
+      setNavigationContext,
+    });
+
+    await handler(new Request("https://example.test/docs/legacy?original=1&same=old"), null);
+
+    expect(Object.fromEntries(pageOptions!.searchParams)).toEqual({
+      destination: "2",
+      original: "1",
+      same: "new",
+    });
+    expect(Object.fromEntries(setNavigationContext.mock.lastCall![0].searchParams)).toEqual({
+      destination: "2",
+      original: "1",
+      same: "new",
+    });
+  });
+
+  it("applies sequential beforeFiles rewrites with accumulated query conditions", async () => {
+    let pageOptions: Parameters<HandlerOptions["dispatchMatchedPage"]>[0] | undefined;
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [
+          { source: "/source", destination: "/intermediate?preview=1" },
+          {
+            source: "/intermediate",
+            destination: "/about?destination=2",
+            has: [{ type: "query", key: "preview", value: "1" }],
+          },
+        ],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage: async (options) => {
+        pageOptions = options;
+        return new Response("page");
+      },
+    });
+
+    await handler(new Request("https://example.test/docs/source?original=1"), null);
+
+    expect(Object.fromEntries(pageOptions!.searchParams)).toEqual({
+      destination: "2",
+      original: "1",
+      preview: "1",
+    });
+  });
+
+  it("exposes unused rewrite source params through App searchParams", async () => {
+    let pageOptions: Parameters<HandlerOptions["dispatchMatchedPage"]>[0] | undefined;
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [
+          {
+            source: "/source/:section/:name",
+            destination: "/about?first=:section&second=:name",
+          },
+        ],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedPage: async (options) => {
+        pageOptions = options;
+        return new Response("page");
+      },
+    });
+
+    await handler(new Request("https://example.test/docs/source/hello/world"), null);
+
+    expect(Object.fromEntries(pageOptions!.searchParams)).toEqual({
+      first: "hello",
+      name: "world",
+      second: "world",
+      section: "hello",
+    });
+  });
+
+  it.each(["afterFiles", "fallback"] as const)(
+    "continues through unmatched %s rewrite destinations",
+    async (rewritePhase) => {
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles:
+            rewritePhase === "afterFiles"
+              ? [
+                  { source: "/source", destination: "/intermediate" },
+                  { source: "/intermediate", destination: "/about" },
+                ]
+              : [],
+          fallback:
+            rewritePhase === "fallback"
+              ? [
+                  { source: "/source", destination: "/intermediate" },
+                  { source: "/intermediate", destination: "/about" },
+                ]
+              : [],
+        },
+        matchRoute: (pathname) =>
+          pathname === "/about" ? { params: {}, route: createPageRoute() } : null,
+      });
+
+      const response = await handler(new Request("https://example.test/docs/source"), null);
+
+      expect(response.status).toBe(200);
+    },
+  );
+
+  it("propagates rewritten query parameters to App route handlers", async () => {
+    const route = createPageRoute({
+      page: null,
+      pattern: "/api/static",
+      routeHandler: { GET: () => new Response("route") },
+      routeSegments: ["api", "static"],
+    });
+    const dispatchMatchedRouteHandler = vi.fn(
+      async (_options: Parameters<HandlerOptions["dispatchMatchedRouteHandler"]>[0]) =>
+        new Response("route"),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [{ source: "/legacy", destination: "/api/static?destination=2&same=new" }],
+        afterFiles: [],
+        fallback: [],
+      },
+      dispatchMatchedRouteHandler,
+      matchRoute: (pathname) => (pathname === "/api/static" ? { params: {}, route } : null),
+    });
+
+    await handler(new Request("https://example.test/docs/legacy?original=1&same=old"), null);
+
+    const routeHandlerOptions = dispatchMatchedRouteHandler.mock.lastCall?.[0];
+    expect(Object.fromEntries(routeHandlerOptions!.searchParams)).toEqual({
+      destination: "2",
+      original: "1",
+      same: "new",
+    });
+    expect(new URL(routeHandlerOptions!.request.url).pathname).toBe("/docs/legacy");
+    expect(Object.fromEntries(new URL(routeHandlerOptions!.request.url).searchParams)).toEqual({
+      destination: "2",
+      original: "1",
+      same: "new",
+    });
   });
 
   it("does not let afterFiles rewrites override non-dynamic app routes", async () => {
@@ -1111,6 +1393,215 @@ describe("createAppRscHandler", () => {
       expect.objectContaining({ cleanPathname: "/about", route: routes["/about"] }),
     );
   });
+
+  it("lets a static Pages route win before afterFiles rewrites", async () => {
+    const dynamicRoute = createPageRoute({
+      isDynamic: true,
+      pattern: "/:path+",
+      routeSegments: ["[...path]"],
+    });
+    const renderPagesFallback = vi.fn(async () => new Response("pages:/about", { status: 200 }));
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [{ source: "/about", destination: "/rewritten" }],
+        fallback: [],
+      },
+      matchRoute: () => ({ params: { path: ["about"] }, route: dynamicRoute }),
+      renderPagesFallback,
+    });
+
+    const response = await handler(new Request("https://example.test/docs/about"), null);
+
+    expect(await response.text()).toBe("pages:/about");
+    expect(renderPagesFallback).toHaveBeenCalledWith(
+      expect.objectContaining({
+        matchKind: "static",
+        pathname: "/about",
+        appRouteMatch: expect.objectContaining({ route: dynamicRoute }),
+      }),
+    );
+  });
+
+  it("runs afterFiles rewrites before dynamic Pages route ownership", async () => {
+    const appDynamicRoute = createPageRoute({
+      isDynamic: true,
+      pattern: "/:slug",
+      routeSegments: ["[slug]"],
+    });
+    const appDestinationRoute = createPageRoute({
+      pattern: "/destination",
+      routeSegments: ["destination"],
+    });
+    const renderPagesFallback = vi.fn(async ({ matchKind }) =>
+      matchKind === "dynamic" ? new Response("pages-dynamic", { status: 200 }) : null,
+    );
+    const dispatchMatchedPage = vi.fn(
+      async ({ route }) => new Response(`app:${route.pattern}`, { status: 200 }),
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [{ source: "/legacy", destination: "/destination" }],
+        fallback: [],
+      },
+      dispatchMatchedPage,
+      matchRoute: (pathname): ReturnType<HandlerOptions["matchRoute"]> => {
+        if (pathname === "/legacy") {
+          return { params: { slug: "legacy" }, route: appDynamicRoute };
+        }
+        if (pathname === "/destination") return { params: {}, route: appDestinationRoute };
+        return null;
+      },
+      renderPagesFallback,
+    });
+
+    const response = await handler(new Request("https://example.test/docs/legacy"), null);
+
+    expect(await response.text()).toBe("app:/destination");
+    expect(renderPagesFallback).toHaveBeenCalledWith(
+      expect.objectContaining({ matchKind: "static", pathname: "/legacy" }),
+    );
+    expect(renderPagesFallback).not.toHaveBeenCalledWith(
+      expect.objectContaining({ matchKind: "dynamic", pathname: "/legacy" }),
+    );
+  });
+
+  it("rechecks static Pages routes after an afterFiles rewrite", async () => {
+    const renderPagesFallback = vi.fn(async ({ matchKind, pathname }) =>
+      matchKind === "static" && pathname === "/pages-static"
+        ? new Response("pages-static", { status: 200 })
+        : null,
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [{ source: "/legacy", destination: "/pages-static" }],
+        fallback: [],
+      },
+      matchRoute: () => null,
+      renderPagesFallback,
+    });
+
+    const response = await handler(new Request("https://example.test/docs/legacy"), null);
+
+    expect(await response.text()).toBe("pages-static");
+  });
+
+  it("rechecks static and dynamic Pages routes after a fallback rewrite", async () => {
+    const renderPagesFallback = vi.fn(async ({ matchKind, pathname }) =>
+      pathname === "/pages-dynamic" && matchKind === "dynamic"
+        ? new Response("pages-dynamic", { status: 200 })
+        : null,
+    );
+    const handler = createHandler({
+      configHeaders: [],
+      configRewrites: {
+        beforeFiles: [],
+        afterFiles: [],
+        fallback: [{ source: "/legacy", destination: "/pages-dynamic" }],
+      },
+      matchRoute: () => null,
+      renderPagesFallback,
+    });
+
+    const response = await handler(new Request("https://example.test/docs/legacy"), null);
+
+    expect(await response.text()).toBe("pages-dynamic");
+    expect(renderPagesFallback).toHaveBeenCalledWith(
+      expect.objectContaining({ matchKind: "static", pathname: "/pages-dynamic" }),
+    );
+    expect(renderPagesFallback).toHaveBeenCalledWith(
+      expect.objectContaining({ matchKind: "dynamic", pathname: "/pages-dynamic" }),
+    );
+  });
+
+  it.each(["beforeFiles", "afterFiles", "fallback"] as const)(
+    "preserves and overrides query parameters for %s rewrites to Pages routes",
+    async (rewritePhase) => {
+      const renderPagesFallback = vi.fn(async ({ pathname }) =>
+        pathname.startsWith("/pages?") ? new Response("pages", { status: 200 }) : null,
+      );
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles:
+            rewritePhase === "beforeFiles"
+              ? [{ source: "/legacy", destination: "/pages?dest=2&same=new" }]
+              : [],
+          afterFiles:
+            rewritePhase === "afterFiles"
+              ? [{ source: "/legacy", destination: "/pages?dest=2&same=new" }]
+              : [],
+          fallback:
+            rewritePhase === "fallback"
+              ? [{ source: "/legacy", destination: "/pages?dest=2&same=new" }]
+              : [],
+        },
+        matchRoute: () => null,
+        renderPagesFallback,
+      });
+
+      const response = await handler(
+        new Request("https://example.test/docs/legacy?keep=1&same=old"),
+        null,
+      );
+
+      expect(await response.text()).toBe("pages");
+      const rewrittenCall = renderPagesFallback.mock.calls.find(([options]) =>
+        options.pathname.startsWith("/pages?"),
+      );
+      expect(rewrittenCall).toBeDefined();
+      const rewrittenUrl = new URL(rewrittenCall![0].pathname, "https://example.test");
+      expect(rewrittenUrl.pathname).toBe("/pages");
+      expect(Object.fromEntries(rewrittenUrl.searchParams)).toEqual({
+        dest: "2",
+        keep: "1",
+        same: "new",
+      });
+    },
+  );
+
+  it.each(["beforeFiles", "afterFiles", "fallback"] as const)(
+    "excludes rewrite fragments from %s route matching",
+    async (rewritePhase) => {
+      const matchRoute = vi.fn((pathname: string) =>
+        pathname === "/about"
+          ? {
+              params: {},
+              route: createPageRoute(),
+            }
+          : null,
+      );
+      const handler = createHandler({
+        configHeaders: [],
+        configRewrites: {
+          beforeFiles:
+            rewritePhase === "beforeFiles"
+              ? [{ source: "/legacy/:code", destination: "/about#:code" }]
+              : [],
+          afterFiles:
+            rewritePhase === "afterFiles"
+              ? [{ source: "/legacy/:code", destination: "/about#:code" }]
+              : [],
+          fallback:
+            rewritePhase === "fallback"
+              ? [{ source: "/legacy/:code", destination: "/about#:code" }]
+              : [],
+        },
+        matchRoute,
+      });
+
+      const response = await handler(new Request("https://example.test/docs/legacy/500"), null);
+
+      expect(response.status).toBe(200);
+      expect(matchRoute).toHaveBeenCalledWith("/about");
+      expect(matchRoute).not.toHaveBeenCalledWith("/about#500");
+    },
+  );
 
   it("serves public files before route matching and clears request context", async () => {
     const clearRequestContext = vi.fn();

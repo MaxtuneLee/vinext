@@ -36,8 +36,8 @@ import { buildPagesDataHref } from "./internal/pages-data-url.js";
 import {
   getPagesRouterComponentsMap,
   markAppRouteDetectedOnPrefetch,
-  matchesAppRoute,
 } from "./internal/app-route-detection.js";
+import { resolveHybridClientRouteOwner } from "./internal/hybrid-client-route-owner.js";
 import { dedupedPagesDataFetch } from "./internal/pages-data-fetch-dedup.js";
 import { installWindowNext, type PagesRouterPublicInstance } from "../client/window-next.js";
 import { isUnknownRecord } from "../utils/record.js";
@@ -2298,7 +2298,7 @@ async function performNavigation(
     appPathNorm !== null ? getPagesRouterComponentsMap()[appPathNorm] : undefined;
   const appRouteDetected =
     (appPathEntry !== undefined && "__appRouter" in appPathEntry && appPathEntry.__appRouter) ||
-    matchesAppRoute(resolved, __basePath);
+    ["app", "document"].includes(resolveHybridClientRouteOwner(resolved, __basePath) ?? "");
   if (appRouteDetected) {
     if (mode === "push") window.location.assign(full);
     else window.location.replace(full);

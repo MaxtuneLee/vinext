@@ -3,7 +3,7 @@ import { expect, test } from "@playwright/test";
 // Ported from Next.js: test/e2e/app-dir/front-redirect-issue/front-redirect-issue.test.ts
 // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/front-redirect-issue/front-redirect-issue.test.ts
 
-const BASE = "http://localhost:4186";
+const BASE = "http://localhost:4188";
 
 test.describe("app dir - front redirect issue", () => {
   test("should redirect with a single bootstrap hydration", async ({ page }) => {

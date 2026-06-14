@@ -227,6 +227,18 @@ const projectServers = {
       timeout: 60_000,
     },
   },
+  "use-params-app-pages": {
+    testDir: "./tests/e2e/use-params-app-pages",
+    use: { baseURL: "http://localhost:4186" },
+    server: {
+      command:
+        "cd ../../.. && npx vp run vinext#build && cd tests/fixtures/use-params-app-pages && node ../../../packages/vinext/dist/cli.js build && node ../../../packages/vinext/dist/cli.js start --port 4186",
+      cwd: "./tests/fixtures/use-params-app-pages",
+      port: 4186,
+      reuseExistingServer: !process.env.CI,
+      timeout: 60_000,
+    },
+  },
   "ppr-impact-demo": {
     testDir: "./tests/e2e/ppr-impact-demo",
     use: { baseURL: "http://localhost:4187" },
@@ -241,12 +253,12 @@ const projectServers = {
   },
   "app-front-redirect-issue": {
     testDir: "./tests/e2e/app-front-redirect-issue",
-    use: { baseURL: "http://localhost:4186" },
+    use: { baseURL: "http://localhost:4188" },
     server: {
       command:
-        "(test -e node_modules || test -L node_modules || ln -s ../../../fixtures/app-basic/node_modules node_modules) && npx vp run vinext#build && NEXT_DEPLOYMENT_ID=vinext-front-redirect-e2e node ../../../../packages/vinext/dist/cli.js build && NEXT_DEPLOYMENT_ID=vinext-front-redirect-e2e node ../../../../packages/vinext/dist/cli.js start --port 4186",
+        "(test -e node_modules || test -L node_modules || ln -s ../../../fixtures/app-basic/node_modules node_modules) && npx vp run vinext#build && NEXT_DEPLOYMENT_ID=vinext-front-redirect-e2e node ../../../../packages/vinext/dist/cli.js build && NEXT_DEPLOYMENT_ID=vinext-front-redirect-e2e node ../../../../packages/vinext/dist/cli.js start --port 4188",
       cwd: "./tests/e2e/app-front-redirect-issue/fixture",
-      port: 4186,
+      port: 4188,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
     },
