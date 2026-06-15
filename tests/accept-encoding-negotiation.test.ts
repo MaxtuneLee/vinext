@@ -66,6 +66,27 @@ describe("parseAcceptedEncodings", () => {
     expect(parseAcceptedEncodings("gzip;q=0.1.2").has("gzip")).toBe(false);
   });
 
+  it("honors q=0 when followed by another ;param", () => {
+    // q=0 is a refusal even when other params trail it.
+    expect(parseAcceptedEncodings("br;q=0;foo=bar").has("br")).toBe(false);
+  });
+
+  it("honors q=0 when preceded by another ;param", () => {
+    // q=0 at the end of multi-param list is still a refusal.
+    expect(parseAcceptedEncodings("br;foo=bar;q=0").has("br")).toBe(false);
+  });
+
+  it("accepts when no q param is present among other params", () => {
+    // Absence of any q= param defaults to q=1.
+    expect(parseAcceptedEncodings("br;foo=bar").has("br")).toBe(true);
+  });
+
+  it("honors last q when multiple q params appear", () => {
+    // Last q wins (per RFC 9110 weight parameter semantics).
+    expect(parseAcceptedEncodings("br;q=0.5;q=0").has("br")).toBe(false);
+    expect(parseAcceptedEncodings("gzip;q=0;q=0.5").has("gzip")).toBe(true);
+  });
+
   it("preserves the wildcard token", () => {
     expect(parseAcceptedEncodings("*").has("*")).toBe(true);
     expect(parseAcceptedEncodings("*;q=0").has("*")).toBe(false);

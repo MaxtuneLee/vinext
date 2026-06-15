@@ -179,15 +179,22 @@ function parseAcceptedEncodings(accept: string): Set<string> {
       continue;
     }
 
-    const params = trimmed.slice(semi + 1).trim();
-    const qMatch = /^q\s*=\s*(.+)$/.exec(params);
-    // Parameters present but no recognizable q → treat as accepted (q defaults to 1).
-    if (!qMatch) {
+    // Scan all `;`-separated params for a q param. the q param
+    // can appear anywhere among the params (e.g. `br;foo=bar;q=0`)
+    let qStr: string | undefined;
+    for (const param of trimmed.slice(semi + 1).split(";")) {
+      const eq = param.indexOf("=");
+      if (eq === -1) continue;
+      if (param.slice(0, eq).trim() !== "q") continue;
+      qStr = param.slice(eq + 1).trim();
+    }
+
+    // No q param present → default q=1, accepted.
+    if (qStr === undefined) {
       accepted.add(token);
       continue;
     }
 
-    const qStr = qMatch[1].trim();
     // Valid q-value is 0-1 with up to 3 decimals; reject anything malformed.
     if (!/^(?:0(?:\.\d{1,3})?|1(?:\.0{1,3})?)$/.test(qStr)) continue;
 
