@@ -153,13 +153,13 @@ const HAS_ZSTD = typeof zlib.createZstdCompress === "function";
  * Parse an Accept-Encoding header into the set of encoding tokens the client
  * actually accepts, honoring RFC 9110 q-values.
  *
- * A token with `q=0` is an explicit refusal and is excluded. 
+ * A token with `q=0` is an explicit refusal and is excluded.
  * Malformed q-values cause the token to be dropped
  * matching the conservative behavior of Next.js's negotiator-based pipeline.
  *
  * Returns a Set of lowercase encoding tokens (e.g. "gzip", "br"). The `*`
  * wildcard is preserved as a token so callers can decide how to treat it.
- * 
+ *
  * @param accept original Accept-Encoding header value from the client request
  * @returns Set of accepted encoding tokens, with refusals and malformed entries removed
  */
