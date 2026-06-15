@@ -7,7 +7,6 @@ import {
   renderAppPageHtmlResponse,
   renderAppPageHtmlStream,
   renderAppPageHtmlStreamWithRecovery,
-  shouldRerenderAppPageWithGlobalError,
 } from "../packages/vinext/src/server/app-page-stream.js";
 
 function createStream(chunks: string[]): ReadableStream<Uint8Array> {
@@ -91,6 +90,31 @@ describe("app page stream helpers", () => {
       null,
       expect.anything(),
       expect.objectContaining({ waitForAllReady: true }),
+    );
+  });
+
+  it("forwards the PPR fallback-shell abort signal to the SSR handler", async () => {
+    const abortController = new AbortController();
+    const ssrHandler = vi.fn(async () => createStream(["<html>fallback-shell</html>"]));
+
+    const { htmlStream } = await renderAppPageHtmlStream({
+      fontData: createAppPageFontData({
+        getLinks: () => [],
+        getPreloads: () => [],
+        getStyles: () => [],
+      }),
+      navigationContext: null,
+      pprFallbackShellSignal: abortController.signal,
+      rscStream: createStream(["flight"]),
+      ssrHandler: { handleSsr: ssrHandler },
+    });
+
+    await expect(new Response(htmlStream).text()).resolves.toBe("<html>fallback-shell</html>");
+    expect(ssrHandler).toHaveBeenCalledWith(
+      expect.anything(),
+      null,
+      expect.anything(),
+      expect.objectContaining({ pprFallbackShellSignal: abortController.signal }),
     );
   });
 
@@ -289,7 +313,33 @@ describe("app page stream helpers", () => {
 
     expect(onShellRendered).toHaveBeenCalledTimes(1);
     expect(result.response).toBeNull();
+    expect(result.shellErrorRecovered).toBe(false);
     await expect(new Response(result.htmlStream).text()).resolves.toBe("<html>ok</html>");
+  });
+
+  it("preserves the SSR shell recovery outcome", async () => {
+    const result = await renderAppPageHtmlStreamWithRecovery({
+      async renderErrorBoundaryResponse() {
+        throw new Error("should not render an error boundary");
+      },
+      async renderHtmlStream() {
+        return {
+          htmlStream: createStream(['<html id="__next_error__"></html>']),
+          metadataReady: Promise.resolve(),
+          capturedRscData: null,
+          shellErrorRecovered: true,
+        };
+      },
+      async renderSpecialErrorResponse() {
+        throw new Error("should not render a special response");
+      },
+      resolveSpecialError() {
+        return null;
+      },
+    });
+
+    expect(result.response).toBeNull();
+    expect(result.shellErrorRecovered).toBe(true);
   });
 
   it("turns special SSR failures into the provided response", async () => {
@@ -362,29 +412,6 @@ describe("app page stream helpers", () => {
     tracker.onRenderError({ digest: "NEXT_NOT_FOUND" }, { path: "/test" }, { chunk: 2 });
     expect((tracker.getCapturedError() as Error).message).toBe("boom");
     expect(baseOnError).toHaveBeenCalledTimes(2);
-  });
-
-  it("only rerenders with global-error when an RSC error was captured and no local boundary exists", () => {
-    expect(
-      shouldRerenderAppPageWithGlobalError({
-        capturedError: new Error("boom"),
-        hasLocalBoundary: false,
-      }),
-    ).toBe(true);
-
-    expect(
-      shouldRerenderAppPageWithGlobalError({
-        capturedError: new Error("boom"),
-        hasLocalBoundary: true,
-      }),
-    ).toBe(false);
-
-    expect(
-      shouldRerenderAppPageWithGlobalError({
-        capturedError: null,
-        hasLocalBoundary: false,
-      }),
-    ).toBe(false);
   });
 
   it("emits the `x-edge-runtime: 1` marker on HTML stream responses for edge-runtime routes", async () => {

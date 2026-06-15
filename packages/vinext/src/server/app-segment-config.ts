@@ -186,11 +186,12 @@ export function resolveAppPageSegmentConfig(
     config.revalidateSeconds = 0;
   }
 
-  // Top-level dynamic modes supply fetchCache defaults unless a segment does.
+  // Static-only dynamic modes supply fetchCache defaults unless a segment does.
+  // `dynamic = "force-dynamic"` is handled at the fetch decision layer: it
+  // defaults no-config fetches to no-store but must not override explicit
+  // per-fetch cache/revalidate options.
   if (config.fetchCache === undefined) {
-    if (config.dynamicConfig === "force-dynamic") {
-      config.fetchCache = "force-no-store";
-    } else if (config.dynamicConfig === "error") {
+    if (config.dynamicConfig === "error") {
       config.fetchCache = "only-cache";
     }
   }
@@ -210,6 +211,19 @@ export function resolveAppPageFetchCacheMode(
   options: ResolveAppPageSegmentConfigOptions,
 ): FetchCacheMode | null {
   return resolveAppPageSegmentConfig(options).fetchCache ?? null;
+}
+
+/**
+ * Resolve the `fetchCache` segment config exported by a route handler module.
+ *
+ * Route handlers have no layout chain, so the module's own export applies
+ * directly. Mirrors upstream's app-route module, which copies
+ * `userland.fetchCache` into the work store before invoking the handler.
+ */
+export function resolveAppRouteHandlerFetchCacheMode(
+  handler: Pick<AppRouteSegmentConfigModule, "fetchCache">,
+): FetchCacheMode | null {
+  return isRouteSegmentFetchCache(handler.fetchCache) ? handler.fetchCache : null;
 }
 
 export function isEdgeRuntime(runtime: string | undefined): boolean {

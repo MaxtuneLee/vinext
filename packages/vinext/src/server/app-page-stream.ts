@@ -22,6 +22,7 @@ export type AppSsrRenderResult = {
   htmlStream: ReadableStream<Uint8Array>;
   metadataReady: Promise<void>;
   capturedRscData: Promise<ArrayBuffer> | null;
+  shellErrorRecovered?: boolean;
   /**
    * Preload `Link` header value emitted by React during SSR (via `onHeaders`),
    * already capped to `reactMaxHeadersLength`. Empty/undefined when React
@@ -50,6 +51,7 @@ function normalizeAppSsrRenderResult(
     htmlStream: raw,
     metadataReady: resolvedMetadataReady,
     capturedRscData: fallbackCapturedRscData,
+    shellErrorRecovered: false,
   };
 }
 
@@ -128,10 +130,16 @@ export type AppPageSsrHandler = {
       rootParams?: RootParams;
       sideStream?: ReadableStream<Uint8Array>;
       capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+      /** Abort signal for a build-time PPR fallback-shell static render. */
+      pprFallbackShellSignal?: AbortSignal;
       /** When true, wait for the full React tree before emitting bytes. */
       waitForAllReady?: boolean;
       /** Dev-only: original server error to surface in the browser overlay. */
       initialDevServerError?: unknown;
+      /** When true, an SSR-phase-only shell render error resolves to the
+       *  default `__next_error__` error-document shell (with the original
+       *  flight payload and bootstrap) instead of rejecting. See handleSsr. */
+      fallbackToErrorDocumentOnShellError?: boolean;
     },
   ) => Promise<ReadableStream<Uint8Array> | AppSsrRenderResult>;
 };
@@ -162,10 +170,16 @@ type RenderAppPageHtmlStreamOptions = {
   sideStream?: ReadableStream<Uint8Array>;
   /** Out-parameter filled with accumulated raw RSC bytes after stream consumption. */
   capturedRscDataRef?: { value: Promise<ArrayBuffer> | null };
+  /** Abort signal for a build-time PPR fallback-shell static render. */
+  pprFallbackShellSignal?: AbortSignal;
   /** When true, wait for the full React tree before emitting bytes. */
   waitForAllReady?: boolean;
   /** Dev-only: original server error to surface in the browser overlay. */
   initialDevServerError?: unknown;
+  /** True when the app supplies a custom global-error.tsx. Disables the
+   *  default error-document shell fallback so SSR shell errors keep driving
+   *  the server-rendered global-error boundary re-render. */
+  hasCustomGlobalError?: boolean;
 };
 
 type RenderAppPageHtmlResponseOptions = {
@@ -181,6 +195,7 @@ type AppPageHtmlStreamRecoveryResult = {
   response: Response | null;
   metadataReady: Promise<void>;
   capturedRscData: Promise<ArrayBuffer> | null;
+  shellErrorRecovered: boolean;
   /** React-emitted preload `Link` header (already capped). */
   linkHeader?: string;
 };
@@ -205,11 +220,6 @@ type AppPageRscErrorTracker = {
   onRenderError: (error: unknown, requestInfo: unknown, errorContext: unknown) => unknown;
 };
 
-type ShouldRerenderAppPageWithGlobalErrorOptions = {
-  capturedError: unknown;
-  hasLocalBoundary: boolean;
-};
-
 export function createAppPageFontData(options: CreateAppPageFontDataOptions): AppPageFontData {
   return {
     links: options.getLinks(),
@@ -230,8 +240,13 @@ export async function renderAppPageHtmlStream(
     rootParams: options.rootParams,
     sideStream: options.sideStream,
     capturedRscDataRef: options.capturedRscDataRef,
+    pprFallbackShellSignal: options.pprFallbackShellSignal,
     waitForAllReady: options.waitForAllReady,
     initialDevServerError: options.initialDevServerError,
+    // Only when the caller affirmatively knows there is no custom
+    // global-error.tsx; undefined (unknown) keeps reject semantics.
+    fallbackToErrorDocumentOnShellError:
+      options.waitForAllReady !== true && options.hasCustomGlobalError === false,
   };
 
   const rawResult = await options.ssrHandler.handleSsr(
@@ -336,7 +351,7 @@ export async function renderAppPageHtmlStreamWithRecovery<TSpecialError>(
 ): Promise<AppPageHtmlStreamRecoveryResult> {
   try {
     const rawResult = await options.renderHtmlStream();
-    const { htmlStream, metadataReady, capturedRscData, linkHeader } =
+    const { htmlStream, metadataReady, capturedRscData, linkHeader, shellErrorRecovered } =
       normalizeAppSsrRenderResult(rawResult);
     options.onShellRendered?.();
     return {
@@ -344,6 +359,7 @@ export async function renderAppPageHtmlStreamWithRecovery<TSpecialError>(
       response: null,
       metadataReady,
       capturedRscData,
+      shellErrorRecovered: shellErrorRecovered === true,
       linkHeader,
     };
   } catch (error) {
@@ -354,6 +370,7 @@ export async function renderAppPageHtmlStreamWithRecovery<TSpecialError>(
         response: await options.renderSpecialErrorResponse(specialError),
         metadataReady: resolvedMetadataReady,
         capturedRscData: null,
+        shellErrorRecovered: false,
       };
     }
 
@@ -364,6 +381,7 @@ export async function renderAppPageHtmlStreamWithRecovery<TSpecialError>(
         response: boundaryResponse,
         metadataReady: resolvedMetadataReady,
         capturedRscData: null,
+        shellErrorRecovered: false,
       };
     }
 
@@ -400,10 +418,4 @@ export function createAppPageRscErrorTracker(
       return baseOnError(error, requestInfo, errorContext);
     },
   };
-}
-
-export function shouldRerenderAppPageWithGlobalError(
-  options: ShouldRerenderAppPageWithGlobalErrorOptions,
-): boolean {
-  return Boolean(options.capturedError) && !options.hasLocalBoundary;
 }

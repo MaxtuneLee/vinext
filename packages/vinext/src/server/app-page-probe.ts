@@ -395,6 +395,7 @@ type ProbeAppPageBeforeRenderResult = {
 
 type ProbeAppPageBeforeRenderOptions = {
   hasLoadingBoundary: boolean;
+  skipProbes?: boolean;
   layoutCount: number;
   probeLayoutAt: (layoutIndex: number) => unknown;
   probePage: () => unknown;
@@ -413,6 +414,10 @@ export async function probeAppPageBeforeRender(
   options: ProbeAppPageBeforeRenderOptions,
 ): Promise<ProbeAppPageBeforeRenderResult> {
   let layoutFlags: LayoutFlags = {};
+
+  if (options.skipProbes) {
+    return { response: null, layoutFlags };
+  }
 
   // Layouts render before their children in Next.js, so layout-level special
   // errors must be handled before probing the page component itself.

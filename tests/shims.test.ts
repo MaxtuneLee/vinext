@@ -15,8 +15,19 @@ import type {
   CacheHandlerValue,
   IncrementalCacheValue,
 } from "../packages/vinext/src/shims/cache.js";
+import { normalizePathSeparators } from "../packages/vinext/src/utils/path.ts";
 
 const FIXTURE_DIR = PAGES_FIXTURE_DIR;
+
+function commitRenderedPagesRouterElement(element: unknown): void {
+  if (typeof document === "undefined" || document.documentElement === undefined) return;
+
+  const props = (element as { props?: unknown } | null)?.props;
+  const onCommit =
+    props && typeof props === "object" ? (props as { onCommit?: unknown }).onCommit : undefined;
+  if (typeof onCommit === "function") queueMicrotask(onCommit as () => void);
+}
+
 describe("vinext next data client helpers", () => {
   it("extracts __NEXT_DATA__ after carriage-return whitespace", () => {
     const json = '{"props":{},"page":"/","query":{}}';
@@ -325,6 +336,74 @@ describe("next/navigation shim", () => {
       expect(calls.indexOf("clear")).toBeLessThan(calls.indexOf("navigate:refresh"));
     } finally {
       (globalThis as any).window = previousWindow;
+      vi.resetModules();
+    }
+  });
+
+  it("attaches experimental_gesturePush only when the gesture transition define is set", async () => {
+    // In real builds `process.env.__NEXT_GESTURE_TRANSITION` is replaced with a
+    // boolean literal by the define in packages/vinext/src/index.ts; in vitest
+    // it reads the live env, so stub it and re-import the shim to exercise both
+    // sides of the gate.
+    try {
+      vi.stubEnv("__NEXT_GESTURE_TRANSITION", "");
+      vi.resetModules();
+      const { appRouterInstance: withoutDefine } =
+        await import("../packages/vinext/src/shims/navigation.js");
+      expect(typeof withoutDefine.experimental_gesturePush).toBe("undefined");
+
+      vi.stubEnv("__NEXT_GESTURE_TRANSITION", "true");
+      vi.resetModules();
+      const { appRouterInstance: withDefine } =
+        await import("../packages/vinext/src/shims/navigation.js");
+      expect(typeof withDefine.experimental_gesturePush).toBe("function");
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+    }
+  });
+
+  // Next.js parity: upstream's gesturePush early-returns when
+  // `getCurrentAppRouterState() === null` — a gesture dispatched before
+  // hydration is a no-op. Without the guard, navigateClientSide's non-runtime
+  // fallback would perform a real history push instead.
+  it("experimental_gesturePush is a no-op before the navigation runtime is ready", async () => {
+    const previousWindow = (globalThis as any).window;
+    const historyCalls: string[] = [];
+    const win = {
+      location: { href: "http://localhost/current", origin: "http://localhost" },
+      history: {
+        state: null,
+        pushState: () => {
+          historyCalls.push("push");
+        },
+        replaceState: () => {
+          historyCalls.push("replace");
+        },
+      },
+      addEventListener: () => {},
+      // No Symbol.for("vinext.navigationRuntime") entry: pre-hydration state.
+    };
+    (globalThis as any).window = win;
+
+    try {
+      vi.stubEnv("__NEXT_GESTURE_TRANSITION", "true");
+      vi.resetModules();
+      const { appRouterInstance } = await import("../packages/vinext/src/shims/navigation.js");
+      if (!appRouterInstance.experimental_gesturePush) {
+        throw new Error("Expected experimental_gesturePush to be attached");
+      }
+      appRouterInstance.experimental_gesturePush("/next-page");
+      // navigateClientSide is async; flush microtasks so a (buggy) fallthrough
+      // into its history-push branch would be observable.
+      await Promise.resolve();
+      await Promise.resolve();
+
+      expect(historyCalls).toEqual([]);
+      expect(win.location.href).toBe("http://localhost/current");
+    } finally {
+      (globalThis as any).window = previousWindow;
+      vi.unstubAllEnvs();
       vi.resetModules();
     }
   });
@@ -1053,6 +1132,31 @@ describe("next/navigation shim", () => {
     expect(typeof nav.useSelectedLayoutSegments).toBe("function");
   });
 
+  it("marks navigation hooks dynamic during fallback-shell prerendering", async () => {
+    const { createPprFallbackShellState, runWithPprFallbackShellState } =
+      await import("../packages/vinext/src/shims/ppr-fallback-shell.js");
+    const navigation = await import("../packages/vinext/src/shims/navigation.js");
+
+    const readHooks: Array<() => unknown> = [
+      () => navigation.usePathname(),
+      () => navigation.useSearchParams(),
+      () => navigation.useParams(),
+      () => navigation.useSelectedLayoutSegment(),
+      () => navigation.useSelectedLayoutSegments(),
+    ];
+
+    for (const readHook of readHooks) {
+      const state = createPprFallbackShellState({
+        fallbackParamNames: ["slug"],
+        routePattern: "/blog/:slug",
+      });
+
+      runWithPprFallbackShellState(state, readHook);
+
+      expect(state.hasDynamicBoundary).toBe(true);
+    }
+  });
+
   it("useSelectedLayoutSegment still works when provider and hook are loaded from different module instances", async () => {
     const React = await import("react");
     const { renderToStaticMarkup } = await import("react-dom/server");
@@ -1398,6 +1502,213 @@ describe("next/navigation shim", () => {
   });
 
   // -------------------------------------------------------------------------
+  // useUntrackedPathname
+  //
+  // Ported from Next.js:
+  //   https://github.com/vercel/next.js/blob/v16.2.6/packages/next/src/client/components/navigation-untracked.ts
+  // -------------------------------------------------------------------------
+  it("useUntrackedPathname returns '/' on server when no navigation context is set", async () => {
+    const { useUntrackedPathname } =
+      await import("../packages/vinext/src/shims/internal/navigation-untracked.js");
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+
+    let captured: string | null = "";
+    function Probe() {
+      captured = useUntrackedPathname();
+      return React.createElement("span", null, captured ?? "null");
+    }
+
+    renderToStaticMarkup(React.createElement(Probe));
+    expect(captured).toBe("/");
+  });
+
+  it("useUntrackedPathname returns pathname from server context", async () => {
+    const { useUntrackedPathname } =
+      await import("../packages/vinext/src/shims/internal/navigation-untracked.js");
+    const { setNavigationContext } = await import("../packages/vinext/src/shims/navigation.js");
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+
+    setNavigationContext({
+      pathname: "/untracked/test",
+      searchParams: new URLSearchParams(""),
+      params: {},
+    });
+
+    let captured: string | null = "";
+    function Probe() {
+      captured = useUntrackedPathname();
+      return React.createElement("span", null, captured ?? "null");
+    }
+
+    try {
+      renderToStaticMarkup(React.createElement(Probe));
+      expect(captured).toBe("/untracked/test");
+    } finally {
+      setNavigationContext(null);
+    }
+  });
+
+  it("useUntrackedPathname prefers render snapshot during active navigation", async () => {
+    const previousWindow = globalThis.window;
+    const win = {
+      addEventListener() {},
+      dispatchEvent() {
+        return true;
+      },
+      history: {
+        pushState() {},
+        replaceState() {},
+      },
+      location: {
+        href: "http://localhost/committed",
+        origin: "http://localhost",
+        pathname: "/committed",
+        search: "",
+      },
+      removeEventListener() {},
+    };
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const React = await import("react");
+      const { renderToStaticMarkup } = await import("react-dom/server");
+      const { useUntrackedPathname } =
+        await import("../packages/vinext/src/shims/internal/navigation-untracked.js");
+      const navigation = await import("../packages/vinext/src/shims/navigation.js");
+      const Context = navigation.getClientNavigationRenderContext();
+      if (!Context) {
+        throw new Error("Expected client navigation render context");
+      }
+
+      navigation.activateNavigationSnapshot();
+      const snapshot = navigation.createClientNavigationRenderSnapshot(
+        "http://localhost/pending-untracked?from=snapshot",
+        {},
+      );
+
+      let pathname: string | null = "";
+      function Probe() {
+        pathname = useUntrackedPathname();
+        return React.createElement("span", null, pathname ?? "null");
+      }
+
+      renderToStaticMarkup(
+        React.createElement(Context.Provider, { value: snapshot }, React.createElement(Probe)),
+      );
+      expect(pathname).toBe("/pending-untracked");
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+    }
+  });
+
+  it("useUntrackedPathname ignores stale render snapshot after navigation commits", async () => {
+    const previousWindow = globalThis.window;
+    const win = {
+      addEventListener() {},
+      dispatchEvent() {
+        return true;
+      },
+      history: {
+        pushState() {},
+        replaceState() {},
+      },
+      location: {
+        href: "http://localhost/committed",
+        origin: "http://localhost",
+        pathname: "/committed",
+        search: "",
+      },
+      removeEventListener() {},
+    };
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const React = await import("react");
+      const { renderToStaticMarkup } = await import("react-dom/server");
+      const { useUntrackedPathname } =
+        await import("../packages/vinext/src/shims/internal/navigation-untracked.js");
+      const navigation = await import("../packages/vinext/src/shims/navigation.js");
+      const Context = navigation.getClientNavigationRenderContext();
+      if (!Context) {
+        throw new Error("Expected client navigation render context");
+      }
+
+      // Snapshot is present but NOT active (navigationSnapshotActiveCount === 0).
+      // This simulates a post-commit re-render where the provider still wraps
+      // the tree but the URL has since changed via user pushState/replaceState.
+      const snapshot = navigation.createClientNavigationRenderSnapshot(
+        "http://localhost/stale-provider?from=snapshot",
+        {},
+      );
+
+      let pathname: string | null = "";
+      function Probe() {
+        pathname = useUntrackedPathname();
+        return React.createElement("span", null, pathname ?? "null");
+      }
+
+      renderToStaticMarkup(
+        React.createElement(Context.Provider, { value: snapshot }, React.createElement(Probe)),
+      );
+      // Must return the committed pathname, not the stale provider snapshot.
+      expect(pathname).toBe("/committed");
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+    }
+  });
+
+  it("useUntrackedPathname returns Pages Router pathname when no App context is set", async () => {
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const accessorKey = Symbol.for("vinext.navigation.pagesNavigationContextAccessor");
+    const globalRecord = globalThis as Record<PropertyKey, unknown>;
+    const previousAccessor = globalRecord[accessorKey];
+
+    try {
+      globalRecord[accessorKey] = () => ({
+        pathname: "/pages/untracked",
+        searchParams: new URLSearchParams(""),
+        params: {},
+      });
+
+      const hookPath =
+        "../packages/vinext/src/shims/internal/navigation-untracked.js?pages-untracked=1";
+      const { useUntrackedPathname } = (await import(
+        hookPath
+      )) as typeof import("../packages/vinext/src/shims/internal/navigation-untracked.js");
+
+      let captured: string | null = "";
+      function Probe() {
+        captured = useUntrackedPathname();
+        return React.createElement("span", null, captured ?? "null");
+      }
+
+      renderToStaticMarkup(React.createElement(Probe));
+      expect(captured).toBe("/pages/untracked");
+    } finally {
+      if (previousAccessor === undefined) {
+        delete globalRecord[accessorKey];
+      } else {
+        globalRecord[accessorKey] = previousAccessor;
+      }
+    }
+  });
+
+  // -------------------------------------------------------------------------
   // react-server re-exports
   // -------------------------------------------------------------------------
   it("navigation.react-server re-exports unstable_rethrow and stubs unstable_isUnrecognizedActionError", async () => {
@@ -1429,6 +1740,18 @@ describe("next/navigation shim", () => {
 //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/catch-error/
 // ---------------------------------------------------------------------------
 describe("next/error shim — unstable_catchError", () => {
+  // Ported from Next.js:
+  // packages/next/src/api/error.react-server.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/packages/next/src/api/error.react-server.ts
+  it("error.react-server throws the exact Client Components diagnostic", async () => {
+    const { unstable_catchError } =
+      await import("../packages/vinext/src/shims/error.react-server.js");
+
+    expect(() => unstable_catchError()).toThrow(
+      "`unstable_catchError` can only be used in Client Components.",
+    );
+  });
+
   it("exports unstable_catchError as a function", async () => {
     const mod = await import("../packages/vinext/src/shims/error.js");
     expect(typeof mod.unstable_catchError).toBe("function");
@@ -1454,118 +1777,6 @@ describe("next/error shim — unstable_catchError", () => {
 
     expect(html).toContain('id="ok"');
     expect(html).toContain("hello");
-  });
-
-  it("class-component lifecycle catches non-router errors and renders the fallback", async () => {
-    // React 19's renderToStaticMarkup does NOT invoke error boundaries during
-    // SSR — errors propagate up by design (boundaries only run during client
-    // commit). To validate behavior without spinning up a real browser, we
-    // exercise the lifecycle hooks directly: `getDerivedStateFromError` is
-    // the canonical predicate driving the class component's behavior, and
-    // its return value is the only thing the React runtime feeds into the
-    // next render.
-    const React = (await import("react")).default;
-    const { renderToStaticMarkup } = await import("react-dom/server");
-    const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
-
-    const seenErrors: unknown[] = [];
-    function Fallback(
-      props: { title: string },
-      info: { error: unknown; reset: () => void; unstable_retry: () => void },
-    ) {
-      seenErrors.push(info.error);
-      const message = info.error instanceof Error ? info.error.message : String(info.error);
-      return React.createElement(
-        "div",
-        null,
-        React.createElement("p", { id: "title" }, props.title),
-        React.createElement("p", { id: "msg" }, message),
-      );
-    }
-
-    const Boundary = unstable_catchError<{ title: string }>(Fallback);
-
-    // Locate the inner class component by inspecting what the HOC renders.
-    // The wrapper function returns `React.createElement(_CatchError, ...)`.
-    const wrapperResult = (
-      Boundary as unknown as (props: {
-        title: string;
-        children?: React.ReactNode;
-      }) => React.ReactElement
-    )({
-      title: "hello-title",
-      children: React.createElement("span", null, "child"),
-    });
-    const InnerCatchError = wrapperResult.type as unknown as React.ComponentClass<{
-      fallback: typeof Fallback;
-      forwardedProps: { title: string };
-      children?: React.ReactNode;
-    }>;
-
-    const props = {
-      fallback: Fallback,
-      forwardedProps: { title: "hello-title" },
-      children: React.createElement("span", null, "child"),
-    };
-    // Cast through unknown to instantiate without engaging React's renderer.
-    const instance = new (InnerCatchError as unknown as new (p: typeof props) => InstanceType<
-      typeof InnerCatchError
-    > & {
-      state: { error: { thrownValue: unknown } | null };
-      render(): React.ReactNode;
-    })(props);
-    instance.state = { error: null };
-
-    // 1. No error → renders children.
-    const childrenOutput = renderToStaticMarkup(instance.render() as React.ReactElement);
-    expect(childrenOutput).toContain("child");
-
-    // 2. After getDerivedStateFromError, renders the fallback with ErrorInfo.
-    const thrown = new Error("boom");
-    const derived = (
-      InnerCatchError as unknown as {
-        getDerivedStateFromError(e: unknown): { error: { thrownValue: unknown } | null };
-      }
-    ).getDerivedStateFromError(thrown);
-    expect(derived).toEqual({ error: { thrownValue: thrown } });
-    instance.state = derived;
-    const fallbackOutput = renderToStaticMarkup(instance.render() as React.ReactElement);
-    expect(fallbackOutput).toContain('id="msg"');
-    expect(fallbackOutput).toContain("boom");
-    expect(fallbackOutput).toContain("hello-title");
-    expect(seenErrors[seenErrors.length - 1]).toBe(thrown);
-  });
-
-  it("class-component getDerivedStateFromError re-throws Next.js router errors", async () => {
-    const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
-    const { redirect } = await import("../packages/vinext/src/shims/navigation.js");
-
-    function Fallback() {
-      return null;
-    }
-    const Boundary = unstable_catchError(Fallback);
-
-    // Probe the inner class through the wrapper.
-    const wrapperResult = (Boundary as unknown as (p: Record<string, never>) => { type: unknown })(
-      {},
-    );
-    const InnerCatchError = wrapperResult.type as unknown as {
-      getDerivedStateFromError(e: unknown): unknown;
-    };
-
-    let captured: unknown = null;
-    try {
-      redirect("/login");
-    } catch (e) {
-      captured = e;
-    }
-    expect(() => InnerCatchError.getDerivedStateFromError(captured)).toThrow();
-    try {
-      InnerCatchError.getDerivedStateFromError(captured);
-    } catch (rethrown) {
-      // Identity-preserving rethrow.
-      expect(rethrown).toBe(captured);
-    }
   });
 
   it("rethrows Next.js navigation signals (redirect, notFound) instead of catching them", async () => {
@@ -1626,16 +1837,25 @@ describe("next/error shim — unstable_catchError", () => {
   // (`isNextRouterError`) must not crash on null/undefined inputs.
   it("class-component getDerivedStateFromError accepts null thrown values", async () => {
     const React = (await import("react")).default;
+    const { renderToStaticMarkup } = await import("react-dom/server");
     const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
 
     function Fallback() {
       return null;
     }
     const Boundary = unstable_catchError(Fallback);
-    const wrapperResult = (Boundary as unknown as (p: Record<string, never>) => { type: unknown })(
-      {},
-    );
-    const InnerCatchError = wrapperResult.type as unknown as {
+
+    // The Boundary wrapper is a function component that calls hooks
+    // (usePathname, useContext). We must call it inside a React render
+    // so React's dispatcher is active.
+    let wrapperResult: React.ReactElement | null = null;
+    function Capture() {
+      wrapperResult = (Boundary as unknown as (p: Record<string, never>) => React.ReactElement)({});
+      return React.createElement("span");
+    }
+    renderToStaticMarkup(React.createElement(Capture));
+
+    const InnerCatchError = wrapperResult!.type as unknown as {
       getDerivedStateFromError(e: unknown): { error: { thrownValue: unknown } | null };
     };
 
@@ -1656,42 +1876,137 @@ describe("next/error shim — unstable_catchError", () => {
     });
   });
 
-  // unstable_retry behavior parity. Next.js refreshes the App Router segment
-  // and resets the boundary. vinext does the same on the client; on the
-  // server we throw (refresh is meaningless during SSR setup).
-  it("unstable_retry throws on the server (where refresh is meaningless)", async () => {
+  // class-component lifecycle catches non-router errors and renders the fallback
+  it("class-component lifecycle catches non-router errors and renders the fallback", async () => {
+    // React 19's renderToStaticMarkup does NOT invoke error boundaries during
+    // SSR — errors propagate up by design (boundaries only run during client
+    // commit). To validate behavior without spinning up a real browser, we
+    // exercise the lifecycle hooks directly: `getDerivedStateFromError` is
+    // the canonical predicate driving the class component's behavior, and
+    // its return value is the only thing the React runtime feeds into the
+    // next render.
     const React = (await import("react")).default;
+    const { renderToStaticMarkup } = await import("react-dom/server");
     const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
 
-    function Fallback(
-      _props: Record<string, never>,
-      info: { error: unknown; reset: () => void; unstable_retry: () => void },
-    ) {
-      return React.createElement("button", { onClick: info.unstable_retry }, "retry");
+    const seenErrors: unknown[] = [];
+    function Fallback({
+      props,
+      errorInfo,
+    }: {
+      props: { title: string };
+      errorInfo: { error: unknown; reset: () => void; unstable_retry: () => void };
+    }) {
+      seenErrors.push(errorInfo.error);
+      const message =
+        errorInfo.error instanceof Error ? errorInfo.error.message : String(errorInfo.error);
+      return React.createElement(
+        "div",
+        null,
+        React.createElement("p", { id: "title" }, props.title),
+        React.createElement("p", { id: "msg" }, message),
+      );
+    }
+
+    // `as any` is necessary here because this test probes the inner
+    // `_CatchError` class component directly, where `Fallback` is used
+    // as a React component type (receives `{ props, errorInfo }` as a
+    // single props object per React.createElement semantics), matching
+    // the internal wrapper shape rather than the public API signature
+    // `(props: P, errorInfo: ErrorInfo) => React.ReactNode`.
+    const Boundary = unstable_catchError<{ title: string }>(Fallback as any);
+
+    // The Boundary wrapper is a function component that calls hooks.
+    // We must call it inside a React render so React's dispatcher is active.
+    let wrapperResult: React.ReactElement | null = null;
+    function Capture() {
+      wrapperResult = (
+        Boundary as unknown as (props: {
+          title: string;
+          children?: React.ReactNode;
+        }) => React.ReactElement
+      )({
+        title: "hello-title",
+        children: React.createElement("span", null, "child"),
+      });
+      return React.createElement("span");
+    }
+    renderToStaticMarkup(React.createElement(Capture));
+
+    const InnerCatchError = wrapperResult!.type as unknown as React.ComponentClass<{
+      fallback: typeof Fallback;
+      props: { title: string };
+      children?: React.ReactNode;
+    }> & {
+      getDerivedStateFromError(thrownValue: unknown): { error: { thrownValue: unknown } | null };
+    };
+
+    const props = {
+      fallback: Fallback,
+      props: { title: "hello-title" },
+      children: React.createElement("span", null, "child"),
+    };
+    // Cast through unknown to instantiate without engaging React's renderer.
+    const instance = new (InnerCatchError as unknown as new (p: typeof props) => InstanceType<
+      typeof InnerCatchError
+    > & {
+      state: { error: { thrownValue: unknown } | null };
+      render(): React.ReactNode;
+    })(props);
+
+    // Before an error: children render untouched.
+    expect(renderToStaticMarkup(instance.render() as React.ReactElement)).toContain("child");
+
+    // Simulate React calling getDerivedStateFromError with a thrown Error.
+    const thrown = new Error("boom");
+    const derived = InnerCatchError.getDerivedStateFromError(thrown);
+    expect(derived).toEqual({ error: { thrownValue: thrown } });
+
+    // Feed the derived state into the instance and render the fallback.
+    instance.state = derived as { error: { thrownValue: unknown } | null };
+    const fallbackOutput = renderToStaticMarkup(instance.render() as React.ReactElement);
+    expect(fallbackOutput).toContain("boom");
+    expect(fallbackOutput).toContain("hello-title");
+    expect(seenErrors[seenErrors.length - 1]).toBe(thrown);
+  });
+
+  it("class-component getDerivedStateFromError re-throws Next.js router errors", async () => {
+    const React = (await import("react")).default;
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
+    const { redirect } = await import("../packages/vinext/src/shims/navigation.js");
+
+    function Fallback() {
+      return null;
     }
     const Boundary = unstable_catchError(Fallback);
-    // Probe the inner class for its instance shape.
-    const wrapperResult = (Boundary as unknown as (p: Record<string, never>) => { type: unknown })(
-      {},
-    );
-    const InnerCatchError = wrapperResult.type as unknown as new (props: object) => {
-      state: { error: { thrownValue: unknown } | null };
-      unstable_retry: () => void;
-    };
-    const instance = new InnerCatchError({
-      fallback: Fallback,
-      forwardedProps: {},
-    });
-    // Manually instantiating the class skips React's context machinery,
-    // so `this.context` is undefined. Seed it to `null` (matching the
-    // App Router default) so the Pages Router branch in `unstable_retry`
-    // doesn't fire.
-    (instance as unknown as { context: null }).context = null;
-    instance.state = { error: { thrownValue: new Error("boom") } };
 
-    // typeof window === "undefined" in this Node test environment, so
-    // unstable_retry should throw a clear "client only" error.
-    expect(() => instance.unstable_retry()).toThrow(/client/i);
+    // The Boundary wrapper is a function component that calls hooks.
+    // We must call it inside a React render so React's dispatcher is active.
+    let wrapperResult: React.ReactElement | null = null;
+    function Capture() {
+      wrapperResult = (Boundary as unknown as (p: Record<string, never>) => React.ReactElement)({});
+      return React.createElement("span");
+    }
+    renderToStaticMarkup(React.createElement(Capture));
+
+    const InnerCatchError = wrapperResult!.type as unknown as {
+      getDerivedStateFromError(e: unknown): unknown;
+    };
+
+    let captured: unknown = null;
+    try {
+      redirect("/login");
+    } catch (e) {
+      captured = e;
+    }
+    expect(() => InnerCatchError.getDerivedStateFromError(captured)).toThrow();
+    try {
+      InnerCatchError.getDerivedStateFromError(captured);
+    } catch (rethrown) {
+      // Identity-preserving rethrow.
+      expect(rethrown).toBe(captured);
+    }
   });
 
   it("unstable_retry on the client calls appRouterInstance.refresh and resets the boundary", async () => {
@@ -1700,61 +2015,70 @@ describe("next/error shim — unstable_catchError", () => {
     // installed BEFORE re-importing the shims, otherwise navigation.ts will
     // initialize its client navigation state against a bare `{}` and crash.
     // Mutable view over globalThis that allows assigning/deleting `window`.
-    // We avoid `as Window & typeof globalThis` because the stub doesn't have
-    // the full DOM surface — just the bits navigation.ts touches at
-    // module-load.
     const globalAny = globalThis as unknown as { window?: unknown };
     const previousWindow = globalAny.window;
-    const stubWindow = {
+    const win = {
       location: {
-        search: "",
         pathname: "/",
+        search: "",
+        hash: "",
         href: "http://localhost/",
         origin: "http://localhost",
       },
       history: {
-        pushState: () => {},
-        replaceState: () => {},
-        back: () => {},
-        forward: () => {},
         state: null,
+        pushState() {},
+        replaceState() {},
       },
-      addEventListener: () => {},
-      scrollTo: () => {},
+      addEventListener() {},
+      dispatchEvent() {
+        return true;
+      },
+      removeEventListener() {},
+      scrollTo() {},
+      scrollX: 0,
+      scrollY: 0,
     };
-    globalAny.window = stubWindow;
+    globalAny.window = win;
 
     try {
       vi.resetModules();
 
       const React = (await import("react")).default;
+      const { renderToStaticMarkup } = await import("react-dom/server");
       const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
-      const navigation = await import("../packages/vinext/src/shims/navigation.js");
 
-      const refreshSpy = vi
-        .spyOn(navigation.appRouterInstance, "refresh")
-        .mockImplementation(() => {});
+      const refreshSpy = vi.fn();
 
       function Fallback() {
         return null;
       }
       const Boundary = unstable_catchError(Fallback);
-      const wrapperResult = (
-        Boundary as unknown as (p: Record<string, never>) => { type: unknown }
-      )({});
-      const InnerCatchError = wrapperResult.type as unknown as new (props: object) => {
+      // The Boundary wrapper is a function component that calls hooks.
+      // We must call it inside a React render so React's dispatcher is active.
+      let wrapperResult: React.ReactElement | null = null;
+      function Capture() {
+        wrapperResult = (Boundary as unknown as (p: Record<string, never>) => React.ReactElement)(
+          {},
+        );
+        return React.createElement("span");
+      }
+      renderToStaticMarkup(React.createElement(Capture));
+
+      const InnerCatchError = wrapperResult!.type as unknown as new (props: object) => {
         state: { error: { thrownValue: unknown } | null };
         unstable_retry: () => void;
       };
       const instance = new InnerCatchError({
         fallback: Fallback,
-        forwardedProps: {},
+        props: {},
       });
-      // Manually instantiating the class skips React's context machinery,
-      // so `this.context` is undefined. Seed it to `null` (matching the
-      // App Router default) so the Pages Router branch in `unstable_retry`
-      // doesn't fire — this test exercises the App Router branch.
-      (instance as unknown as { context: null }).context = null;
+      // Manually instantiating the class skips React's context machinery.
+      // Seed `this.context` with a mock App Router instance so the App Router
+      // branch in `unstable_retry` fires and calls `context.refresh()`.
+      (instance as unknown as { context: { refresh: typeof refreshSpy } }).context = {
+        refresh: refreshSpy,
+      };
 
       // Seed an error so reset has something to clear, and replace setState
       // with a spy so we can confirm the boundary self-resets.
@@ -1771,64 +2095,126 @@ describe("next/error shim — unstable_catchError", () => {
       instance.unstable_retry();
 
       expect(refreshSpy).toHaveBeenCalledTimes(1);
-      expect(setStateCalls).toEqual([{ error: null }]);
-
-      refreshSpy.mockRestore();
+      expect(setStateCalls).toHaveLength(1);
+      expect(setStateCalls[0]).toEqual({ error: null });
     } finally {
-      if (previousWindow === undefined) {
-        delete globalAny.window;
-      } else {
-        globalAny.window = previousWindow;
-      }
+      globalAny.window = previousWindow;
       vi.resetModules();
     }
   });
 
-  // Regression for cloudflare/vinext#1448.
-  // Ported from Next.js test:
-  //   .nextjs-ref/test/e2e/app-dir/catch-error/catch-error.test.ts
-  //   "should throw when unstable_retry is called on Pages Router"
-  // Mirrors the App Router-only branch in Next.js's catch-error source:
-  //   .nextjs-ref/packages/next/src/client/components/catch-error.tsx
-  // The boundary detects Pages Router via `RouterContext` (set as the inner
   // class component's `contextType`). When a non-null Pages Router instance
   // is in context, `unstable_retry()` must throw the verbatim Next.js
   // message instead of calling App Router's `refresh()`.
   it("unstable_retry under Pages Router throws Next.js parity error message", async () => {
     const React = (await import("react")).default;
+    const { renderToStaticMarkup } = await import("react-dom/server");
     const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
 
     function Fallback() {
       return null;
     }
     const Boundary = unstable_catchError(Fallback);
-    const wrapperResult = (Boundary as unknown as (p: Record<string, never>) => { type: unknown })(
-      {},
-    );
-    const InnerCatchError = wrapperResult.type as unknown as new (props: object) => {
+    // The Boundary wrapper is a function component that calls hooks.
+    // We must call it inside a React render so React's dispatcher is active.
+    let wrapperResult: React.ReactElement | null = null;
+    function Capture() {
+      wrapperResult = (Boundary as unknown as (p: Record<string, never>) => React.ReactElement)({});
+      return React.createElement("span");
+    }
+    renderToStaticMarkup(React.createElement(Capture));
+
+    const InnerCatchError = wrapperResult!.type as unknown as new (props: object) => {
       state: { error: { thrownValue: unknown } | null };
       unstable_retry: () => void;
     };
     const instance = new InnerCatchError({
       fallback: Fallback,
-      forwardedProps: {},
+      isPagesRouter: true,
+      props: {},
     });
     instance.state = { error: { thrownValue: new Error("boom") } };
-
-    // Seed `this.context` with a truthy value so the Pages Router branch
-    // fires. In production React fills this from RouterContext when the
-    // boundary is rendered under `RouterContext.Provider` (every Pages
-    // Router page). Casting via unknown keeps the seed type-safe under
-    // the class's declared `context` type.
-    (instance as unknown as { context: object }).context = {
-      route: "/some-page",
-    };
 
     void React; // keep React import for parity with sibling tests
 
     expect(() => instance.unstable_retry()).toThrow(
       "`unstable_retry()` can only be used in the App Router. Use `reset()` in the Pages Router.",
     );
+  });
+
+  // Integration test: the boundary contract that useUntrackedPathname protects.
+  // The error boundary must clear its captured error when the pathname changes
+  // (navigation) and retain it when the pathname stays the same. This is the
+  // reason useUntrackedPathname exists: it provides a pathname that changes on
+  // navigation without subscribing the component to every URL change.
+  it("getDerivedStateFromProps clears the error when pathname changes and retains it when pathname stays the same", async () => {
+    const React = (await import("react")).default;
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { unstable_catchError } = await import("../packages/vinext/src/shims/error.js");
+
+    function Fallback() {
+      return null;
+    }
+    const Boundary = unstable_catchError(Fallback);
+
+    // The Boundary wrapper is a function component that calls hooks.
+    // We must call it inside a React render so React's dispatcher is active.
+    let wrapperResult: React.ReactElement | null = null;
+    function Capture() {
+      wrapperResult = (Boundary as unknown as (p: Record<string, never>) => React.ReactElement)({});
+      return React.createElement("span");
+    }
+    renderToStaticMarkup(React.createElement(Capture));
+
+    // Structural type for the internal class component so we can call
+    // getDerivedStateFromProps without importing non-public exports.
+    const InnerCatchError = wrapperResult!.type as unknown as React.ComponentClass<{
+      fallback: typeof Fallback;
+      pathname: string | null;
+      props: Record<string, never>;
+    }> & {
+      getDerivedStateFromProps(
+        props: Pick<{ pathname: string | null }, "pathname">,
+        state: { error: { thrownValue: unknown } | null; previousPathname: string | null },
+      ): { error: { thrownValue: unknown } | null; previousPathname: string | null };
+    };
+
+    const thrown = new Error("boom");
+    const initialState = {
+      error: { thrownValue: thrown },
+      previousPathname: "/initial",
+    };
+
+    // Same pathname: error must be retained
+    const samePath = InnerCatchError.getDerivedStateFromProps(
+      { pathname: "/initial" },
+      initialState,
+    );
+    expect(samePath).toEqual({
+      error: { thrownValue: thrown },
+      previousPathname: "/initial",
+    });
+
+    // Different pathname: error must be cleared
+    const changedPath = InnerCatchError.getDerivedStateFromProps(
+      { pathname: "/new" },
+      initialState,
+    );
+    expect(changedPath).toEqual({
+      error: null,
+      previousPathname: "/new",
+    });
+
+    // Null pathname to real pathname: error must be cleared.
+    // This matches the missing-params shell → real render transition.
+    const nullToReal = InnerCatchError.getDerivedStateFromProps(
+      { pathname: "/real" },
+      { error: { thrownValue: thrown }, previousPathname: null },
+    );
+    expect(nullToReal).toEqual({
+      error: null,
+      previousPathname: "/real",
+    });
   });
 });
 
@@ -1903,6 +2289,32 @@ describe("window.next debug global", () => {
       expect(win.next.appDir).toBe(true);
       // Fields not overridden are preserved.
       expect(win.next.version).toBe("v1");
+    } finally {
+      (globalThis as any).window = previousWindow;
+      vi.resetModules();
+    }
+  });
+
+  it("setWindowNextInternalSourcePage mirrors the App Router source-page field", async () => {
+    // Ported from Next.js: test/e2e/app-dir/app/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/app/index.test.ts
+    const previousWindow = (globalThis as any).window;
+    const win: any = {};
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const { setWindowNextInternalSourcePage } =
+        await import("../packages/vinext/src/client/window-next.js");
+
+      setWindowNextInternalSourcePage("/dashboard/page");
+      expect(win.next.__internal_src_page).toBe("/dashboard/page");
+
+      setWindowNextInternalSourcePage("/dynamic/[category]/[id]/page");
+      expect(win.next.__internal_src_page).toBe("/dynamic/[category]/[id]/page");
+
+      setWindowNextInternalSourcePage(null);
+      expect(win.next.__internal_src_page).toBeUndefined();
     } finally {
       (globalThis as any).window = previousWindow;
       vi.resetModules();
@@ -2056,6 +2468,47 @@ describe("window.next debug global", () => {
 
       const result = await win.next.router.replace("/foo", undefined, { shallow: true });
       expect(result).toBe(true);
+    } finally {
+      (globalThis as any).window = previousWindow;
+      vi.resetModules();
+    }
+  });
+
+  // Shallow navigations skip the render-commit path, so the scroll reset is
+  // applied synchronously in performNavigation — before routeChangeComplete.
+  // This matches the non-shallow path, where the x/y reset runs inside the
+  // render-commit callback (also ahead of routeChangeComplete). Pins the
+  // ordering so listeners observe the final scroll position.
+  it("shallow push applies the scroll reset before routeChangeComplete", async () => {
+    const previousWindow = (globalThis as any).window;
+    const order: string[] = [];
+    const win: any = {
+      location: {
+        pathname: "/",
+        search: "",
+        hash: "",
+        href: "http://localhost/",
+        origin: "http://localhost",
+      },
+      history: { state: null, pushState() {}, replaceState() {} },
+      addEventListener() {},
+      dispatchEvent() {},
+      scrollTo(x: number, y: number) {
+        order.push(`scrollTo:${x},${y}`);
+      },
+    };
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+
+      win.next.router.events.on("routeChangeComplete", () => {
+        order.push("routeChangeComplete");
+      });
+      const result = await win.next.router.push("/foo", undefined, { shallow: true });
+      expect(result).toBe(true);
+      expect(order).toEqual(["scrollTo:0,0", "routeChangeComplete"]);
     } finally {
       (globalThis as any).window = previousWindow;
       vi.resetModules();
@@ -2267,6 +2720,33 @@ describe("next/router withRouter HOC", () => {
     );
   });
 
+  it("next/router useRouter falls back to the singleton in a Pages Router browser document", async () => {
+    const React = await import("react");
+    const { renderToStaticMarkup } = await import("react-dom/server");
+    const { useRouter } = await import("../packages/vinext/src/shims/router.js");
+    const win = (globalThis as { window: Window }).window;
+    const previousPageLoaders = win.__VINEXT_PAGE_LOADERS__;
+
+    try {
+      win.__VINEXT_PAGE_LOADERS__ = {};
+
+      const captured: NextRouter[] = [];
+      function Probe() {
+        captured.push(useRouter());
+        return React.createElement("span", null, "ok");
+      }
+
+      renderToStaticMarkup(React.createElement(Probe));
+
+      const router = captured[0];
+      expect(router).toBeDefined();
+      expect(router?.events).toBeDefined();
+      expect(typeof router?.push).toBe("function");
+    } finally {
+      win.__VINEXT_PAGE_LOADERS__ = previousPageLoaders;
+    }
+  });
+
   it("next/router useRouter does not subscribe once per hook call", async () => {
     const previousWindowForMock = (globalThis as any).window;
     const addEventListener = vi.fn();
@@ -2283,6 +2763,7 @@ describe("next/router withRouter HOC", () => {
     vi.resetModules();
     vi.doMock("react", () => {
       const react = {
+        Component: class {},
         createContext(defaultValue: unknown) {
           return { Provider: "Provider", Consumer: "Consumer", defaultValue };
         },
@@ -2296,6 +2777,9 @@ describe("next/router withRouter HOC", () => {
           return [typeof initialValue === "function" ? initialValue() : initialValue, vi.fn()];
         },
         useEffect(effect: () => void | (() => void)) {
+          effect();
+        },
+        useLayoutEffect(effect: () => void | (() => void)) {
           effect();
         },
         useMemo(factory: () => unknown) {
@@ -3638,6 +4122,21 @@ describe("next/server shim", () => {
     const result = connection();
     expect(result).toBeInstanceOf(Promise);
     await expect(result).resolves.toBeUndefined();
+  });
+
+  it("connection() interrupts speculative probes before post-connection user code runs", async () => {
+    const { runWithConnectionProbe } = await import("../packages/vinext/src/shims/headers.js");
+    const { connection } = await import("../packages/vinext/src/shims/server.js");
+
+    let ranAfterConnection = false;
+    const outcome = await runWithConnectionProbe(async () => {
+      await connection();
+      ranAfterConnection = true;
+      return "completed";
+    });
+
+    expect(outcome).toEqual({ completed: false });
+    expect(ranAfterConnection).toBe(false);
   });
 
   it("URLPattern is exported and available in Node 20+", async () => {
@@ -8178,12 +8677,26 @@ describe("NextURL basePath and locale properties", () => {
     expect(url.basePath).toBe("");
   });
 
-  it("basePath returns the configured value", async () => {
+  it("basePath is empty when URL does not start with the configured prefix", async () => {
+    // Matches Next.js getNextPathnameInfo behavior: basePath is only set when
+    // the URL's pathname actually starts with the configured basePath prefix.
+    // This is critical for middleware "absolute path" support — middleware
+    // receiving a request without the basePath prefix should see basePath === "".
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
     const url = new NextURL("http://localhost/dashboard", undefined, {
       basePath: "/app",
     });
+    expect(url.basePath).toBe("");
+  });
+
+  it("basePath is set when URL starts with the configured prefix", async () => {
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("http://localhost/app/dashboard", undefined, {
+      basePath: "/app",
+    });
     expect(url.basePath).toBe("/app");
+    // pathname is stripped of the basePath prefix
+    expect(url.pathname).toBe("/dashboard");
   });
 
   it("basePath setter normalizes leading slash", async () => {
@@ -8193,9 +8706,41 @@ describe("NextURL basePath and locale properties", () => {
     expect(url.basePath).toBe("/app");
   });
 
-  it("basePath is preserved through clone()", async () => {
+  it("href reassignment re-derives basePath from the configured value", async () => {
+    // Next.js's NextURL.analyze() re-runs getNextPathnameInfo on every href
+    // set, so basePath toggles based on whether the new pathname carries the
+    // configured prefix.
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
     const url = new NextURL("http://localhost/dashboard", undefined, {
+      basePath: "/app",
+    });
+    expect(url.basePath).toBe("");
+
+    // Moving inside the basePath re-activates it from the configured value.
+    url.href = "http://localhost/app/settings";
+    expect(url.basePath).toBe("/app");
+    expect(url.pathname).toBe("/settings");
+
+    // Moving back outside the basePath clears it again.
+    url.href = "http://localhost/elsewhere";
+    expect(url.basePath).toBe("");
+    expect(url.pathname).toBe("/elsewhere");
+  });
+
+  it("basePath is empty in clone when URL does not have the prefix", async () => {
+    // When the URL doesn't have the basePath prefix, basePath is cleared during
+    // construction, and the clone reflects that empty basePath.
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("http://localhost/dashboard", undefined, {
+      basePath: "/docs",
+    });
+    const cloned = url.clone();
+    expect(cloned.basePath).toBe("");
+  });
+
+  it("basePath is preserved through clone() when URL has the prefix", async () => {
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("http://localhost/docs/page", undefined, {
       basePath: "/docs",
     });
     const cloned = url.clone();
@@ -8222,6 +8767,78 @@ describe("NextURL basePath and locale properties", () => {
     const url = new NextURL("http://localhost/about", undefined, i18nConfig);
     expect(url.locale).toBe("en");
     expect(url.pathname).toBe("/about");
+  });
+
+  it("uses the matching domain default locale", async () => {
+    // Ported from Next.js: packages/next/src/server/web/next-url.ts
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("https://example.fr/about", undefined, {
+      nextConfig: {
+        i18n: {
+          locales: ["en", "fr", "de"],
+          defaultLocale: "en",
+          domains: [{ domain: "example.fr", defaultLocale: "fr", locales: ["fr"] }],
+        },
+      },
+    });
+    expect(url.defaultLocale).toBe("fr");
+    expect(url.locale).toBe("fr");
+    expect(url.domainLocale).toEqual({
+      domain: "example.fr",
+      defaultLocale: "fr",
+      locales: ["fr"],
+    });
+    expect(url.pathname).toBe("/about");
+  });
+
+  it("pathname locale overrides the matching domain default locale", async () => {
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("https://example.fr/de/about", undefined, {
+      nextConfig: {
+        i18n: {
+          locales: ["en", "fr", "de"],
+          defaultLocale: "en",
+          domains: [{ domain: "example.fr", defaultLocale: "fr", locales: ["fr"] }],
+        },
+      },
+    });
+    expect(url.defaultLocale).toBe("fr");
+    expect(url.locale).toBe("de");
+    expect(url.pathname).toBe("/about");
+  });
+
+  it("does not add locale prefixes when formatting API paths", async () => {
+    // Ported from Next.js: packages/next/src/shared/lib/router/utils/add-locale.ts
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("https://example.com/fr/api/example", undefined, i18nConfig);
+    expect(url.locale).toBe("fr");
+    expect(url.pathname).toBe("/api/example");
+    expect(url.href).toBe("https://example.com/api/example");
+    expect(url.clone().href).toBe("https://example.com/api/example");
+  });
+
+  it("detects API paths case-insensitively when formatting locale URLs", async () => {
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("https://example.com/fr/API/example", undefined, i18nConfig);
+    expect(url.href).toBe("https://example.com/API/example");
+  });
+
+  it("re-analyzes domain locale after href reassignment", async () => {
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("https://example.com/about", undefined, {
+      nextConfig: {
+        i18n: {
+          locales: ["en", "fr"],
+          defaultLocale: "en",
+          domains: [{ domain: "example.fr", defaultLocale: "fr", locales: ["fr"] }],
+        },
+      },
+    });
+    expect(url.defaultLocale).toBe("en");
+    url.href = "https://example.fr/about";
+    expect(url.defaultLocale).toBe("fr");
+    expect(url.locale).toBe("fr");
+    expect(url.domainLocale?.domain).toBe("example.fr");
   });
 
   it("locale detection is case-insensitive", async () => {
@@ -8289,7 +8906,7 @@ describe("NextURL basePath and locale properties", () => {
 
   it("href includes basePath prefix", async () => {
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
-    const url = new NextURL("http://localhost/dashboard", undefined, {
+    const url = new NextURL("http://localhost/app/dashboard", undefined, {
       basePath: "/app",
     });
     expect(url.pathname).toBe("/dashboard");
@@ -8298,7 +8915,7 @@ describe("NextURL basePath and locale properties", () => {
 
   it("href includes both basePath and locale prefix", async () => {
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
-    const url = new NextURL("http://localhost/fr/about", undefined, {
+    const url = new NextURL("http://localhost/app/fr/about", undefined, {
       basePath: "/app",
       ...i18nConfig,
     });
@@ -8346,7 +8963,7 @@ describe("NextURL basePath and locale properties", () => {
 
   it("basePath setter to empty string clears basePath", async () => {
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
-    const url = new NextURL("http://localhost/dashboard", undefined, {
+    const url = new NextURL("http://localhost/app/dashboard", undefined, {
       basePath: "/app",
     });
     expect(url.basePath).toBe("/app");
@@ -8412,7 +9029,7 @@ describe("NextURL basePath and locale properties", () => {
 
   it("searchParams mutations are reflected in href with basePath and locale", async () => {
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
-    const url = new NextURL("http://localhost/fr/about", undefined, {
+    const url = new NextURL("http://localhost/app/fr/about", undefined, {
       basePath: "/app",
       ...i18nConfig,
     });
@@ -8424,7 +9041,7 @@ describe("NextURL basePath and locale properties", () => {
 
   it("clone() preserves locale, basePath, and config through constructor", async () => {
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
-    const url = new NextURL("http://localhost/fr/about", undefined, {
+    const url = new NextURL("http://localhost/app/fr/about", undefined, {
       basePath: "/app",
       ...i18nConfig,
     });
@@ -8439,11 +9056,32 @@ describe("NextURL basePath and locale properties", () => {
     expect(url.locale).toBe("fr");
   });
 
+  it("matches domain locale from the detected pathname locale", async () => {
+    // Ported from Next.js: packages/next/src/shared/lib/i18n/detect-domain-locale.ts
+    const { NextURL } = await import("../packages/vinext/src/shims/server.js");
+    const url = new NextURL("https://example.com/fr/about", undefined, {
+      nextConfig: {
+        i18n: {
+          locales: ["en", "fr", "de"],
+          defaultLocale: "en",
+          domains: [
+            { domain: "example.fr", defaultLocale: "fr", locales: ["fr"] },
+            { domain: "example.de", defaultLocale: "de", locales: ["de"] },
+          ],
+        },
+      },
+    });
+    expect(url.domainLocale?.domain).toBe("example.fr");
+    expect(url.defaultLocale).toBe("fr");
+    expect(url.locale).toBe("fr");
+    expect(url.pathname).toBe("/about");
+  });
+
   // --- NextRequest integration ---
 
   it("NextRequest passes basePath and i18n config through to nextUrl", async () => {
     const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("http://localhost/fr/dashboard", {
+    const req = new NextRequest("http://localhost/app/fr/dashboard", {
       nextConfig: {
         basePath: "/app",
         i18n: {
@@ -8461,7 +9099,7 @@ describe("NextURL basePath and locale properties", () => {
 
   it("NextRequest.url reflects the normalized nextUrl href", async () => {
     const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const req = new NextRequest("http://localhost/fr/dashboard?tab=settings", {
+    const req = new NextRequest("http://localhost/app/fr/dashboard?tab=settings", {
       nextConfig: {
         basePath: "/app",
         i18n: { locales: ["en", "fr"], defaultLocale: "en" },
@@ -8477,7 +9115,7 @@ describe("NextURL basePath and locale properties", () => {
     process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE = "1";
     try {
       const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-      const req = new NextRequest("http://localhost/fr/dashboard?tab=settings", {
+      const req = new NextRequest("http://localhost/app/fr/dashboard?tab=settings", {
         nextConfig: {
           basePath: "/app",
           i18n: { locales: ["en", "fr"], defaultLocale: "en" },
@@ -8485,7 +9123,7 @@ describe("NextURL basePath and locale properties", () => {
       });
 
       expect(req.nextUrl.href).toBe("http://localhost/app/fr/dashboard?tab=settings");
-      expect(req.url).toBe("http://localhost/fr/dashboard?tab=settings");
+      expect(req.url).toBe("http://localhost/app/fr/dashboard?tab=settings");
     } finally {
       if (previous === undefined) {
         delete process.env.__NEXT_NO_MIDDLEWARE_URL_NORMALIZE;
@@ -8512,7 +9150,7 @@ describe("NextURL basePath and locale properties", () => {
 
   it("NextRequest.url normalizes Request input through nextUrl", async () => {
     const { NextRequest } = await import("../packages/vinext/src/shims/server.js");
-    const raw = new Request("http://localhost/fr/dashboard?tab=settings");
+    const raw = new Request("http://localhost/app/fr/dashboard?tab=settings");
     const req = new NextRequest(raw, {
       nextConfig: {
         basePath: "/app",
@@ -8584,7 +9222,7 @@ describe("NextURL trailingSlash policy", () => {
 
   it("applies trailingSlash with basePath", async () => {
     const { NextURL } = await import("../packages/vinext/src/shims/server.js");
-    const url = new NextURL("http://localhost/dashboard", undefined, {
+    const url = new NextURL("http://localhost/app/dashboard", undefined, {
       basePath: "/app",
       nextConfig: { trailingSlash: true },
     });
@@ -9617,6 +10255,28 @@ describe("parseCookies", () => {
     const { parseCookies } = await import("../packages/vinext/src/config/config-matchers.js");
     expect(parseCookies("  a = 1 ;  b = 2 ")).toEqual({ a: "1", b: "2" });
   });
+
+  // Next.js uses the same compiled `cookie` parser for request cookies.
+  // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/api-utils/get-cookie-parser.ts
+  it("matches Next.js duplicate, prototype-key, and empty-name semantics", async () => {
+    const { parseCookies } = await import("../packages/vinext/src/config/config-matchers.js");
+    const cookies = parseCookies(
+      'session=trusted; session=attacker; =empty-name; __proto__=prototype-cookie; constructor=constructor-cookie; toString=string-cookie; encoded=hello%20world; malformed=%E0%A4%A; quoted="quoted value"',
+    );
+
+    expect(Object.getPrototypeOf(cookies)).toBe(Object.prototype);
+    expect(cookies.hasOwnProperty("session")).toBe(true);
+    expect(Object.hasOwn(cookies, "toString")).toBe(false);
+    expect(Object.prototype.toString.call(cookies)).toBe("[object Object]");
+    expect(cookies.session).toBe("trusted");
+    expect(cookies[""]).toBe("empty-name");
+    expect(cookies.encoded).toBe("hello world");
+    expect(cookies.malformed).toBe("%E0%A4%A");
+    expect(cookies.quoted).toBe("quoted value");
+    expect(Object.hasOwn(cookies, "__proto__")).toBe(false);
+    expect(Object.hasOwn(cookies, "constructor")).toBe(false);
+    expect(Object.hasOwn(cookies, "toString")).toBe(false);
+  });
 });
 
 describe("checkHasConditions", () => {
@@ -9705,6 +10365,30 @@ describe("checkHasConditions", () => {
     expect(
       checkHasConditions([{ type: "cookie", key: "authorized", value: "false" }], undefined, ctx),
     ).toBe(false);
+  });
+
+  it("config cookie conditions ignore inherited names", async () => {
+    const { checkHasConditions, requestContextFromRequest } =
+      await import("../packages/vinext/src/config/config-matchers.js");
+    const ctx = requestContextFromRequest(
+      new Request("https://example.com/account", {
+        headers: {
+          cookie:
+            "session=trusted; session=attacker; constructor=constructor-cookie; toString=string-cookie",
+        },
+      }),
+    );
+
+    expect(
+      checkHasConditions([{ type: "cookie", key: "session", value: "trusted" }], undefined, ctx),
+    ).toBe(true);
+    expect(
+      checkHasConditions([{ type: "cookie", key: "session", value: "attacker" }], undefined, ctx),
+    ).toBe(false);
+    expect(checkHasConditions([{ type: "cookie", key: "constructor" }], undefined, ctx)).toBe(
+      false,
+    );
+    expect(checkHasConditions([{ type: "cookie", key: "toString" }], undefined, ctx)).toBe(false);
   });
 
   // -- query conditions --
@@ -10468,6 +11152,20 @@ describe("matchRewrite with external URLs", () => {
     expect(isExternalUrl(result!)).toBe(false);
   });
 
+  it("appends unused rewrite source params to the destination query", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const rewrites = [{ source: "/blog-:param", destination: "/blog/post-3" }];
+    const result = matchRewrite("/blog-post-3", rewrites, emptyCtx);
+    expect(result).toBe("/blog/post-3?param=post-3");
+  });
+
+  it("does not append rewrite source params consumed by the destination hash", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const rewrites = [{ source: "/old/:id", destination: "/new#section-:id" }];
+    const result = matchRewrite("/old/123", rewrites, emptyCtx);
+    expect(result).toBe("/new#section-123");
+  });
+
   it("replaces repeated params in rewrite destinations", async () => {
     const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
     const rewrites = [{ source: "/post/:id", destination: "/api/:id/:id" }];
@@ -10512,6 +11210,50 @@ describe("matchRewrite with external URLs", () => {
       headers: new Headers({ "x-authorized": "yes" }),
     });
     expect(result).toBe("/home?authorized=yes&path=docs/intro");
+  });
+
+  it("appends source params not referenced by the rewrite destination", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const result = matchRewrite(
+      "/query-rewrite/hello/world",
+      [
+        {
+          source: "/query-rewrite/:section/:name",
+          destination: "/with-params?first=:section&second=:name",
+        },
+      ],
+      emptyCtx,
+    );
+
+    expect(result).toBe("/with-params?first=hello&second=world&section=hello&name=world");
+  });
+
+  it("appends unused condition captures to the rewrite destination query", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const result = matchRewrite(
+      "/source",
+      [
+        {
+          source: "/source",
+          destination: "/target",
+          has: [{ type: "query", key: "preview", value: "(?<mode>draft)" }],
+        },
+      ],
+      { ...emptyCtx, query: new URLSearchParams("preview=draft") },
+    );
+
+    expect(result).toBe("/target?mode=draft");
+  });
+
+  it("does not append rewrite params consumed by the destination fragment", async () => {
+    const { matchRewrite } = await import("../packages/vinext/src/config/config-matchers.js");
+    const result = matchRewrite(
+      "/docs/500",
+      [{ source: "/docs/:code", destination: "/status#:code" }],
+      emptyCtx,
+    );
+
+    expect(result).toBe("/status#500");
   });
 });
 
@@ -11937,6 +12679,75 @@ describe("next/amp shim", () => {
 });
 
 describe("app router scroll intent state", () => {
+  it("clears a staged scroll intent when a same-document navigation supersedes it", async () => {
+    const {
+      beginAppRouterScrollIntent,
+      clearAppRouterScrollIntent,
+      getPendingAppRouterScrollIntent,
+    } = await import("../packages/vinext/src/shims/app-router-scroll-state.js");
+
+    clearAppRouterScrollIntent();
+    beginAppRouterScrollIntent(null);
+    expect(getPendingAppRouterScrollIntent()).not.toBeNull();
+
+    clearAppRouterScrollIntent();
+    expect(getPendingAppRouterScrollIntent()).toBeNull();
+  });
+
+  it("marks only the claimed commit's intent as head-hoisted", async () => {
+    const {
+      beginAppRouterScrollIntent,
+      claimAppRouterScrollIntentForCommit,
+      clearAppRouterScrollIntent,
+      consumeAppRouterScrollIntent,
+      getPendingAppRouterScrollIntent,
+      markAppRouterScrollIntentHeadHoisted,
+    } = await import("../packages/vinext/src/shims/app-router-scroll-state.js");
+
+    clearAppRouterScrollIntent();
+
+    const intent = beginAppRouterScrollIntent(null);
+    expect(intent.targetHoistedInHead).toBe(false);
+
+    // The committed scroll target only runs once a commit id is claimed, so a
+    // not-yet-claimed intent must never be marked.
+    markAppRouterScrollIntentHeadHoisted(intent, 7);
+    expect(getPendingAppRouterScrollIntent()?.targetHoistedInHead).toBe(false);
+
+    claimAppRouterScrollIntentForCommit(intent, 7);
+
+    // A scroll target from a different (e.g. stale) commit must not mark it.
+    markAppRouterScrollIntentHeadHoisted(intent, 6);
+    expect(getPendingAppRouterScrollIntent()?.targetHoistedInHead).toBe(false);
+
+    markAppRouterScrollIntentHeadHoisted(intent, 7);
+    const consumed = consumeAppRouterScrollIntent(intent, 7);
+    expect(consumed?.targetHoistedInHead).toBe(true);
+    expect(getPendingAppRouterScrollIntent()).toBeNull();
+  });
+
+  it("does not mark a stale intent reference as head-hoisted", async () => {
+    const {
+      beginAppRouterScrollIntent,
+      claimAppRouterScrollIntentForCommit,
+      clearAppRouterScrollIntent,
+      getPendingAppRouterScrollIntent,
+      markAppRouterScrollIntentHeadHoisted,
+    } = await import("../packages/vinext/src/shims/app-router-scroll-state.js");
+
+    clearAppRouterScrollIntent();
+
+    const staleIntent = beginAppRouterScrollIntent(null);
+    const latestIntent = beginAppRouterScrollIntent(null);
+    claimAppRouterScrollIntentForCommit(latestIntent, 3);
+
+    // A scroll target committed for an earlier navigation must not poison the
+    // navigation that replaced it.
+    markAppRouterScrollIntentHeadHoisted(staleIntent, 3);
+    expect(getPendingAppRouterScrollIntent()?.id).toBe(latestIntent.id);
+    expect(getPendingAppRouterScrollIntent()?.targetHoistedInHead).toBe(false);
+  });
+
   it("only lets the claimed render commit consume its own scroll intent", async () => {
     const {
       beginAppRouterScrollIntent,
@@ -12036,6 +12847,151 @@ describe("app router scroll intent state", () => {
     const consumed = consumeAppRouterScrollIntent(intent);
     expect(consumed?.id).toBe(intent.id);
     expect(getPendingAppRouterScrollIntent()).toBeNull();
+  });
+});
+
+describe("app router scroll document-top fallback", () => {
+  // applyAppRouterScrollFallback runs in navigateClientSide after a committed
+  // navigation declined to consume its scroll intent. It must scroll the
+  // document to the top UNLESS this navigation's committed target was a
+  // React-hoisted node in <head> (marked per-intent by AppRouterScrollTarget).
+  function withScrollFallbackEnv(
+    head: { querySelectorAll: () => unknown[] },
+    run: (documentElement: { scrollTop: number }) => void,
+  ): void {
+    const documentElement = { clientHeight: 800, scrollTop: 500 };
+    const originalDocument = Object.getOwnPropertyDescriptor(globalThis, "document");
+    const originalWindow = Object.getOwnPropertyDescriptor(globalThis, "window");
+
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { documentElement, head },
+    });
+    Object.defineProperty(globalThis, "window", { configurable: true, value: {} });
+
+    try {
+      run(documentElement);
+    } finally {
+      if (originalDocument) {
+        Object.defineProperty(globalThis, "document", originalDocument);
+      } else {
+        Reflect.deleteProperty(globalThis, "document");
+      }
+      if (originalWindow) {
+        Object.defineProperty(globalThis, "window", originalWindow);
+      } else {
+        Reflect.deleteProperty(globalThis, "window");
+      }
+    }
+  }
+
+  // A document head that already contains a React-hoisted precedence stylesheet
+  // — exactly the state in which the old global head scan wrongly suppressed the
+  // fallback for every navigation.
+  const headWithHoistedStylesheet = {
+    querySelectorAll: () => [
+      {
+        getAttribute: () => null,
+        localName: "link",
+      },
+    ],
+  };
+
+  it("scrolls to the document top even when hoisted stylesheets exist in <head>", async () => {
+    const { beginAppRouterScrollIntent, clearAppRouterScrollIntent } =
+      await import("../packages/vinext/src/shims/app-router-scroll-state.js");
+    const { applyAppRouterScrollFallback } =
+      await import("../packages/vinext/src/shims/navigation.js");
+
+    // Regression: an ordinary navigation whose intent was never marked as
+    // head-hoisted must still scroll to the document top. The presence of a
+    // hoisted stylesheet in <head> for some unrelated reason must not suppress
+    // it — the suppression decision is per-intent, not a global head scan.
+    clearAppRouterScrollIntent();
+    const intent = beginAppRouterScrollIntent(null);
+    expect(intent.targetHoistedInHead).toBe(false);
+
+    withScrollFallbackEnv(headWithHoistedStylesheet, (documentElement) => {
+      applyAppRouterScrollFallback(intent);
+      expect(documentElement.scrollTop).toBe(0);
+    });
+  });
+
+  it("does not scroll to the document top when this navigation's target was hoisted into <head>", async () => {
+    const { applyAppRouterScrollFallback } =
+      await import("../packages/vinext/src/shims/navigation.js");
+
+    const intent = {
+      commitId: 1,
+      hash: null,
+      id: 1,
+      targetHoistedInHead: true,
+    };
+
+    withScrollFallbackEnv({ querySelectorAll: () => [] }, (documentElement) => {
+      applyAppRouterScrollFallback(intent);
+      expect(documentElement.scrollTop).toBe(500);
+    });
+  });
+
+  it("full chain: marked head-hoisted intent survives claim→consume and suppresses the document-top fallback", async () => {
+    const {
+      beginAppRouterScrollIntent,
+      claimAppRouterScrollIntentForCommit,
+      clearAppRouterScrollIntent,
+      consumeAppRouterScrollIntent,
+      getPendingAppRouterScrollIntent,
+      markAppRouterScrollIntentHeadHoisted,
+    } = await import("../packages/vinext/src/shims/app-router-scroll-state.js");
+    const { applyAppRouterScrollFallback } =
+      await import("../packages/vinext/src/shims/navigation.js");
+
+    // Start with a clean slate — no leftover intent from a prior test.
+    clearAppRouterScrollIntent();
+
+    // ── begin ──────────────────────────────────────────────────────────
+    // navigateClientSide stages an intent before sending the RSC navigation.
+    const originalIntent = beginAppRouterScrollIntent(null);
+    expect(originalIntent.targetHoistedInHead).toBe(false);
+
+    // ── claim ──────────────────────────────────────────────────────────
+    // The render commit claims the intent, writing its commit id.
+    claimAppRouterScrollIntentForCommit(originalIntent, 9);
+
+    // ── mark (head-hoisted) ───────────────────────────────────────────
+    // AppRouterScrollTarget finds the committed node is a React-hoisted
+    // resource in <head> and marks this navigation's intent.
+    markAppRouterScrollIntentHeadHoisted(originalIntent, 9);
+
+    // ── consume ────────────────────────────────────────────────────────
+    // navigateClientSide reads the consumable result.
+    const consumed = consumeAppRouterScrollIntent(originalIntent, 9);
+    expect(consumed).not.toBeNull();
+    expect(consumed!.targetHoistedInHead).toBe(true);
+    expect(consumed!.id).toBe(originalIntent.id);
+    expect(getPendingAppRouterScrollIntent()).toBeNull();
+
+    // ── apply fallback ─────────────────────────────────────────────────
+    // navigateClientSide calls the fallback with the consumed intent.
+    withScrollFallbackEnv({ querySelectorAll: () => [] }, (documentElement) => {
+      applyAppRouterScrollFallback(consumed!);
+      // targetHoistedInHead is true → fallback declines document-top scroll.
+      expect(documentElement.scrollTop).toBe(500);
+    });
+
+    // ══════════════════════════════════════════════════════════════════
+    // Regression guard
+    // ══════════════════════════════════════════════════════════════════
+    // markAppRouterScrollIntentHeadHoisted replaces the store.pending
+    // object with a spread copy to keep the type Readonly. The reference
+    // handed back by beginAppRouterScrollIntent still points at the old
+    // object where targetHoistedInHead is false. If a future refactor
+    // accidentally passes the original (stale) intent to the fallback
+    // instead of the consumed one, the flag check silently passes and the
+    // document scrolls to top — incorrectly masking the old-handler
+    // behaviour whose observable contract the upstream deploy-suite
+    // depends on.
+    expect(originalIntent.targetHoistedInHead).toBe(false);
   });
 });
 
@@ -12797,17 +13753,25 @@ describe("Pages Router router helpers", () => {
 });
 
 describe("Pages Router concurrent navigation", () => {
-  it("does not install the Pages Router popstate runtime when next/router is imported", async () => {
+  it("installs the Pages Router popstate runtime before exposing window.next.router", async () => {
     const previousWindow = (globalThis as any).window;
     const { win } = createNavWindow();
-    win.addEventListener = vi.fn();
+    const calls: string[] = [];
+    win.addEventListener = vi.fn((type: string) => {
+      const next = Reflect.get(win, "next");
+      const router =
+        typeof next === "object" && next !== null ? Reflect.get(next, "router") : undefined;
+      calls.push(
+        `${type}:${router === undefined ? "before-window-next-router" : "after-window-next-router"}`,
+      );
+    });
     (globalThis as any).window = win;
 
     try {
       vi.resetModules();
       await import("../packages/vinext/src/shims/router.js");
 
-      expect(win.addEventListener).not.toHaveBeenCalledWith("popstate", expect.any(Function));
+      expect(calls).toEqual(["popstate:before-window-next-router"]);
     } finally {
       vi.resetModules();
       if (previousWindow === undefined) {
@@ -12853,7 +13817,7 @@ describe("Pages Router concurrent navigation", () => {
   function createNavWindow() {
     const pushState = vi.fn();
     const replaceState = vi.fn();
-    const render = vi.fn();
+    const render = vi.fn((element: unknown) => commitRenderedPagesRouterElement(element));
 
     const win = {
       location: {
@@ -13299,6 +14263,58 @@ describe("Pages Router concurrent navigation", () => {
         delete (globalThis as any).window;
       } else {
         (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("Pages Router HTML fallback prefers the registered route loader", async () => {
+    const previousWindow = (globalThis as any).window;
+    const previousDocument = (globalThis as any).document;
+    const originalFetch = globalThis.fetch;
+    const { win, render } = createNavWindow();
+    const LoaderPage = () => null;
+    const loader = vi.fn(async () => ({ default: LoaderPage }));
+    Object.assign(win, {
+      __VINEXT_PAGE_LOADERS__: {
+        "/same": loader,
+      },
+      __VINEXT_PAGE_PATTERNS__: ["/same"],
+    });
+    (globalThis as any).window = win;
+    (globalThis as any).document = {
+      createElement: vi.fn(),
+      head: { appendChild: vi.fn() },
+    };
+
+    const fetch = vi.fn(
+      async () => new Response(buildNavHtml("/same", "javascript:duplicate-or-invalid")),
+    );
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+      const Router = routerModule.default;
+
+      const result = await Router.push("/same");
+
+      expect(result).toBe(true);
+      expect(fetch).toHaveBeenCalledWith("/same", expect.any(Object));
+      expect(loader).toHaveBeenCalledTimes(1);
+      expect(render).toHaveBeenCalled();
+      expect(win.location.href).toBe("http://localhost/same");
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      if (previousDocument === undefined) {
+        delete (globalThis as any).document;
+      } else {
+        (globalThis as any).document = previousDocument;
       }
       globalThis.fetch = originalFetch;
     }
@@ -13810,6 +14826,433 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
+  // Without experimental.scrollRestoration, popstate must still restore the
+  // per-entry scroll saved into history state on push (__vinext_scrollX/Y):
+  // a soft popstate re-renders content the browser's native "auto" scroll
+  // restoration can't position correctly.
+  it("popstate restores history-state scroll when manual scroll restoration is off", async () => {
+    const previousWindow = (globalThis as any).window;
+    const previousDocument = (globalThis as any).document;
+    const originalFetch = globalThis.fetch;
+    const originalCustomEvent = globalThis.CustomEvent;
+    const listeners = new Map<string, (event: any) => void>();
+    const { win, render } = createNavWindow();
+    const pageModuleUrl = path.resolve(import.meta.dirname, "fixtures/client-navigation-page.tsx");
+    win.scrollTo.mockImplementation((x: number, y: number) => {
+      win.scrollX = x;
+      win.scrollY = y;
+    });
+
+    win.addEventListener = vi.fn((type: string, handler: (event: any) => void) => {
+      listeners.set(type, handler);
+    });
+
+    (globalThis as any).window = win;
+    (globalThis as any).document = {
+      documentElement: {
+        dataset: {},
+        style: {},
+        getClientRects: vi.fn(),
+      },
+    };
+    (globalThis as any).CustomEvent = class CustomEventMock {
+      constructor(public type: string) {}
+    } as any;
+
+    globalThis.fetch = vi.fn(
+      async () => new Response(buildNavHtml("/other", pageModuleUrl), { status: 200 }),
+    );
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      const popstateHandler = listeners.get("popstate");
+      expect(popstateHandler).toBeDefined();
+
+      const routeChangeComplete = new Promise<void>((resolve, reject) => {
+        (win as any).next.router.events.on("routeChangeComplete", () => resolve());
+        (win as any).next.router.events.on("routeChangeError", (err: unknown) => reject(err));
+      });
+
+      win.location.pathname = "/other";
+      win.location.href = "http://localhost/other";
+      // The router-owned state shape saveScrollPosition() writes on push:
+      // the Next.js state stamp plus the merged __vinext_scrollX/Y fields.
+      popstateHandler!({
+        state: {
+          __N: true,
+          url: "/other",
+          as: "/other",
+          options: {},
+          __vinext_scrollX: 12,
+          __vinext_scrollY: 345,
+        },
+      });
+
+      // The scroll target is applied inside the render-commit callback; the
+      // mocked root.render never mounts React, so fire the commit manually.
+      await vi.waitFor(() => expect(render).toHaveBeenCalled());
+      const committed = render.mock.calls.at(-1)![0] as { props: { onCommit: () => void } };
+      committed.props.onCommit();
+      await routeChangeComplete;
+
+      expect(win.scrollTo).toHaveBeenCalledWith(12, 345);
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      if (previousDocument === undefined) {
+        delete (globalThis as any).document;
+      } else {
+        (globalThis as any).document = previousDocument;
+      }
+      globalThis.fetch = originalFetch;
+      (globalThis as any).CustomEvent = originalCustomEvent;
+    }
+  });
+
+  // When beforePopState cancels a popstate the app stays on the previous
+  // history entry, so the internal current-key tracker must keep pointing at
+  // that entry — otherwise later scroll bookkeeping saves the outgoing
+  // position under the wrong (never-visited) key. Observable via the next
+  // popstate's sessionStorage scroll save, which is keyed off the tracker.
+  it("beforePopState cancellation leaves the current history key unchanged", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const originalScrollRestorationEnv = process.env.__NEXT_SCROLL_RESTORATION;
+    const listeners = new Map<string, (event: any) => void>();
+    const { win } = createNavWindow();
+
+    win.addEventListener = vi.fn((type: string, handler: (event: any) => void) => {
+      listeners.set(type, handler);
+    });
+    // Enable the manual scroll restoration path: the flag also requires
+    // history.scrollRestoration support and a working sessionStorage.
+    (win.history as any).scrollRestoration = "auto";
+    const sessionStore = new Map<string, string>();
+    (win as any).sessionStorage = {
+      getItem: (key: string) => sessionStore.get(key) ?? null,
+      setItem: (key: string, value: string) => void sessionStore.set(key, value),
+      removeItem: (key: string) => void sessionStore.delete(key),
+    };
+    // Pre-stamped router-owned entry so install picks up its key.
+    (win.history as any).state = {
+      __N: true,
+      url: "/",
+      as: "/",
+      options: {},
+      key: "key-initial",
+    };
+
+    (globalThis as any).window = win;
+    globalThis.fetch = vi.fn();
+    process.env.__NEXT_SCROLL_RESTORATION = "true";
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      const popstateHandler = listeners.get("popstate");
+      expect(popstateHandler).toBeDefined();
+
+      const beforePopState = vi.fn(() => false);
+      (win as any).next.router.beforePopState(beforePopState);
+
+      // Back/forward to another entry, cancelled by beforePopState.
+      win.location.pathname = "/other";
+      win.location.href = "http://localhost/other";
+      popstateHandler!({
+        state: { __N: true, url: "/other", as: "/other", options: {}, key: "key-target" },
+      });
+      expect(beforePopState).toHaveBeenCalledTimes(1);
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+
+      // A later popstate snapshots the outgoing scroll position under the
+      // tracked current key. The app never left the initial entry, so the
+      // snapshot must land on key-initial — not the cancelled key-target.
+      win.scrollX = 120;
+      win.scrollY = 450;
+      win.location.pathname = "/third";
+      win.location.href = "http://localhost/third";
+      popstateHandler!({
+        state: { __N: true, url: "/third", as: "/third", options: {}, key: "key-other" },
+      });
+
+      expect(sessionStore.get("__next_scroll_key-initial")).toBe(
+        JSON.stringify({ x: 120, y: 450 }),
+      );
+      expect(sessionStore.has("__next_scroll_key-target")).toBe(false);
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+      if (originalScrollRestorationEnv === undefined) {
+        delete process.env.__NEXT_SCROLL_RESTORATION;
+      } else {
+        process.env.__NEXT_SCROLL_RESTORATION = originalScrollRestorationEnv;
+      }
+    }
+  });
+
+  // A hash-only back/forward under manual scroll restoration honors only the
+  // hash anchor: the target entry's `__next_scroll_<key>` snapshot is read but
+  // intentionally not applied, matching Next.js where change()'s
+  // onlyAHashChange branch passes `null` to this.set() and only scrollToHash
+  // runs (forcedScroll feeds the full-navigation path exclusively). The
+  // departed entry's position is still snapshotted, and the unconsumed target
+  // snapshot stays in sessionStorage for a later non-hash popstate.
+  it("hash-only popstate scrolls to the hash anchor and leaves the entry snapshot for later", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const originalScrollRestorationEnv = process.env.__NEXT_SCROLL_RESTORATION;
+    const listeners = new Map<string, (event: any) => void>();
+    const { win, pushState } = createNavWindow();
+
+    win.addEventListener = vi.fn((type: string, handler: (event: any) => void) => {
+      listeners.set(type, handler);
+    });
+    // Enable the manual scroll restoration path: the flag also requires
+    // history.scrollRestoration support and a working sessionStorage.
+    (win.history as any).scrollRestoration = "auto";
+    const sessionStore = new Map<string, string>();
+    (win as any).sessionStorage = {
+      getItem: (key: string) => sessionStore.get(key) ?? null,
+      setItem: (key: string, value: string) => void sessionStore.set(key, value),
+      removeItem: (key: string) => void sessionStore.delete(key),
+    };
+    // Pre-stamped router-owned entry so install picks up its key.
+    (win.history as any).state = {
+      __N: true,
+      url: "/",
+      as: "/",
+      options: {},
+      key: "key-initial",
+    };
+
+    (globalThis as any).window = win;
+    globalThis.fetch = vi.fn();
+    process.env.__NEXT_SCROLL_RESTORATION = "true";
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      // Positive control: a Pages Router document with the flag enabled
+      // switches the browser to manual restoration at install time.
+      expect((win.history as any).scrollRestoration).toBe("manual");
+
+      const popstateHandler = listeners.get("popstate");
+      expect(popstateHandler).toBeDefined();
+
+      // The position the user reached on the initial entry; the hash-only
+      // push below snapshots it under key-initial on departure.
+      win.scrollX = 5;
+      win.scrollY = 500;
+
+      // Hash-only push mints a new history entry ("#top" avoids the
+      // document-dependent getElementById branch of scrollToHashTarget).
+      await (win as any).next.router.push("/#top");
+      expect(sessionStore.get("__next_scroll_key-initial")).toBe(JSON.stringify({ x: 5, y: 500 }));
+      const pushedKey = pushState.mock.calls.at(-1)![0].key as string;
+      expect(typeof pushedKey).toBe("string");
+
+      const hashEvents: string[] = [];
+      (win as any).next.router.events.on("hashChangeStart", () =>
+        hashEvents.push("hashChangeStart"),
+      );
+      (win as any).next.router.events.on("hashChangeComplete", () =>
+        hashEvents.push("hashChangeComplete"),
+      );
+
+      // The live position on the hash entry, snapshotted on departure.
+      win.scrollX = 7;
+      win.scrollY = 70;
+      win.scrollTo.mockClear();
+
+      // Back to the initial entry: same pathname+search, only the hash
+      // differs, so this is a hash-only popstate.
+      win.location.hash = "";
+      win.location.pathname = "/";
+      win.location.href = "http://localhost/";
+      popstateHandler!({
+        state: { __N: true, url: "/", as: "/", options: {}, key: "key-initial" },
+      });
+
+      // Hash-only: no page fetch, hash events fired in order.
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+      expect(hashEvents).toEqual(["hashChangeStart", "hashChangeComplete"]);
+
+      // Only the hash anchor is honored (empty hash scrolls to top); the
+      // target entry's saved {x: 5, y: 500} is not applied (upstream parity).
+      expect(win.scrollTo).toHaveBeenCalledWith(0, 0);
+      expect(win.scrollTo).not.toHaveBeenCalledWith(5, 500);
+
+      // The departed hash entry's live position was snapshotted under its
+      // key, and the unconsumed target snapshot survives for a later
+      // non-hash popstate to this entry.
+      expect(sessionStore.get(`__next_scroll_${pushedKey}`)).toBe(JSON.stringify({ x: 7, y: 70 }));
+      expect(sessionStore.get("__next_scroll_key-initial")).toBe(JSON.stringify({ x: 5, y: 500 }));
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+      if (originalScrollRestorationEnv === undefined) {
+        delete process.env.__NEXT_SCROLL_RESTORATION;
+      } else {
+        process.env.__NEXT_SCROLL_RESTORATION = originalScrollRestorationEnv;
+      }
+    }
+  });
+
+  // A hash-only push must snapshot the outgoing entry's scroll under its key
+  // before updateHistory mints the new entry's key — otherwise a later
+  // back-popstate to the departed entry restores {x: 0, y: 0} instead of the
+  // position the user had reached there. Upstream snapshots in Router.push()
+  // itself, ahead of change()'s onlyAHashChange short-circuit, so hash-only
+  // pushes still write `__next_scroll_<key>` for the departed entry.
+  it("hash-only push snapshots the outgoing entry's scroll under the old key", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const originalScrollRestorationEnv = process.env.__NEXT_SCROLL_RESTORATION;
+    const { win, pushState } = createNavWindow();
+
+    // Enable the manual scroll restoration path: the flag also requires
+    // history.scrollRestoration support and a working sessionStorage.
+    (win.history as any).scrollRestoration = "auto";
+    const sessionStore = new Map<string, string>();
+    (win as any).sessionStorage = {
+      getItem: (key: string) => sessionStore.get(key) ?? null,
+      setItem: (key: string, value: string) => void sessionStore.set(key, value),
+      removeItem: (key: string) => void sessionStore.delete(key),
+    };
+    // Pre-stamped router-owned entry so install picks up its key.
+    (win.history as any).state = {
+      __N: true,
+      url: "/",
+      as: "/",
+      options: {},
+      key: "key-initial",
+    };
+
+    (globalThis as any).window = win;
+    globalThis.fetch = vi.fn();
+    process.env.__NEXT_SCROLL_RESTORATION = "true";
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      // The live position on the outgoing entry at push time ("#top" avoids
+      // the document-dependent getElementById branch of scrollToHashTarget).
+      win.scrollX = 30;
+      win.scrollY = 300;
+      await (win as any).next.router.push("/#top");
+
+      // Hash-only: no page fetch; a new entry was minted with a fresh key.
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+      const pushedKey = pushState.mock.calls.at(-1)![0].key as string;
+      expect(typeof pushedKey).toBe("string");
+      expect(pushedKey).not.toBe("key-initial");
+
+      // The departed entry's position was snapshotted under its own key —
+      // not the freshly minted one — so a later back-popstate restores it.
+      expect(sessionStore.get("__next_scroll_key-initial")).toBe(JSON.stringify({ x: 30, y: 300 }));
+      expect(sessionStore.has(`__next_scroll_${pushedKey}`)).toBe(false);
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+      if (originalScrollRestorationEnv === undefined) {
+        delete process.env.__NEXT_SCROLL_RESTORATION;
+      } else {
+        process.env.__NEXT_SCROLL_RESTORATION = originalScrollRestorationEnv;
+      }
+    }
+  });
+
+  // The experimental.scrollRestoration manual opt-in is Pages-Router-only:
+  // an App Router document (window.next.appDir === true, stamped by the App
+  // Router bootstrap before any client-component module evaluates) that
+  // value-imports next/router for compat must not have the browser's native
+  // restoration disabled. Upstream only flips history.scrollRestoration in
+  // the Pages Router constructor, which never runs on App Router documents.
+  //
+  // This test guards the bootstrap eval-order invariant: the
+  // manualScrollRestoration constant in router.ts reads window.next?.appDir
+  // at module-eval time, which is only correct because installWindowNext in
+  // app-browser-entry.ts stamps appDir: true before the first next/router
+  // value-import evaluates. The failure mode is silent — if that ordering
+  // regressed, manual scroll restoration would flip on under App Router
+  // documents with no error, only subtly broken back/forward scroll.
+  it("does not flip history.scrollRestoration to manual on App Router documents", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalScrollRestorationEnv = process.env.__NEXT_SCROLL_RESTORATION;
+    const { win } = createNavWindow();
+
+    (win.history as any).scrollRestoration = "auto";
+    const sessionStore = new Map<string, string>();
+    (win as any).sessionStorage = {
+      getItem: (key: string) => sessionStore.get(key) ?? null,
+      setItem: (key: string, value: string) => void sessionStore.set(key, value),
+      removeItem: (key: string) => void sessionStore.delete(key),
+    };
+    // The App Router bootstrap stamp, in place before next/router evaluates.
+    (win as any).next = { version: "test", appDir: true };
+
+    (globalThis as any).window = win;
+    process.env.__NEXT_SCROLL_RESTORATION = "true";
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      expect((win.history as any).scrollRestoration).toBe("auto");
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      if (originalScrollRestorationEnv === undefined) {
+        delete process.env.__NEXT_SCROLL_RESTORATION;
+      } else {
+        process.env.__NEXT_SCROLL_RESTORATION = originalScrollRestorationEnv;
+      }
+    }
+  });
+
   it("does not prefix a locale-qualified target with the current locale", async () => {
     const previousWindow = (globalThis as any).window;
     const originalFetch = globalThis.fetch;
@@ -13923,6 +15366,135 @@ describe("Pages Router concurrent navigation", () => {
       expect(fetch).toHaveBeenNthCalledWith(2, "/new-home", expect.any(Object));
       expect(replaceState).toHaveBeenLastCalledWith({}, "", "/new-home");
       expect(win.location.pathname).toBe("/new-home");
+      expect(render).toHaveBeenCalled();
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("hydrates middleware rewrites to fallback pages from the data response", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const { win, render } = createNavWindow();
+    const pageModuleUrl = path.resolve(import.meta.dirname, "fixtures/client-navigation-page.tsx");
+    Object.assign(win.location, { origin: "http://localhost" });
+    Object.assign(win.__NEXT_DATA__, {
+      buildId: "build-1",
+      __vinext: { ...win.__NEXT_DATA__.__vinext, hasMiddleware: true },
+    });
+    Object.assign(win, {
+      __VINEXT_PAGE_PATTERNS__: ["/fallback-true-blog/[slug]"],
+      __VINEXT_PAGE_LOADERS__: {
+        "/fallback-true-blog/[slug]": async () => import(pageModuleUrl),
+      },
+    });
+    (globalThis as any).window = win;
+
+    const fetch = vi.fn(async (url: RequestInfo | URL) => {
+      const href = getFetchHref(url);
+      if (href === "/_next/data/build-1/to-blog/another-post.json") {
+        return new Response(
+          JSON.stringify({ pageProps: { slug: "another-post", generated: true } }),
+          {
+            headers: {
+              "content-type": "application/json",
+              "x-nextjs-rewrite": "/fallback-true-blog/another-post",
+            },
+          },
+        );
+      }
+      throw new Error(`Unexpected fetch: ${href}`);
+    });
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+      const Router = routerModule.default;
+
+      const result = await Router.push("/to-blog/another-post");
+
+      expect(result).toBe(true);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(win.history.pushState).toHaveBeenLastCalledWith(
+        expect.objectContaining({ __N: true }),
+        "",
+        "/to-blog/another-post",
+      );
+      expect(win.location.pathname).toBe("/to-blog/another-post");
+      expect(win.__NEXT_DATA__).toMatchObject({
+        page: "/fallback-true-blog/[slug]",
+        query: { slug: "another-post" },
+        props: { pageProps: { slug: "another-post", generated: true } },
+        isFallback: false,
+      });
+      expect(render).toHaveBeenCalled();
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+    }
+  });
+
+  it("uses the rewritten page loader when the visible URL also matches a page", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const { win, render } = createNavWindow();
+    const sourceLoader = vi.fn(async () => ({ default: () => null }));
+    const destinationLoader = vi.fn(async () => ({ default: () => null }));
+    Object.assign(win.location, { origin: "http://localhost" });
+    Object.assign(win.__NEXT_DATA__, {
+      buildId: "build-1",
+      __vinext: { ...win.__NEXT_DATA__.__vinext, hasMiddleware: true },
+    });
+    Object.assign(win, {
+      __VINEXT_PAGE_PATTERNS__: ["/source/[slug]", "/destination"],
+      __VINEXT_PAGE_LOADERS__: {
+        "/source/[slug]": sourceLoader,
+        "/destination": destinationLoader,
+      },
+    });
+    (globalThis as any).window = win;
+
+    const fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify({ pageProps: { slug: "post", rewritten: true } }), {
+          headers: {
+            "content-type": "application/json",
+            "x-nextjs-rewrite": "/destination?rewriteSlug=post",
+          },
+        }),
+    );
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+      const Router = routerModule.default;
+
+      const result = await Router.push("/source/post");
+
+      expect(result).toBe(true);
+      expect(fetch).toHaveBeenCalledOnce();
+      expect(sourceLoader).not.toHaveBeenCalled();
+      expect(destinationLoader).toHaveBeenCalledOnce();
+      expect(win.location.pathname).toBe("/source/post");
+      expect(win.__NEXT_DATA__).toMatchObject({
+        page: "/destination",
+        query: { rewriteSlug: "post" },
+        props: { pageProps: { slug: "post", rewritten: true } },
+      });
+      expect(Router.query).toEqual({ rewriteSlug: "post" });
       expect(render).toHaveBeenCalled();
     } finally {
       vi.resetModules();
@@ -14944,7 +16516,7 @@ describe("Pages Router _next/data client navigation", () => {
   ) {
     const pushState = vi.fn();
     const replaceState = vi.fn();
-    const render = vi.fn();
+    const render = vi.fn((element: unknown) => commitRenderedPagesRouterElement(element));
     const buildId = opts.buildId ?? "test-build";
 
     const win = {
@@ -15063,6 +16635,62 @@ describe("Pages Router _next/data client navigation", () => {
       expect(loaderAbout).toHaveBeenCalledTimes(1);
       expect(win.__NEXT_DATA__.page).toBe("/about");
       expect(win.__NEXT_DATA__.props.pageProps).toEqual({ hello: "world" });
+    } finally {
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+      globalThis.fetch = originalFetch;
+      vi.resetModules();
+    }
+  });
+
+  it("threads full Pages props through _app during data navigation", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+
+    const PageComponent = () => "page:about";
+    const AppComponent = () => "app";
+    const loaderAbout = vi.fn(async () => ({ default: PageComponent }));
+    const appLoader = vi.fn(async () => ({ default: AppComponent }));
+    const { win, render } = createDataNavWindow({
+      loaders: { "/": vi.fn(async () => makePageModule("home")), "/about": loaderAbout },
+      appLoader,
+    });
+    (globalThis as any).window = win;
+    vi.resetModules();
+
+    const props = {
+      appProps: { source: "_app.getInitialProps" },
+      pageProps: { hello: "world" },
+    };
+    globalThis.fetch = vi.fn(
+      async () =>
+        new Response(JSON.stringify(props), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        }),
+    ) as any;
+
+    try {
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+      const Router = routerModule.default;
+      const result = await Router.push("/about");
+
+      expect(result).toBe(true);
+      expect(loaderAbout).toHaveBeenCalledTimes(1);
+      expect(appLoader).toHaveBeenCalledTimes(1);
+      const committed = render.mock.calls.at(-1)![0] as {
+        props: {
+          children: { props: { children: { type: unknown; props: Record<string, unknown> } } };
+        };
+      };
+      const appElement = committed.props.children.props.children;
+      expect(appElement.type).toBe(AppComponent);
+      expect(appElement.props).toMatchObject({
+        appProps: { source: "_app.getInitialProps" },
+        pageProps: { hello: "world" },
+      });
+      expect(appElement.props.Component).toBe(PageComponent);
+      expect(win.__NEXT_DATA__.props).toEqual(props);
     } finally {
       if (previousWindow === undefined) delete (globalThis as any).window;
       else (globalThis as any).window = previousWindow;
@@ -15312,6 +16940,7 @@ describe("Pages Router _next/data client navigation", () => {
   it("uses the JSON path for prefetch when a loader is registered", async () => {
     const previousWindow = (globalThis as any).window;
     const originalDocument = (globalThis as any).document;
+    const originalFetch = globalThis.fetch;
 
     const aboutLoader = vi.fn(async () => makePageModule("about"));
     const { win, buildId } = createDataNavWindow({
@@ -15342,6 +16971,8 @@ describe("Pages Router _next/data client navigation", () => {
         },
       },
     };
+    const fetchMock = vi.fn(async () => new Response("{}"));
+    globalThis.fetch = fetchMock;
     vi.resetModules();
 
     try {
@@ -15349,17 +16980,22 @@ describe("Pages Router _next/data client navigation", () => {
       const Router = routerModule.default;
       await Router.prefetch("/about");
 
-      const prefetchLink = appendedLinks.find((l) => l.rel === "prefetch");
-      expect(prefetchLink).toBeDefined();
-      expect(prefetchLink?.as).toBe("fetch");
-      expect(prefetchLink?.href).toBe(`/_next/data/${buildId}/about.json`);
-      expect(prefetchLink?.crossOrigin).toBe("anonymous");
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledOnce());
+      expect(fetchMock).toHaveBeenCalledWith(`/_next/data/${buildId}/about.json`, {
+        headers: {
+          Accept: "application/json",
+          purpose: "prefetch",
+          "x-nextjs-data": "1",
+        },
+      });
+      expect(appendedLinks).toEqual([]);
       // The loader was warmed (chunk fetch kicked off).
       expect(aboutLoader).toHaveBeenCalledTimes(1);
     } finally {
       if (previousWindow === undefined) delete (globalThis as any).window;
       else (globalThis as any).window = previousWindow;
       (globalThis as any).document = originalDocument;
+      globalThis.fetch = originalFetch;
       vi.resetModules();
     }
   });
@@ -16180,39 +17816,100 @@ describe("image optimization request parsing", () => {
   it("parseImageParams returns null when url is missing", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const url = new URL("http://localhost/_next/image?w=800&q=75");
+    const url = new URL("http://localhost/_next/image?w=640&q=75");
     expect(parseImageParams(url)).toBeNull();
   });
 
   it("parseImageParams blocks absolute http URLs", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const url = new URL("http://localhost/_next/image?url=http%3A%2F%2Fevil.com%2Fimg.jpg&w=800");
+    const url = new URL(
+      "http://localhost/_next/image?url=http%3A%2F%2Fevil.com%2Fimg.jpg&w=640&q=75",
+    );
     expect(parseImageParams(url)).toBeNull();
   });
 
   it("parseImageParams blocks absolute https URLs", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const url = new URL("http://localhost/_next/image?url=https%3A%2F%2Fevil.com%2Fimg.jpg&w=800");
+    const url = new URL(
+      "http://localhost/_next/image?url=https%3A%2F%2Fevil.com%2Fimg.jpg&w=640&q=75",
+    );
     expect(parseImageParams(url)).toBeNull();
   });
 
   it("parseImageParams blocks protocol-relative URLs", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const url = new URL("http://localhost/_next/image?url=%2F%2Fevil.com%2Fimg.jpg&w=800");
+    const url = new URL("http://localhost/_next/image?url=%2F%2Fevil.com%2Fimg.jpg&w=640&q=75");
     expect(parseImageParams(url)).toBeNull();
   });
 
-  it("parseImageParams defaults width to 0 and quality to 75", async () => {
+  // Ported from Next.js: test/integration/image-optimizer/test/index.test.ts
+  // https://github.com/vercel/next.js/blob/canary/test/integration/image-optimizer/test/index.test.ts
+  it("parseImageParams requires width and quality", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const url = new URL("http://localhost/_next/image?url=%2Fimg.jpg");
-    const params = parseImageParams(url);
-    expect(params).not.toBeNull();
-    expect(params!.width).toBe(0);
-    expect(params!.quality).toBe(75);
+    expect(parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg"))).toBeNull();
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640")),
+    ).toBeNull();
+  });
+
+  it("parseImageParams rejects cache-key aliases with integer suffixes", async () => {
+    const { parseImageParams } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640junk&q=75")),
+    ).toBeNull();
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75junk")),
+    ).toBeNull();
+  });
+
+  it("parseImageParams rejects zero, signed, and decimal widths", async () => {
+    const { parseImageParams } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    for (const width of ["0", "-640", "+640", "640.0"]) {
+      expect(
+        parseImageParams(new URL(`http://localhost/_next/image?url=%2Fimg.jpg&w=${width}&q=75`)),
+      ).toBeNull();
+    }
+  });
+
+  it("parseImageParams rejects leading-zero cache-key aliases", async () => {
+    const { parseImageParams } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=0640&q=75")),
+    ).toBeNull();
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=075")),
+    ).toBeNull();
+  });
+
+  it("parseImageParams rejects duplicate and unknown query parameters", async () => {
+    const { parseImageParams } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&w=640&q=75")),
+    ).toBeNull();
+    expect(
+      parseImageParams(
+        new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75&cacheBust=1"),
+      ),
+    ).toBeNull();
+  });
+
+  it("parseImageParams rejects source URLs longer than 3072 characters", async () => {
+    const { parseImageParams } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const imageUrl = `/${"a".repeat(3072)}`;
+    const url = new URL("http://localhost/_next/image");
+    url.searchParams.set("url", imageUrl);
+    url.searchParams.set("w", "640");
+    url.searchParams.set("q", "75");
+    expect(parseImageParams(url)).toBeNull();
   });
 
   it("parseImageParams blocks data: URIs (exotic scheme bypass)", async () => {
@@ -16221,7 +17918,7 @@ describe("image optimization request parsing", () => {
     expect(
       parseImageParams(
         new URL(
-          "http://localhost/_next/image?url=data%3Atext%2Fhtml%2C%3Cscript%3Ealert(1)%3C%2Fscript%3E&w=800",
+          "http://localhost/_next/image?url=data%3Atext%2Fhtml%2C%3Cscript%3Ealert(1)%3C%2Fscript%3E&w=640&q=75",
         ),
       ),
     ).toBeNull();
@@ -16231,22 +17928,28 @@ describe("image optimization request parsing", () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=javascript%3Aalert(1)&w=800")),
+      parseImageParams(
+        new URL("http://localhost/_next/image?url=javascript%3Aalert(1)&w=640&q=75"),
+      ),
     ).toBeNull();
   });
 
   it("parseImageParams blocks bare filenames (no leading slash)", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(parseImageParams(new URL("http://localhost/_next/image?url=img.jpg&w=800"))).toBeNull();
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=img.jpg&w=640&q=75")),
+    ).toBeNull();
   });
 
   it("parseImageParams rejects quality outside 1-100", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    expect(parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&q=0"))).toBeNull();
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&q=101")),
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=0")),
+    ).toBeNull();
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=101")),
     ).toBeNull();
   });
 
@@ -16255,7 +17958,7 @@ describe("image optimization request parsing", () => {
       await import("../packages/vinext/src/server/image-optimization.js");
     // /\evil.com — browsers and the URL constructor treat this as //evil.com
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2F%5Cevil.com&w=800")),
+      parseImageParams(new URL("http://localhost/_next/image?url=%2F%5Cevil.com&w=640&q=75")),
     ).toBeNull();
   });
 
@@ -16264,11 +17967,13 @@ describe("image optimization request parsing", () => {
       await import("../packages/vinext/src/server/image-optimization.js");
     // /\evil.com/img.jpg
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2F%5Cevil.com%2Fimg.jpg&w=800")),
+      parseImageParams(
+        new URL("http://localhost/_next/image?url=%2F%5Cevil.com%2Fimg.jpg&w=640&q=75"),
+      ),
     ).toBeNull();
     // /\\evil.com (double backslash)
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2F%5C%5Cevil.com&w=800")),
+      parseImageParams(new URL("http://localhost/_next/image?url=%2F%5C%5Cevil.com&w=640&q=75")),
     ).toBeNull();
   });
 
@@ -16279,7 +17984,7 @@ describe("image optimization request parsing", () => {
     // the origin check catches it.
     // A valid relative URL should pass
     const good = parseImageParams(
-      new URL("http://localhost/_next/image?url=%2Fimages%2Fhero.webp&w=800"),
+      new URL("http://localhost/_next/image?url=%2Fimages%2Fhero.webp&w=640&q=75"),
     );
     expect(good).not.toBeNull();
     expect(good!.imageUrl).toBe("/images/hero.webp");
@@ -16291,7 +17996,7 @@ describe("image optimization request parsing", () => {
     // /images\hero.webp should be normalized to /images/hero.webp
     // (backslash in the middle of a valid path)
     const result = parseImageParams(
-      new URL("http://localhost/_next/image?url=%2Fimages%5Chero.webp&w=800"),
+      new URL("http://localhost/_next/image?url=%2Fimages%5Chero.webp&w=640&q=75"),
     );
     expect(result).not.toBeNull();
     expect(result!.imageUrl).toBe("/images/hero.webp");
@@ -16301,20 +18006,22 @@ describe("image optimization request parsing", () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=3841")),
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=3841&q=75")),
     ).toBeNull();
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=999999999")),
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=999999999&q=75")),
     ).toBeNull();
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=2147483647")),
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=2147483647&q=75")),
     ).toBeNull();
   });
 
   it("parseImageParams accepts width at the absolute maximum (3840)", async () => {
     const { parseImageParams } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const params = parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=3840"));
+    const params = parseImageParams(
+      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=3840&q=75"),
+    );
     expect(params).not.toBeNull();
     expect(params!.width).toBe(3840);
   });
@@ -16325,22 +18032,81 @@ describe("image optimization request parsing", () => {
     const allowedWidths = [640, 750, 828, 1080, 1200, 1920, 2048, 3840];
     // Allowed width passes
     const params = parseImageParams(
-      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=1080"),
+      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=1080&q=75"),
       allowedWidths,
     );
     expect(params).not.toBeNull();
     expect(params!.width).toBe(1080);
     // Non-allowed width is rejected
     expect(
-      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=999"), allowedWidths),
+      parseImageParams(
+        new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=999&q=75"),
+        allowedWidths,
+      ),
     ).toBeNull();
-    // w=0 (no resize) is always allowed even with allowedWidths
-    const noResize = parseImageParams(
-      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=0"),
-      allowedWidths,
+    expect(
+      parseImageParams(
+        new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=0&q=75"),
+        allowedWidths,
+      ),
+    ).toBeNull();
+  });
+
+  it("parseImageParams defaults allowed qualities to 75", async () => {
+    const { parseImageParams } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75")),
+    ).not.toBeNull();
+    expect(
+      parseImageParams(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=80")),
+    ).toBeNull();
+  });
+
+  it("parseImageParams accepts configured qualities", async () => {
+    const { parseImageParams, DEFAULT_DEVICE_SIZES, DEFAULT_IMAGE_SIZES } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    const params = parseImageParams(
+      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=80"),
+      [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES],
+      [75, 80],
     );
-    expect(noResize).not.toBeNull();
-    expect(noResize!.width).toBe(0);
+    expect(params?.quality).toBe(80);
+  });
+
+  it("resolveDevImageRedirect applies validation before passthrough", async () => {
+    const { resolveDevImageRedirect } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    expect(
+      resolveDevImageRedirect(
+        new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640junk&q=75"),
+      ),
+    ).toBeNull();
+    expect(
+      resolveDevImageRedirect(
+        new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75&extra=1"),
+      ),
+    ).toBeNull();
+    expect(
+      resolveDevImageRedirect(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75")),
+    ).toBe("/img.jpg");
+  });
+
+  it("resolveDevImageRedirect preserves Next.js blur requests", async () => {
+    const { resolveDevImageRedirect } =
+      await import("../packages/vinext/src/server/image-optimization.js");
+    expect(
+      resolveDevImageRedirect(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=8&q=70")),
+    ).toBe("/img.jpg");
+    expect(
+      resolveDevImageRedirect(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=8&q=75")),
+    ).toBe("/img.jpg");
+    expect(
+      resolveDevImageRedirect(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=70")),
+    ).toBe("/img.jpg");
+    expect(
+      resolveDevImageRedirect(new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=08&q=70")),
+    ).toBeNull();
   });
 
   it("parseImageParams allows imageSizes (small widths) in allowedWidths", async () => {
@@ -16350,7 +18116,7 @@ describe("image optimization request parsing", () => {
       16, 32, 48, 64, 96, 128, 256, 384, 640, 750, 828, 1080, 1200, 1920, 2048, 3840,
     ];
     const params = parseImageParams(
-      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=64"),
+      new URL("http://localhost/_next/image?url=%2Fimg.jpg&w=64&q=75"),
       allowedWidths,
     );
     expect(params).not.toBeNull();
@@ -16492,7 +18258,7 @@ describe("handleImageOptimization", () => {
   it("returns 404 when fetchAsset fails", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () => new Response("", { status: 404 }),
     };
@@ -16503,7 +18269,7 @@ describe("handleImageOptimization", () => {
   it("returns original image when no transformImage handler", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("original-image-data", {
@@ -16521,7 +18287,7 @@ describe("handleImageOptimization", () => {
   it("calls transformImage when provided", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800&q=90", {
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=90", {
       headers: { Accept: "image/webp" },
     });
     let capturedOptions: { width: number; format: string; quality: number } | null = null;
@@ -16539,16 +18305,18 @@ describe("handleImageOptimization", () => {
         return new Response("transformed", { headers: { "Content-Type": options.format } });
       },
     };
-    const response = await handleImageOptimization(request, handlers);
+    const response = await handleImageOptimization(request, handlers, undefined, {
+      qualities: [90],
+    });
     expect(response.status).toBe(200);
     expect(await response.text()).toBe("transformed");
-    expect(capturedOptions).toEqual({ width: 800, format: "image/webp", quality: 90 });
+    expect(capturedOptions).toEqual({ width: 640, format: "image/webp", quality: 90 });
   });
 
   it("falls back to original on transform error", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     let fetchCount = 0;
     const handlers = {
       fetchAsset: async () => {
@@ -16571,7 +18339,7 @@ describe("handleImageOptimization", () => {
   it("refetches the source when transform consumes the stream before failing", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     let fetchCount = 0;
     const handlers = {
       fetchAsset: async () => {
@@ -16595,7 +18363,7 @@ describe("handleImageOptimization", () => {
   it("uses refetched source headers when consumed transform falls back", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     let fetchCount = 0;
     const handlers = {
       fetchAsset: async () => {
@@ -16625,7 +18393,7 @@ describe("handleImageOptimization", () => {
   it("returns 404 when refetch fallback cannot reload the source image", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     let fetchCount = 0;
     const handlers = {
       fetchAsset: async () => {
@@ -16651,7 +18419,7 @@ describe("handleImageOptimization", () => {
   it("returns 400 when refetch fallback reloads an unsafe content type", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     let fetchCount = 0;
     const handlers = {
       fetchAsset: async () => {
@@ -16677,7 +18445,7 @@ describe("handleImageOptimization", () => {
   it("returns 400 for backslash open redirect (/\\evil.com)", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2F%5Cevil.com&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2F%5Cevil.com&w=640&q=75");
     const handlers = {
       fetchAsset: async () => new Response("should not be called", { status: 200 }),
     };
@@ -16689,7 +18457,7 @@ describe("handleImageOptimization", () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
     const request = new Request(
-      "http://localhost/_next/image?url=%2F%5Cgoogle.com%2Fimg.jpg&w=800",
+      "http://localhost/_next/image?url=%2F%5Cgoogle.com%2Fimg.jpg&w=640&q=75",
     );
     let fetchCalled = false;
     const handlers = {
@@ -16706,7 +18474,7 @@ describe("handleImageOptimization", () => {
   it("blocks SVG content type", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fmalicious.svg&w=100&q=75");
+    const request = new Request("http://localhost/_next/image?url=%2Fmalicious.svg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("<svg><script>alert(1)</script></svg>", {
@@ -16722,7 +18490,7 @@ describe("handleImageOptimization", () => {
   it("blocks text/html content type", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Ffake.jpg&w=100&q=75");
+    const request = new Request("http://localhost/_next/image?url=%2Ffake.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("<html><script>alert(1)</script></html>", {
@@ -16737,7 +18505,7 @@ describe("handleImageOptimization", () => {
   it("blocks responses with no Content-Type", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () => new Response("data", { status: 200 }),
     };
@@ -16748,7 +18516,7 @@ describe("handleImageOptimization", () => {
   it("sets Content-Security-Policy header on fallback responses", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("image-data", {
@@ -16768,7 +18536,7 @@ describe("handleImageOptimization", () => {
   it("sets Content-Security-Policy header on transformed responses", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800&q=90", {
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=90", {
       headers: { Accept: "image/webp" },
     });
     const handlers = {
@@ -16782,7 +18550,9 @@ describe("handleImageOptimization", () => {
         options: { width: number; format: string; quality: number },
       ) => new Response("transformed", { headers: { "Content-Type": options.format } }),
     };
-    const response = await handleImageOptimization(request, handlers);
+    const response = await handleImageOptimization(request, handlers, undefined, {
+      qualities: [90],
+    });
     expect(response.status).toBe(200);
     expect(response.headers.get("Content-Security-Policy")).toBe(
       "script-src 'none'; frame-src 'none'; sandbox;",
@@ -16794,7 +18564,7 @@ describe("handleImageOptimization", () => {
   it("overrides unsafe Content-Type from transform handler", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800&q=90", {
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=90", {
       headers: { Accept: "image/webp" },
     });
     const handlers = {
@@ -16806,7 +18576,9 @@ describe("handleImageOptimization", () => {
       transformImage: async () =>
         new Response("transformed", { headers: { "Content-Type": "text/html" } }),
     };
-    const response = await handleImageOptimization(request, handlers);
+    const response = await handleImageOptimization(request, handlers, undefined, {
+      qualities: [90],
+    });
     expect(response.status).toBe(200);
     // Should override to the negotiated format, not pass through text/html
     expect(response.headers.get("Content-Type")).toBe("image/webp");
@@ -16815,7 +18587,7 @@ describe("handleImageOptimization", () => {
   it("allows SVG passthrough with dangerouslyAllowSVG: true", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=100&q=75");
+    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response('<svg xmlns="http://www.w3.org/2000/svg"><rect/></svg>', {
@@ -16834,7 +18606,7 @@ describe("handleImageOptimization", () => {
   it("still blocks SVG when dangerouslyAllowSVG is false", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=100&q=75");
+    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("<svg></svg>", {
@@ -16851,7 +18623,7 @@ describe("handleImageOptimization", () => {
   it("SVG passthrough skips transformImage", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=100&q=75");
+    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=640&q=75");
     let transformCalled = false;
     const handlers = {
       fetchAsset: async () =>
@@ -16875,7 +18647,7 @@ describe("handleImageOptimization", () => {
   it("applies security headers on SVG passthrough", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=100&q=75");
+    const request = new Request("http://localhost/_next/image?url=%2Flogo.svg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("<svg></svg>", {
@@ -16897,7 +18669,7 @@ describe("handleImageOptimization", () => {
   it("applies custom contentDispositionType", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("image-data", {
@@ -16915,7 +18687,7 @@ describe("handleImageOptimization", () => {
   it("defaults Content-Disposition to inline when contentDispositionType is invalid", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("image-data", {
@@ -16933,7 +18705,7 @@ describe("handleImageOptimization", () => {
   it("applies custom contentSecurityPolicy", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("image-data", {
@@ -16952,7 +18724,7 @@ describe("handleImageOptimization", () => {
   it("default behavior unchanged when no imageConfig provided", async () => {
     const { handleImageOptimization } =
       await import("../packages/vinext/src/server/image-optimization.js");
-    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=800");
+    const request = new Request("http://localhost/_next/image?url=%2Fimg.jpg&w=640&q=75");
     const handlers = {
       fetchAsset: async () =>
         new Response("image-data", {
@@ -18829,6 +20601,29 @@ describe("shim alias map .js variants", () => {
     const missing = topLevel.filter((key) => !(key + ".js" in aliases!));
     expect(missing, `Missing .js aliases for: ${missing.join(", ")}`).toEqual([]);
   });
+
+  it("resolves next/error to the react-server shim only in the RSC environment", () => {
+    const plugins = vinext() as Plugin[];
+    const configPlugin = plugins.find((plugin) => plugin.name === "vinext:config");
+    if (!configPlugin?.resolveId || typeof configPlugin.resolveId === "function") {
+      throw new Error("vinext:config resolveId hook not found");
+    }
+
+    const hook = configPlugin.resolveId as {
+      handler: (this: { environment?: { name?: string } }, id: string) => string | undefined;
+    };
+    const clientShim = path.resolve(import.meta.dirname, "../packages/vinext/src/shims/error.tsx");
+    const reactServerShim = path.resolve(
+      import.meta.dirname,
+      "../packages/vinext/src/shims/error.react-server.ts",
+    );
+
+    expect(hook.handler.call({ environment: { name: "rsc" } }, "next/error")).toBe(reactServerShim);
+    expect(hook.handler.call({ environment: { name: "ssr" } }, "next/error")).toBe(clientShim);
+    expect(hook.handler.call({ environment: { name: "rsc" } }, "next/error.js")).toBe(
+      reactServerShim,
+    );
+  });
 });
 
 describe("@vercel/og compatibility resolution", () => {
@@ -18852,7 +20647,10 @@ describe("@vercel/og compatibility resolution", () => {
 
   it("routes direct @vercel/og app imports through the Next-compatible ImageResponse shim", () => {
     const hook = getResolveIdHook();
-    const expectedShim = path.resolve(import.meta.dirname, "../packages/vinext/src/shims/og.tsx");
+    // resolveId returns Vite-style ids: forward slashes on every platform.
+    const expectedShim = normalizePathSeparators(
+      path.resolve(import.meta.dirname, "../packages/vinext/src/shims/og.tsx"),
+    );
 
     expect(hook.filter.id.test("@vercel/og")).toBe(true);
     expect(hook.filter.id.test("@vercel/og.js")).toBe(true);
@@ -18873,6 +20671,53 @@ describe("@vercel/og compatibility resolution", () => {
     expect(
       hook.handler.call({}, "@vercel/og", "/repo/node_modules/vinext/dist/shims/og.js"),
     ).toBeUndefined();
+  });
+});
+
+describe("vinext shim package-subpath resolution", () => {
+  type ResolveIdHook = {
+    filter: { id: RegExp };
+    handler: (
+      this: { environment?: { name?: string } },
+      id: string,
+      importer?: string,
+    ) => string | undefined;
+  };
+
+  function getResolveIdHook(): ResolveIdHook {
+    const plugins = vinext() as Plugin[];
+    const configPlugin = plugins.find((plugin) => plugin.name === "vinext:config");
+    if (!configPlugin?.resolveId || typeof configPlugin.resolveId === "function") {
+      throw new Error("vinext:config resolveId hook not found");
+    }
+    return configPlugin.resolveId as ResolveIdHook;
+  }
+
+  it("strips JavaScript extensions and Vite queries from package subpaths", () => {
+    const hook = getResolveIdHook();
+    const expectedShim = path.resolve(
+      import.meta.dirname,
+      "../packages/vinext/src/shims/navigation.ts",
+    );
+    const expectedReactServerShim = path.resolve(
+      import.meta.dirname,
+      "../packages/vinext/src/shims/navigation.react-server.ts",
+    );
+    const expectedOgShim = path.resolve(import.meta.dirname, "../packages/vinext/src/shims/og.tsx");
+
+    expect(hook.filter.id.test("vinext/shims/navigation.js?v=123")).toBe(true);
+    expect(hook.filter.id.test("\0vinext/shims/navigation.js?v=123")).toBe(true);
+    expect(hook.filter.id.test("\0next/navigation")).toBe(true);
+    expect(hook.filter.id.test("\0@vercel/og")).toBe(true);
+    expect(hook.handler.call({}, "unrelated-next/navigation")).toBeUndefined();
+    expect(hook.handler.call({}, "vinext/shims/navigation.js?v=123")).toBe(expectedShim);
+    expect(hook.handler.call({}, "\0vinext/shims/navigation.js?v=123")).toBe(expectedShim);
+    expect(hook.handler.call({ environment: { name: "rsc" } }, "\0next/navigation")).toBe(
+      expectedReactServerShim,
+    );
+    expect(
+      hook.handler.call({}, "\0@vercel/og", path.join(FIXTURE_DIR, "app/opengraph-image.tsx")),
+    ).toBe(expectedOgShim);
   });
 });
 
@@ -19578,5 +21423,117 @@ describe("default-locale path normalisation (issue #1336, item 4)", () => {
     expect(
       matchRedirect(normalizeDefaultLocalePathname("/sv/old", i18n), rules, emptyCtx)?.destination,
     ).toBe("/sv/new");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pages Router runtime state sharing
+//
+// Vite can evaluate `next/router` in both the client entry and in page chunks.
+// State that must be consistent across those instances (events, history keys,
+// abort/cancel state, and router readiness) must live on a window-scoped
+// runtime object rather than in module-local variables.
+// ---------------------------------------------------------------------------
+describe("Pages Router runtime state sharing", () => {
+  it("shares RouterContext across duplicated next/router module instances", async () => {
+    vi.resetModules();
+    const contextA = await import("../packages/vinext/src/shims/internal/router-context.js");
+
+    vi.resetModules();
+    const contextB = await import("../packages/vinext/src/shims/internal/router-context.js");
+
+    expect(contextB.RouterContext).toBe(contextA.RouterContext);
+  });
+
+  it("shares router readiness across duplicated next/router module instances", async () => {
+    const previousWindow = (globalThis as any).window;
+    const win: any = {
+      location: {
+        pathname: "/1",
+        search: "",
+        hash: "",
+        href: "http://localhost/1",
+        hostname: "localhost",
+      },
+      history: { state: null, pushState() {}, replaceState() {} },
+      addEventListener() {},
+      dispatchEvent() {},
+      scrollTo() {},
+      __NEXT_DATA__: {
+        page: "/[id]",
+        query: {},
+        autoExport: true,
+        isFallback: false,
+        props: { pageProps: {} },
+      },
+      __VINEXT_PAGE_LOADERS__: {},
+    };
+    (globalThis as any).window = win;
+
+    try {
+      vi.resetModules();
+      const React = await import("react");
+      const { renderToStaticMarkup } = await import("react-dom/server");
+
+      // First `next/router` instance: the generated Pages client entry.
+      const routerModuleA = await import("../packages/vinext/src/shims/router.js");
+      const RouterA = routerModuleA.default;
+      const markReadyA = routerModuleA._markPagesRouterReady;
+
+      // Second `next/router` instance: a later page chunk that re-evaluates the
+      // module and overwrites window.next.router.
+      vi.resetModules();
+      const routerModuleB = await import("../packages/vinext/src/shims/router.js");
+      const RouterB = routerModuleB.default;
+      const useRouterB = routerModuleB.useRouter;
+
+      // Both singletons start with the same deferred-ready state.
+      expect(win.next.router).toBe(RouterB);
+      expect(RouterA.isReady).toBe(false);
+      expect(RouterB.isReady).toBe(false);
+
+      // After hydration, the readiness bit still stays false until the provider
+      // publishes it.
+      win.__NEXT_HYDRATED = true;
+      expect(RouterA.isReady).toBe(false);
+      expect(RouterB.isReady).toBe(false);
+
+      // Simulate the provider mounting and flipping the shared ready bit.
+      expect(markReadyA()).toBe(true);
+      expect(markReadyA()).toBe(false);
+
+      // The readiness transition is visible from every module instance and from
+      // the global singleton.
+      expect(RouterA.isReady).toBe(true);
+      expect(RouterB.isReady).toBe(true);
+      expect(win.next.router.isReady).toBe(true);
+
+      // useRouter() backed by the second instance also converges to ready.
+      function ProbeB() {
+        const router = useRouterB();
+        return React.createElement("span", null, router.isReady ? "ready" : "not-ready");
+      }
+      const htmlB = renderToStaticMarkup(
+        routerModuleB.wrapWithRouterContext(React.createElement(ProbeB)),
+      );
+      expect(htmlB).toBe("<span>ready</span>");
+
+      // And a provider-mounted hook from the first instance sees it too.
+      function ProbeA() {
+        const router = routerModuleA.useRouter();
+        return React.createElement("span", null, router.isReady ? "ready" : "not-ready");
+      }
+      const htmlA = renderToStaticMarkup(
+        routerModuleA.wrapWithRouterContext(React.createElement(ProbeA)),
+      );
+      expect(htmlA).toBe("<span>ready</span>");
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+    }
   });
 });

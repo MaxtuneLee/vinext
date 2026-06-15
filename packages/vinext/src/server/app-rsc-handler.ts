@@ -33,6 +33,7 @@ import { pickRootParams, setRootParams, type RootParams } from "vinext/shims/roo
 import { createRequestContext, runWithRequestContext } from "vinext/shims/unified-request-context";
 import { flattenErrorCauses } from "../utils/error-cause.js";
 import { hasBasePath } from "../utils/base-path.js";
+import { mergeRewriteQuery } from "../utils/query.js";
 import { applyAppMiddleware, type AppMiddlewareContext } from "./app-middleware.js";
 import { mergeMiddlewareResponseHeaders } from "./app-page-response.js";
 import { handleAppPrerenderEndpoint } from "./app-prerender-endpoints.js";
@@ -42,14 +43,23 @@ import {
   resolveInvalidRscCacheBustingRequest,
   stripRscCacheBustingSearchParam,
   stripRscSuffix,
+  VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM,
 } from "./app-rsc-cache-busting.js";
 import { finalizeAppRscResponse } from "./app-rsc-response-finalizer.js";
 import { normalizeRscRequest } from "./app-rsc-request-normalization.js";
 import { normalizeDefaultLocalePathname } from "./pages-i18n.js";
 import { notFoundResponse } from "./http-error-responses.js";
+import { getRenderedConcreteUrlPathsForRoute } from "./pregenerated-concrete-paths.js";
 import { getScriptNonceFromHeaderSources } from "./csp.js";
 import { buildPageCacheTags } from "./implicit-tags.js";
-import { isImageOptimizationPath } from "./image-optimization.js";
+import {
+  DEFAULT_DEVICE_SIZES,
+  DEFAULT_IMAGE_QUALITIES,
+  DEFAULT_IMAGE_SIZES,
+  isImageOptimizationPath,
+  resolveDevImageRedirect,
+  type ImageConfig,
+} from "./image-optimization.js";
 import { handleMetadataRouteRequest } from "./metadata-route-response.js";
 import type { MiddlewareModule } from "./middleware-runtime.js";
 import { runWithPrerenderWorkUnit } from "./prerender-work-unit-setup.js";
@@ -63,17 +73,18 @@ import {
   applyConfigHeadersToResponse,
   normalizeTrailingSlash,
   resolvePublicFileRoute,
-  validateImageUrl,
 } from "./request-pipeline.js";
 import {
-  prerenderRouteParamsPayloadMatchesRoute,
+  matchPrerenderRouteParamsPayload,
   readTrustedPrerenderRouteParams,
   serializePrerenderRouteParamsHeader,
 } from "./prerender-route-params.js";
+import { createAppPprFallbackShells } from "./app-ppr-fallback-shell.js";
 
 type AppPageParams = Record<string, string | string[]>;
 type RequestContext = ReturnType<typeof requestContextFromRequest>;
 type MetadataRoutes = Parameters<typeof handleMetadataRouteRequest>[0]["metadataRoutes"];
+const STATIC_METADATA_CONFIG_HEADER_OVERRIDES = new Set(["cache-control"]);
 type MakeThenableParams = Parameters<typeof handleMetadataRouteRequest>[0]["makeThenableParams"];
 type StaticParamsMap = Parameters<typeof handleAppPrerenderEndpoint>[1]["staticParamsMap"];
 type RootParamNamesMap = Parameters<
@@ -84,6 +95,7 @@ type AppRscMiddlewareContext = AppMiddlewareContext;
 
 type AppRscHandlerRoute = {
   isDynamic: boolean;
+  params?: readonly string[];
   page?: unknown;
   pattern: string;
   rootParamNames?: readonly string[];
@@ -128,6 +140,19 @@ type DispatchMatchedPageOptions<TRoute> = {
   middlewareContext: AppRscMiddlewareContext;
   mountedSlotsHeader: string | null;
   params: AppPageParams;
+  pprFallbackCacheShells?:
+    | readonly {
+        fallbackParamNames: readonly string[];
+        params: AppPageParams;
+        pathname: string;
+      }[]
+    | null;
+  pprFallbackShell?: {
+    fallbackParamNames: readonly string[];
+    routePattern: string;
+  };
+  renderedConcreteUrlPaths?: ReadonlySet<string>;
+  skipStaticParamsValidation?: boolean;
   staticParamsValidationParams?: AppPageParams;
   rootParams?: RootParams;
   request: Request;
@@ -207,8 +232,12 @@ type RenderNotFoundOptions<TRoute> = {
 };
 
 type RenderPagesFallbackOptions = {
+  allowRscDocumentFallback?: boolean;
+  appRouteMatch?: { route: { isDynamic: boolean; pattern: string } } | null;
   isRscRequest: boolean;
+  matchKind?: "dynamic" | "static";
   middlewareContext: AppRscMiddlewareContext;
+  pathname?: string;
   request: Request;
   url: URL;
 };
@@ -221,6 +250,7 @@ type NavigationContextValue = {
 
 type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
   basePath: string;
+  cacheComponents?: boolean;
   clearRequestContext: () => void;
   configHeaders: NextHeader[];
   configRedirects: NextRedirect[];
@@ -255,6 +285,8 @@ type CreateAppRscHandlerOptions<TRoute extends AppRscHandlerRoute> = {
     options: HandleServerActionRequestOptions,
   ) => Promise<Response | null>;
   i18nConfig: NextI18nConfig | null;
+  imageConfig?: ImageConfig;
+  isDev: boolean;
   isMiddlewareProxy: boolean;
   loadPrerenderPagesRoutes?: () => Promise<unknown>;
   makeThenableParams: MakeThenableParams;
@@ -276,6 +308,11 @@ function hasProperty<TKey extends PropertyKey>(
   key: TKey,
 ): value is object & Record<TKey, unknown> {
   return key in value;
+}
+
+function isEdgeRouteHandler(handler: unknown): boolean {
+  if (!handler || typeof handler !== "object" || !hasProperty(handler, "runtime")) return false;
+  return handler.runtime === "edge" || handler.runtime === "experimental-edge";
 }
 
 function isExecutionContextLike(value: unknown): value is ExecutionContextLike {
@@ -320,6 +357,23 @@ async function applyRewrite(
   }
 
   return rewritten;
+}
+
+function requestContextForResolvedUrl(
+  requestContext: RequestContext,
+  resolvedUrl: string,
+  baseUrl: URL,
+): RequestContext {
+  return {
+    cookies: requestContext.cookies,
+    headers: requestContext.headers,
+    host: requestContext.host,
+    query: new URL(resolvedUrl, baseUrl).searchParams,
+  };
+}
+
+function pathnameForResolvedUrl(resolvedUrl: string): string {
+  return resolvedUrl.split("#", 1)[0].split("?", 1)[0];
 }
 
 function applyConfigHeadersToMiddlewareRedirect(
@@ -377,6 +431,16 @@ function requestWithoutRscCacheBustingSearchParam(request: Request): Request {
   return cloneRequestWithUrl(source, url.toString());
 }
 
+function requestWithoutRscSuffix(request: Request): Request {
+  const url = new URL(request.url);
+  const pathname = stripRscSuffix(url.pathname);
+  if (pathname === url.pathname) return request;
+
+  url.pathname = pathname;
+  const source = request.body ? request.clone() : request;
+  return cloneRequestWithUrl(source, url.toString());
+}
+
 async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   options: CreateAppRscHandlerOptions<TRoute>,
   request: Request,
@@ -402,6 +466,8 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     clientReuseManifest,
   } = normalized;
   let { pathname, cleanPathname } = normalized;
+  let resolvedUrl = cleanPathname + url.search;
+  const getResolvedSearchParams = () => new URL(resolvedUrl, url).searchParams;
   // Canonical (external) pathname the user requested. Middleware rewrites and
   // next.config.js rewrites mutate `cleanPathname` so internal route matching
   // can find the destination page, but hooks like `usePathname()` must reflect
@@ -483,14 +549,14 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // Keep cache-busting validation on the real request above, then hide the
   // internal `_rsc` transport query from userland middleware and post-middleware
   // has/missing matching. This mirrors Next.js' navigation middleware fixture.
-  const userlandRequest = isRscRequest
-    ? requestWithoutRscCacheBustingSearchParam(request)
-    : request;
+  const normalizedUserlandRequest = requestWithoutRscSuffix(request);
+  const userlandRequest = requestWithoutRscCacheBustingSearchParam(normalizedUserlandRequest);
   const middlewareContext: AppRscMiddlewareContext = {
     headers: null,
     requestHeaders: null,
     status: null,
   };
+  let didMiddlewareRewrite = false;
 
   if (options.middlewareModule) {
     const middlewareResult = await applyAppMiddleware({
@@ -514,9 +580,11 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     }
 
     cleanPathname = middlewareResult.cleanPathname;
+    didMiddlewareRewrite = cleanPathname !== normalized.cleanPathname;
     if (middlewareResult.search !== null) {
       url.search = middlewareResult.search;
     }
+    resolvedUrl = cleanPathname + url.search;
   }
 
   const scriptNonce = getScriptNonceFromHeaderSources(request.headers, middlewareContext.headers);
@@ -527,25 +595,43 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // itself continues to use the un-prefixed `cleanPathname` because App
   // Router files live under `app/...` with no locale segment. See issue
   // #1336 item 4 / pages-i18n.normalizeDefaultLocalePathname.
-  const beforeFilesRewrite = await applyRewrite(
-    {
-      basePathState,
-      clearRequestContext: options.clearRequestContext,
-      // Forward the `_rsc`-stripped request so external rewrite proxies never
-      // receive the internal RSC transport query (same invariant as middleware).
-      request: userlandRequest,
-      requestContext: postMiddlewareRequestContext,
-      rewrites: options.configRewrites.beforeFiles,
-    },
-    matchPathname(cleanPathname),
-  );
-  if (beforeFilesRewrite instanceof Response) return beforeFilesRewrite;
-  if (beforeFilesRewrite) cleanPathname = beforeFilesRewrite;
+  for (const rewrite of options.configRewrites.beforeFiles) {
+    const beforeFilesRewrite = await applyRewrite(
+      {
+        basePathState,
+        clearRequestContext: options.clearRequestContext,
+        // External RSC rewrites must forward the validated `_rsc` token so the
+        // destination server can validate the request without the original URL.
+        request: normalizedUserlandRequest,
+        requestContext: requestContextForResolvedUrl(
+          postMiddlewareRequestContext,
+          resolvedUrl,
+          url,
+        ),
+        rewrites: [rewrite],
+      },
+      matchPathname(cleanPathname),
+    );
+    if (beforeFilesRewrite instanceof Response) return beforeFilesRewrite;
+    if (beforeFilesRewrite) {
+      resolvedUrl = mergeRewriteQuery(resolvedUrl, beforeFilesRewrite);
+      cleanPathname = pathnameForResolvedUrl(resolvedUrl);
+    }
+  }
 
   if (isImageOptimizationPath(cleanPathname)) {
-    const imageUrlResult = validateImageUrl(url.searchParams.get("url"), request.url);
-    if (imageUrlResult instanceof Response) return imageUrlResult;
-    return Response.redirect(new URL(imageUrlResult, url.origin).href, 302);
+    const imageRedirect = resolveDevImageRedirect(
+      url,
+      [
+        ...(options.imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
+        ...(options.imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
+      ],
+      options.imageConfig?.qualities ?? DEFAULT_IMAGE_QUALITIES,
+      { isDev: options.isDev },
+    );
+    if (!imageRedirect)
+      return new Response("Invalid image optimization parameters", { status: 400 });
+    return Response.redirect(new URL(imageRedirect, url.origin).href, 302);
   }
 
   const metadataRouteResponse = await handleMetadataRouteRequest({
@@ -554,6 +640,13 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     makeThenableParams: options.makeThenableParams,
   });
   if (metadataRouteResponse) {
+    applyConfigHeadersToResponse(metadataRouteResponse.headers, {
+      basePathState,
+      configHeaders: options.configHeaders,
+      overwriteExisting: STATIC_METADATA_CONFIG_HEADER_OVERRIDES,
+      pathname: matchPathname(cleanPathname),
+      requestContext: preMiddlewareRequestContext,
+    });
     return applyMiddlewareContextToResponse(metadataRouteResponse, middlewareContext);
   }
 
@@ -569,13 +662,14 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     return publicFileResponse;
   }
 
-  if (isRscRequest) {
-    stripRscCacheBustingSearchParam(url);
-  }
+  stripRscCacheBustingSearchParam(url);
+  const resolved = new URL(resolvedUrl, url);
+  stripRscCacheBustingSearchParam(resolved);
+  resolvedUrl = resolved.pathname + resolved.search + resolved.hash;
 
   options.setNavigationContext({
     pathname: canonicalPathname,
-    searchParams: url.searchParams,
+    searchParams: getResolvedSearchParams(),
     params: {},
   });
 
@@ -628,48 +722,106 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     middlewareContext,
     mountedSlotsHeader,
     request,
-    searchParams: url.searchParams,
+    searchParams: getResolvedSearchParams(),
   });
   if (serverActionResponse) return serverActionResponse;
 
   let match = preActionMatch;
+  const renderPagesForMatchKind = async (
+    matchKind: "dynamic" | "static",
+  ): Promise<Response | null> =>
+    match === null || match.route.isDynamic
+      ? ((await options.renderPagesFallback?.({
+          appRouteMatch: match ?? null,
+          allowRscDocumentFallback: didMiddlewareRewrite,
+          isRscRequest,
+          matchKind,
+          middlewareContext,
+          pathname: resolvedUrl,
+          request,
+          url,
+        })) ?? null)
+      : null;
+  const staticPagesFallbackResponse = await renderPagesForMatchKind("static");
+  if (staticPagesFallbackResponse) {
+    options.clearRequestContext();
+    return staticPagesFallbackResponse;
+  }
   if (!match || match.route.isDynamic) {
-    const afterFilesRewrite = await applyRewrite(
-      {
-        basePathState,
-        clearRequestContext: options.clearRequestContext,
-        // Forward the `_rsc`-stripped request so external rewrite proxies never
-        // receive the internal RSC transport query (same invariant as middleware).
-        request: userlandRequest,
-        requestContext: postMiddlewareRequestContext,
-        rewrites: options.configRewrites.afterFiles,
-      },
-      matchPathname(cleanPathname),
-    );
-    if (afterFilesRewrite instanceof Response) return afterFilesRewrite;
-    if (afterFilesRewrite) {
-      cleanPathname = afterFilesRewrite;
+    for (const rewrite of options.configRewrites.afterFiles) {
+      const afterFilesRewrite = await applyRewrite(
+        {
+          basePathState,
+          clearRequestContext: options.clearRequestContext,
+          // External RSC rewrites must forward the validated `_rsc` token.
+          request: normalizedUserlandRequest,
+          requestContext: requestContextForResolvedUrl(
+            postMiddlewareRequestContext,
+            resolvedUrl,
+            url,
+          ),
+          rewrites: [rewrite],
+        },
+        matchPathname(cleanPathname),
+      );
+      if (afterFilesRewrite instanceof Response) return afterFilesRewrite;
+      if (!afterFilesRewrite) continue;
+      resolvedUrl = mergeRewriteQuery(resolvedUrl, afterFilesRewrite);
+      cleanPathname = pathnameForResolvedUrl(resolvedUrl);
       match = options.matchRoute(cleanPathname);
+      const rewrittenStaticPagesResponse = await renderPagesForMatchKind("static");
+      if (rewrittenStaticPagesResponse) {
+        options.clearRequestContext();
+        return rewrittenStaticPagesResponse;
+      }
+      const rewrittenDynamicPagesResponse = await renderPagesForMatchKind("dynamic");
+      if (rewrittenDynamicPagesResponse) {
+        options.clearRequestContext();
+        return rewrittenDynamicPagesResponse;
+      }
+      if (match) break;
     }
   }
 
+  const dynamicPagesFallbackResponse = await renderPagesForMatchKind("dynamic");
+  if (dynamicPagesFallbackResponse) {
+    options.clearRequestContext();
+    return dynamicPagesFallbackResponse;
+  }
+
   if (!match) {
-    const fallbackRewrite = await applyRewrite(
-      {
-        basePathState,
-        clearRequestContext: options.clearRequestContext,
-        // Forward the `_rsc`-stripped request so external rewrite proxies never
-        // receive the internal RSC transport query (same invariant as middleware).
-        request: userlandRequest,
-        requestContext: postMiddlewareRequestContext,
-        rewrites: options.configRewrites.fallback,
-      },
-      matchPathname(cleanPathname),
-    );
-    if (fallbackRewrite instanceof Response) return fallbackRewrite;
-    if (fallbackRewrite) {
-      cleanPathname = fallbackRewrite;
+    for (const rewrite of options.configRewrites.fallback) {
+      const fallbackRewrite = await applyRewrite(
+        {
+          basePathState,
+          clearRequestContext: options.clearRequestContext,
+          // External RSC rewrites must forward the validated `_rsc` token.
+          request: normalizedUserlandRequest,
+          requestContext: requestContextForResolvedUrl(
+            postMiddlewareRequestContext,
+            resolvedUrl,
+            url,
+          ),
+          rewrites: [rewrite],
+        },
+        matchPathname(cleanPathname),
+      );
+      if (fallbackRewrite instanceof Response) return fallbackRewrite;
+      if (!fallbackRewrite) continue;
+      resolvedUrl = mergeRewriteQuery(resolvedUrl, fallbackRewrite);
+      cleanPathname = pathnameForResolvedUrl(resolvedUrl);
       match = options.matchRoute(cleanPathname);
+      const rewrittenStaticPagesResponse = await renderPagesForMatchKind("static");
+      if (rewrittenStaticPagesResponse) {
+        options.clearRequestContext();
+        return rewrittenStaticPagesResponse;
+      }
+      const rewrittenDynamicPagesResponse = await renderPagesForMatchKind("dynamic");
+      if (rewrittenDynamicPagesResponse) {
+        options.clearRequestContext();
+        return rewrittenDynamicPagesResponse;
+      }
+      if (match) break;
     }
   }
 
@@ -684,17 +836,6 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     if (process.env.NODE_ENV !== "production" && canonicalPathname === "/favicon.ico") {
       options.clearRequestContext();
       return new Response("", { status: 404 });
-    }
-
-    const pagesFallbackResponse = await options.renderPagesFallback?.({
-      isRscRequest,
-      middlewareContext,
-      request,
-      url,
-    });
-    if (pagesFallbackResponse) {
-      options.clearRequestContext();
-      return pagesFallbackResponse;
     }
 
     const renderedNotFoundResponse = await options.renderNotFound({
@@ -717,17 +858,33 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
   // branch and any downstream synchronous module reads.
   if (options.ensureRouteLoaded) await options.ensureRouteLoaded(route);
   const prerenderRouteParamsPayload = readTrustedPrerenderRouteParams(request);
-  const prerenderRouteParams = prerenderRouteParamsPayloadMatchesRoute(
+  const prerenderRouteParamsMatch = matchPrerenderRouteParamsPayload(
     prerenderRouteParamsPayload,
     route.pattern,
     params,
-  )
-    ? prerenderRouteParamsPayload.params
-    : null;
+  );
+  const prerenderRouteParams = prerenderRouteParamsMatch?.params ?? null;
+  const isPrerenderFallbackShell = prerenderRouteParamsMatch?.kind === "fallback-shell";
   const renderParams = prerenderRouteParams ?? params;
+  const resolvedSearchParams = getResolvedSearchParams();
+  const runtimeFallbackShells =
+    options.cacheComponents === true &&
+    request.method === "GET" &&
+    !isRscRequest &&
+    !isPrerenderFallbackShell &&
+    route.params
+      ? createAppPprFallbackShells(
+          {
+            params: route.params,
+            pattern: route.pattern,
+            rootParamNames: route.rootParamNames,
+          },
+          params,
+        )
+      : [];
   options.setNavigationContext({
     pathname: canonicalPathname,
-    searchParams: url.searchParams,
+    searchParams: resolvedSearchParams,
     params: renderParams,
   });
   const rootParams = pickRootParams(renderParams, route.rootParamNames);
@@ -737,6 +894,21 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     setCurrentFetchSoftTags(
       buildPageCacheTags(cleanPathname, [], [...route.routeSegments], "route"),
     );
+    // Next.js edge route handlers run through web/adapter.ts, which strips
+    // internal search params from the request URL. Node route handlers only
+    // strip `_rsc` from the parsed query object and rebuild request.url from
+    // initURL, preserving it there even for RSC requests.
+    const routeHandlerRequest = isEdgeRouteHandler(route.routeHandler)
+      ? userlandRequest
+      : normalizedUserlandRequest;
+    const routeHandlerUrl = new URL(routeHandlerRequest.url);
+    const internalRscValues = isEdgeRouteHandler(route.routeHandler)
+      ? []
+      : routeHandlerUrl.searchParams.getAll(VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM);
+    routeHandlerUrl.search = resolvedSearchParams.toString();
+    for (const internalRscValue of internalRscValues) {
+      routeHandlerUrl.searchParams.append(VINEXT_RSC_CACHE_BUSTING_SEARCH_PARAM, internalRscValue);
+    }
     return options.dispatchMatchedRouteHandler({
       cleanPathname,
       middlewareContext,
@@ -745,9 +917,9 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
       // object (always `{}` for non-dynamic) so `useParams()` etc. still see
       // an object shape; only the user-facing handler context surfaces null.
       params: route.isDynamic ? renderParams : null,
-      request,
+      request: new Request(routeHandlerUrl, routeHandlerRequest),
       route,
-      searchParams: url.searchParams,
+      searchParams: resolvedSearchParams,
     });
   }
 
@@ -765,12 +937,22 @@ async function handleAppRscRequest<TRoute extends AppRscHandlerRoute>(
     middlewareContext,
     mountedSlotsHeader,
     params: renderParams,
-    staticParamsValidationParams: prerenderRouteParams === null ? undefined : params,
+    pprFallbackCacheShells: runtimeFallbackShells,
+    pprFallbackShell: isPrerenderFallbackShell
+      ? {
+          fallbackParamNames: prerenderRouteParamsMatch.fallbackParamNames,
+          routePattern: route.pattern,
+        }
+      : undefined,
+    renderedConcreteUrlPaths: getRenderedConcreteUrlPathsForRoute(route.pattern),
+    skipStaticParamsValidation: isPrerenderFallbackShell,
+    staticParamsValidationParams:
+      prerenderRouteParams === null || isPrerenderFallbackShell ? undefined : params,
     rootParams,
     request,
     route,
     scriptNonce,
-    searchParams: url.searchParams,
+    searchParams: resolvedSearchParams,
     renderMode,
   });
 

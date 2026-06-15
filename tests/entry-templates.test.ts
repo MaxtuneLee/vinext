@@ -123,6 +123,17 @@ const minimalAppRoutes: AppRoute[] = [
 // ── App Router manifest construction ─────────────────────────────────
 
 describe("App Router generated manifest construction", () => {
+  it("embeds client rewrite rules in the App browser entry", () => {
+    const code = generateBrowserEntry([], null, [], {
+      afterFiles: [],
+      beforeFiles: [{ source: "/legacy", destination: "/about" }],
+      fallback: [],
+    });
+
+    expect(code).toContain('window.__VINEXT_CLIENT_REWRITES__ = {"afterFiles":[],"beforeFiles"');
+    expect(code).toContain('"source":"/legacy","destination":"/about"');
+  });
+
   it("embeds the Link auto-prefetch route manifest in the browser entry", () => {
     const code = generateBrowserEntry([
       ...minimalAppRoutes,
@@ -947,6 +958,50 @@ describe("Pages Router entry template", () => {
       expect(code).toContain("vinext/instrumentation-client");
       // No spurious bare imports referring to a non-existent project file.
       expect(code).not.toMatch(/import "[^"]*instrumentation-client\.ts"/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it("hydrates _app with the full Pages props envelope", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-client-entry-props-"));
+    const pagesDir = path.join(tmpDir, "pages");
+
+    try {
+      fs.mkdirSync(pagesDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(pagesDir, "_app.tsx"),
+        "export default function App({ Component, pageProps }) { return <Component {...pageProps} />; }",
+      );
+      fs.writeFileSync(
+        path.join(pagesDir, "index.tsx"),
+        "export default function Page() { return null; }",
+      );
+
+      const code = await generateClientEntry(
+        pagesDir,
+        await resolveNextConfig({}),
+        createValidFileMatcher(),
+      );
+
+      expect(code).toContain(
+        'const props = nextData.props && typeof nextData.props === "object" ? nextData.props : {};',
+      );
+      expect(code).toContain("const rawPageProps = props.pageProps;");
+      expect(code).toContain(
+        'const pageProps = rawPageProps && typeof rawPageProps === "object" ? rawPageProps : {};',
+      );
+      expect(code).toContain('import Router, { wrapWithRouterContext } from "next/router";');
+      expect(code).toContain("router: Router,");
+      expect(code).toContain("pageProps: rawPageProps,");
+      expect(code).toContain("element = wrapWithRouterContext(element, resolveHydrationCommit);");
+      expect(code).toContain("await hydrationCommitted;");
+      expect(code).toContain("if (nextData.isFallback) {");
+      expect(code).toContain("await Router.replace(");
+      expect(code).toContain("{ _h: 1, scroll: false },");
+      expect(code).not.toContain("function VinextHydrationMarker");
+      expect(code).not.toContain("React.createElement(VinextHydrationMarker");
+      expect(code).toContain("hydrateRoot(container, element, hydrateRootOptions)");
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vite-plus/test";
 import {
+  beginPprFallbackShellFinalRender,
   createPprFallbackShellState,
   createPprFallbackShellSuspensePromise,
   isPprFallbackShellAbortError,
@@ -188,10 +189,30 @@ describe("ppr fallback shell render lifecycle", () => {
 
     expect(state.phase).toBe("final");
     expect(state.hasDynamicBoundary).toBe(false);
+    expect(state.isFinalRenderStarted).toBe(false);
     expect(state.pendingCacheTasks).toBe(0);
     expect(state.isAbortScheduled).toBe(false);
     expect(state.cacheReadyResolvers.length).toBe(0);
     expect(state.abortController.signal.aborted).toBe(false);
+  });
+
+  it("does not abort the final shell before the React prerender starts", async () => {
+    const state = createPprFallbackShellState({
+      fallbackParamNames: ["slug"],
+      routePattern: "/:locale/blog/:slug",
+    });
+    preparePprFallbackShellFinalRender(state);
+
+    runWithPprFallbackShellState(state, () => {
+      void createPprFallbackShellSuspensePromise("params");
+    });
+    await delay(5);
+    expect(state.reactAbortController.signal.aborted).toBe(false);
+
+    beginPprFallbackShellFinalRender(state);
+    await delay(5);
+    expect(state.reactAbortController.signal.aborted).toBe(true);
+    expect(state.abortController.signal.aborted).toBe(true);
   });
 
   it("isPprFallbackShellAbortError returns true for DOMException AbortError", () => {
@@ -277,11 +298,10 @@ describe("ppr fallback shell render lifecycle", () => {
       expect(p2).not.toBeNull();
     });
 
-    await delay(5);
+    await ready;
     expect(isReady).toBe(true);
     expect(state.pendingCacheTasks).toBe(0);
 
     state.abortController.abort();
-    await ready.catch(() => {});
   });
 });

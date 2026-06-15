@@ -54,7 +54,6 @@ import {
 import {
   isAbsoluteOrProtocolRelativeUrl,
   normalizePathTrailingSlash,
-  resolveRelativeHref,
   toBrowserNavigationHref,
   toSameOriginAppPath,
   withBasePath,
@@ -71,6 +70,7 @@ import {
   resolvePagesDataNavigationTarget,
 } from "./internal/pages-data-target.js";
 import { markAppRouteDetectedOnPrefetch } from "./internal/app-route-detection.js";
+import { resolveHybridClientRouteOwner } from "./internal/hybrid-client-route-owner.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
 import {
   clearLinkForCurrentNavigation,
@@ -293,11 +293,12 @@ function resolveMatchedAutoAppRoutePrefetch(route: VinextLinkPrefetchRoute): {
   prefetchShellFirst: boolean;
   shouldPrefetch: boolean;
 } {
-  const hasLoadingShell = route.isDynamic && route.canPrefetchLoadingShell;
+  const hasLoadingShell = route.canPrefetchLoadingShell;
   return {
     // Vinext does not yet have Next.js's per-segment runtime-prefetch hints.
-    // Until that route fact exists, dynamic routes without loading-shell
-    // fallbacks are treated as exact-URL full prefetches. The prefetch cache is
+    // Routes with loading boundaries prefetch a shell first so navigation can
+    // commit loading.js immediately. Dynamic routes without loading-shell
+    // fallbacks are treated as exact-URL full prefetches; the prefetch cache is
     // keyed by the concrete RSC URL, so this cannot reuse data across params.
     cacheForNavigation: !hasLoadingShell,
     prefetchShellFirst: !route.isDynamic,
@@ -391,6 +392,17 @@ function prefetchUrl(href: string, mode: LinkPrefetchMode, priority: "low" | "hi
   schedule(() => {
     void (async () => {
       if (hasAppNavigationRuntime()) {
+        // Hybrid ownership: skip the App RSC prefetch when Pages owns the
+        // URL. The App's `__VINEXT_LINK_PREFETCH_ROUTES__` may include an
+        // App catch-all that also matches the same path, so a naive
+        // prefetch would fetch an RSC stream for a Pages route — that
+        // stream is never consumed (the click path now hard-navigates to
+        // Pages) and would also race the request the browser will issue on
+        // the actual navigation.
+        const hybridOwner = resolveHybridClientRouteOwner(prefetchHref, __basePath);
+        if (hybridOwner === "pages" || hybridOwner === "document") {
+          return;
+        }
         const autoPrefetch =
           mode === "auto"
             ? resolveAutoAppRoutePrefetch(prefetchHref)
@@ -945,9 +957,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
 
     e.preventDefault();
 
-    // Resolve relative hrefs (#hash, ?query) against the current URL once so
-    // onNavigate and the actual navigation target stay in sync.
-    const absoluteHref = resolveRelativeHref(navigateHref, window.location.href, __basePath);
+    // Resolve relative hrefs (#hash, ?query) for onNavigate and the hard-navigation fallback.
     const absoluteFullHref = toBrowserNavigationHref(
       navigateHref,
       window.location.href,
@@ -979,6 +989,30 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       }
     }
 
+    // Hybrid ownership check: when the App Router runtime is installed and
+    // the target URL is owned by the Pages Router, soft-navigating with RSC
+    // would either (a) hit the App catch-all, or (b) bounce off
+    // `renderPagesFallback` returning null for RSC requests. Either way the
+    // user lands on the wrong route. Pages only renders HTML documents or
+    // `_next/data` JSON, so the only correct path is a document navigation.
+    //
+    // We compare ownership here, not in `navigateClientSide`, because the
+    // document navigation is committed synchronously by the browser — there
+    // is no RSC stream to suspend on, so the soft-navigation bookkeeping
+    // (`setPending`, `setLinkForCurrentNavigation`) would be a no-op at best
+    // and a stale `useLinkStatus` indicator at worst.
+    if (
+      getNavigationRuntime()?.functions.navigate &&
+      ["pages", "document"].includes(resolveHybridClientRouteOwner(navigateHref, __basePath) ?? "")
+    ) {
+      if (replace) {
+        window.location.replace(absoluteFullHref);
+      } else {
+        window.location.assign(absoluteFullHref);
+      }
+      return;
+    }
+
     // App Router: delegate to navigateClientSide which handles scroll save,
     // hash-only changes, RSC fetch, and two-phase URL commit.
     if (getNavigationRuntime()?.functions.navigate) {
@@ -1006,7 +1040,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
         const routerModule = await import("next/router");
         const Router = routerModule.default;
         await navigatePagesRouterLink(Router, {
-          href: absoluteHref,
+          href: navigateHref,
           replace,
           scroll,
           shallow,

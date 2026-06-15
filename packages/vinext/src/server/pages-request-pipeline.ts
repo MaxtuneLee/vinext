@@ -29,17 +29,22 @@ import {
   proxyExternalRequest,
   sanitizeDestination,
 } from "../config/config-matchers.js";
-import { applyConfigHeadersToHeaderRecord, normalizeTrailingSlash } from "./request-pipeline.js";
+import {
+  applyConfigHeadersToHeaderRecord,
+  cloneRequestWithUrl,
+  normalizeTrailingSlash,
+} from "./request-pipeline.js";
 import type { HeaderRecord } from "./request-pipeline.js";
 import { mergeHeaders } from "./worker-utils.js";
 import { normalizeDefaultLocalePathname, stripI18nLocaleForApiRoute } from "./pages-i18n.js";
 import { mergeRewriteQuery } from "../utils/query.js";
-import { hasBasePath } from "../utils/base-path.js";
+import { addBasePathToPathname, hasBasePath } from "../utils/base-path.js";
 
 // All "render options" that are passed through to the renderPage callback
 export type PagesRenderOptions = {
   isDataReq?: boolean;
   renderErrorPageOnMiss?: boolean;
+  originalUrl?: string;
 };
 
 export type MiddlewareResult = {
@@ -120,6 +125,32 @@ export type PagesPipelineDeps = {
     | ((requestPathname: string, stagedHeaders: HeaderRecord) => Promise<boolean>)
     | null;
 };
+
+/**
+ * Wrap an adapter's `runMiddleware` callback so middleware receives the original
+ * (pre-basePath-stripping) URL. Adapters strip the basePath before handing the
+ * request to `runPagesRequest`, but Next.js passes the un-stripped URL to the
+ * middleware adapter so `request.nextUrl.basePath` reflects whether the URL
+ * actually had the basePath prefix. Requests outside the basePath
+ * (`hadBasePath === false`) are passed through untouched so middleware sees
+ * `nextUrl.basePath === ""` and can redirect them into the basePath
+ * (see the middleware-base-path e2e test / #1830).
+ *
+ * Shared by the Node prod server (prod-server.ts) and the generated Pages
+ * Router worker entry (deploy.ts) to keep the two adapters in sync.
+ */
+export function wrapMiddlewareWithBasePath(
+  runMiddleware: NonNullable<PagesPipelineDeps["runMiddleware"]>,
+  basePath: string,
+  hadBasePath: boolean,
+): NonNullable<PagesPipelineDeps["runMiddleware"]> {
+  if (!hadBasePath || !basePath) return runMiddleware;
+  return (request, ctx, opts) => {
+    const mwUrl = new URL(request.url);
+    mwUrl.pathname = addBasePathToPathname(mwUrl.pathname, basePath);
+    return runMiddleware(new Request(mwUrl, request), ctx, opts);
+  };
+}
 
 // The result discriminated union
 export type PagesPipelineResult =
@@ -240,7 +271,8 @@ export async function runPagesRequest(
   }
 
   // Step 5: Middleware
-  let resolvedUrl = pathname + search;
+  const originalResolvedUrl = pathname + search;
+  let resolvedUrl = originalResolvedUrl;
   const middlewareHeaders: HeaderRecord = {};
   let middlewareStatus: number | undefined;
 
@@ -331,7 +363,12 @@ export async function runPagesRequest(
     { preserveCredentialHeaders: isExternalUrl(resolvedUrl) },
   );
   request = postMwReq;
-  let resolvedPathname = resolvedUrl.split("?")[0];
+  const pathnameForResolvedUrl = (value: string): string => value.split("#", 1)[0].split("?", 1)[0];
+  const rewriteRequestContext = (): RequestContext => ({
+    ...postMwReqCtx,
+    query: new URL(resolvedUrl, url).searchParams,
+  });
+  let resolvedPathname = pathnameForResolvedUrl(resolvedUrl);
 
   const matchResolvedPathname = (p: string): string =>
     i18nConfig ? normalizeDefaultLocalePathname(p, i18nConfig, { hostname: requestHostname }) : p;
@@ -376,12 +413,14 @@ export async function runPagesRequest(
   }
 
   // Step 9: beforeFiles rewrites
+  // Next.js server-utils.ts applies every beforeFiles rule in sequence and
+  // continues afterFiles/fallback rules until a destination resolves.
   let configRewriteFired = false;
-  if (configRewrites.beforeFiles?.length) {
+  for (const rewrite of configRewrites.beforeFiles ?? []) {
     const rewritten = matchRewrite(
       matchResolvedPathname(resolvedPathname),
-      configRewrites.beforeFiles,
-      postMwReqCtx,
+      [rewrite],
+      rewriteRequestContext(),
       basePathState,
     );
     if (rewritten) {
@@ -390,7 +429,7 @@ export async function runPagesRequest(
         return { type: "response", response: await proxyExternal(request, rewritten) };
       }
       resolvedUrl = mergeRewriteQuery(resolvedUrl, rewritten);
-      resolvedPathname = resolvedUrl.split("?")[0];
+      resolvedPathname = pathnameForResolvedUrl(resolvedUrl);
       configRewriteFired = true;
     }
   }
@@ -411,7 +450,16 @@ export async function runPagesRequest(
   const apiLookupPathname = apiLookupUrl.split("?")[0];
   if (apiLookupPathname.startsWith("/api/") || apiLookupPathname === "/api") {
     if (typeof deps.handleApi === "function") {
-      const response = await deps.handleApi(request, apiLookupUrl, deps.ctx ?? null);
+      let apiRequest = request;
+      // Prod re-adds basePath only when the original request carried it.
+      // Dev reconstructs Vite's stripped basePath in api-handler.ts; the paths
+      // differ only for an out-of-basePath request config-rewritten into an API.
+      if (basePath && hadBasePath) {
+        const apiRequestUrl = new URL(request.url);
+        apiRequestUrl.pathname = addBasePathToPathname(apiRequestUrl.pathname, basePath);
+        apiRequest = cloneRequestWithUrl(request, apiRequestUrl.toString());
+      }
+      const response = await deps.handleApi(apiRequest, apiLookupUrl, deps.ctx ?? null);
       return {
         type: "response",
         // API routes return arbitrary data; default a missing content-type to
@@ -432,36 +480,73 @@ export async function runPagesRequest(
   }
 
   // Step 12: afterFiles rewrites
-  const pageMatch = deps.matchPageRoute ? deps.matchPageRoute(resolvedPathname, request) : null;
+  let pageMatch = deps.matchPageRoute ? deps.matchPageRoute(resolvedPathname, request) : null;
   // matchPageRoute is a route-table scan; only re-run it below if afterFiles
   // actually rewrote resolvedPathname (the common case leaves it unchanged).
   let resolvedPathnameChanged = false;
-  if ((!pageMatch || pageMatch.route.isDynamic) && configRewrites.afterFiles?.length) {
-    const rewritten = matchRewrite(
-      matchResolvedPathname(resolvedPathname),
-      configRewrites.afterFiles,
-      postMwReqCtx,
-      basePathState,
-    );
-    if (rewritten) {
-      if (isExternalUrl(rewritten)) {
-        // Bare proxy — no middleware-header merge (see Step 8 asymmetry note).
-        return { type: "response", response: await proxyExternal(request, rewritten) };
+  if (!pageMatch || pageMatch.route.isDynamic) {
+    for (const rewrite of configRewrites.afterFiles ?? []) {
+      const rewritten = matchRewrite(
+        matchResolvedPathname(resolvedPathname),
+        [rewrite],
+        rewriteRequestContext(),
+        basePathState,
+      );
+      if (rewritten) {
+        if (isExternalUrl(rewritten)) {
+          // Bare proxy — no middleware-header merge (see Step 8 asymmetry note).
+          return { type: "response", response: await proxyExternal(request, rewritten) };
+        }
+        resolvedUrl = mergeRewriteQuery(resolvedUrl, rewritten);
+        resolvedPathname = pathnameForResolvedUrl(resolvedUrl);
+        resolvedPathnameChanged = true;
+        pageMatch = deps.matchPageRoute ? deps.matchPageRoute(resolvedPathname, request) : null;
+        if (pageMatch) break;
       }
-      resolvedUrl = mergeRewriteQuery(resolvedUrl, rewritten);
-      resolvedPathname = resolvedUrl.split("?")[0];
-      resolvedPathnameChanged = true;
     }
   }
+
+  const refreshDataRewriteHeader = () => {
+    if (
+      (isDataReq || isDataRequest) &&
+      resolvedUrl !== originalResolvedUrl &&
+      !isExternalUrl(resolvedUrl)
+    ) {
+      middlewareHeaders["x-nextjs-rewrite"] = resolvedUrl;
+    } else {
+      delete middlewareHeaders["x-nextjs-rewrite"];
+    }
+  };
+  refreshDataRewriteHeader();
 
   // Step 13: Render + fallback rewrites
   if (typeof deps.renderPage === "function") {
     // Reuse the Step 12 match unless afterFiles changed the pathname.
-    const renderPageMatch = resolvedPathnameChanged
-      ? deps.matchPageRoute
-        ? deps.matchPageRoute(resolvedPathname, request)
-        : null
-      : pageMatch;
+    let renderPageMatch = pageMatch;
+    if ((isDataReq || isDataRequest) && !renderPageMatch && configRewrites.fallback?.length) {
+      for (const rewrite of configRewrites.fallback) {
+        const fallbackRewrite = matchRewrite(
+          matchResolvedPathname(resolvedPathname),
+          [rewrite],
+          rewriteRequestContext(),
+          basePathState,
+        );
+        if (!fallbackRewrite) continue;
+        if (isExternalUrl(fallbackRewrite)) {
+          return {
+            type: "response",
+            response: await proxyExternal(request, fallbackRewrite),
+          };
+        }
+        resolvedUrl = mergeRewriteQuery(resolvedUrl, fallbackRewrite);
+        resolvedPathname = pathnameForResolvedUrl(resolvedUrl);
+        renderPageMatch = deps.matchPageRoute
+          ? deps.matchPageRoute(resolvedPathname, request)
+          : null;
+        refreshDataRewriteHeader();
+        if (renderPageMatch) break;
+      }
+    }
     // A data request must not defer-render the error page or run fallback rewrites.
     // Node/dev signal this via `isDataReq` (set when a `/_next/data/` path is
     // normalized); the worker never normalizes those paths (no buildId at request
@@ -493,13 +578,14 @@ export async function runPagesRequest(
     // Fallback rewrites if 404 + deferred
     let matchedFallbackRewrite = false;
     if (response.status === 404 && shouldDeferErrorPageOnMiss && configRewrites.fallback?.length) {
-      const fallbackRewrite = matchRewrite(
-        matchResolvedPathname(resolvedPathname),
-        configRewrites.fallback,
-        postMwReqCtx,
-        basePathState,
-      );
-      if (fallbackRewrite) {
+      for (const rewrite of configRewrites.fallback) {
+        const fallbackRewrite = matchRewrite(
+          matchResolvedPathname(resolvedPathname),
+          [rewrite],
+          rewriteRequestContext(),
+          basePathState,
+        );
+        if (!fallbackRewrite) continue;
         if (isExternalUrl(fallbackRewrite)) {
           // Bare proxy — no middleware-header merge (see Step 8 asymmetry note).
           return {
@@ -507,13 +593,11 @@ export async function runPagesRequest(
             response: await proxyExternal(request, fallbackRewrite),
           };
         }
-        response = await deps.renderPage(
-          request,
-          mergeRewriteQuery(resolvedUrl, fallbackRewrite),
-          undefined,
-          stagedHeaders,
-        );
+        resolvedUrl = mergeRewriteQuery(resolvedUrl, fallbackRewrite);
+        resolvedPathname = pathnameForResolvedUrl(resolvedUrl);
+        response = await deps.renderPage(request, resolvedUrl, undefined, stagedHeaders);
         matchedFallbackRewrite = true;
+        if (response.status !== 404) break;
       }
     }
 
@@ -545,20 +629,24 @@ export async function runPagesRequest(
       : null
     : pageMatch;
   if (!devPageMatch && configRewrites.fallback?.length) {
-    const fallbackRewrite = matchRewrite(
-      matchResolvedPathname(resolvedPathname),
-      configRewrites.fallback,
-      postMwReqCtx,
-      basePathState,
-    );
-    if (fallbackRewrite) {
+    for (const rewrite of configRewrites.fallback) {
+      const fallbackRewrite = matchRewrite(
+        matchResolvedPathname(resolvedPathname),
+        [rewrite],
+        rewriteRequestContext(),
+        basePathState,
+      );
+      if (!fallbackRewrite) continue;
       if (isExternalUrl(fallbackRewrite)) {
         // Bare proxy — no middleware-header merge (see Step 8 asymmetry note).
         return { type: "response", response: await proxyExternal(request, fallbackRewrite) };
       }
       resolvedUrl = mergeRewriteQuery(resolvedUrl, fallbackRewrite);
+      resolvedPathname = pathnameForResolvedUrl(resolvedUrl);
+      if (deps.matchPageRoute?.(resolvedPathname, request)) break;
     }
   }
+  refreshDataRewriteHeader();
 
   return {
     type: "render",

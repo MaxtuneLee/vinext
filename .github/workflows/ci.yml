@@ -302,6 +302,10 @@ jobs:
             label: pages-router-prod
             shardIndex: 1
             shardTotal: 1
+          - project: pages-scroll-restoration
+            label: pages-scroll-restoration
+            shardIndex: 1
+            shardTotal: 1
           - project: cloudflare-workers
             label: cloudflare-workers
             shardIndex: 1
@@ -324,6 +328,18 @@ jobs:
             shardTotal: 1
           - project: standalone-output
             label: standalone-output
+            shardIndex: 1
+            shardTotal: 1
+          - project: root-layout-redirect
+            label: root-layout-redirect
+            shardIndex: 1
+            shardTotal: 1
+          - project: ppr-impact-demo
+            label: ppr-impact-demo
+            shardIndex: 1
+            shardTotal: 1
+          - project: app-front-redirect-issue
+            label: app-front-redirect-issue
             shardIndex: 1
             shardTotal: 1
     steps:

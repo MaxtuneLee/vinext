@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from "vite-plus/test";
 import {
   runPagesRequest,
+  wrapMiddlewareWithBasePath,
   type PagesPipelineDeps,
   type MiddlewareResult,
   type PagesRenderOptions,
@@ -163,6 +164,65 @@ describe("middleware", () => {
     );
   });
 
+  it("exposes the middleware rewrite target on Pages data responses", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/to-blog/post"),
+      baseDeps({
+        isDataRequest: true,
+        runMiddleware: makeMiddleware({
+          continue: true,
+          rewriteUrl: "/fallback-true-blog/post",
+        }),
+        renderPage: makeRenderPage(200, '{"pageProps":{"slug":"post"}}'),
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/fallback-true-blog/post");
+  });
+
+  it("does not expose the middleware rewrite target on HTML responses", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/to-blog/post"),
+      baseDeps({
+        runMiddleware: makeMiddleware({
+          continue: true,
+          rewriteUrl: "/fallback-true-blog/post",
+        }),
+        renderPage: makeRenderPage(200),
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBeNull();
+  });
+
+  it("exposes the final config rewrite URL with appended source params", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/config-rewrite-to-dynamic-static/post-2"),
+      baseDeps({
+        isDataRequest: true,
+        configRewrites: {
+          beforeFiles: [
+            {
+              source: "/config-rewrite-to-dynamic-static/:rewriteSlug",
+              destination: "/ssg",
+            },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+        renderPage: makeRenderPage(200),
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/ssg?rewriteSlug=post-2");
+  });
+
   // 6. Middleware response short-circuit → {type:"response"} with middleware response
   it("middleware response short-circuit returns the middleware response", async () => {
     const middlewareResponse = new Response("blocked", { status: 403 });
@@ -315,6 +375,86 @@ describe("beforeFiles rewrites", () => {
       undefined,
       expect.any(Headers),
     );
+  });
+
+  it("applies chained beforeFiles rewrites with accumulated query conditions", async () => {
+    const renderPage = makeRenderPage(200);
+    const result = await runPagesRequest(
+      makeRequest("/from?keep=1"),
+      baseDeps({
+        configRewrites: {
+          beforeFiles: [
+            { source: "/from", destination: "/middle?stage=1" },
+            {
+              source: "/middle",
+              destination: "/to",
+              has: [{ type: "query", key: "stage", value: "1" }],
+            },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/to?keep=1&stage=1",
+      undefined,
+      expect.any(Headers),
+    );
+  });
+
+  it("applies every matching beforeFiles rewrite in sequence", async () => {
+    const renderPage = makeRenderPage(200);
+    const result = await runPagesRequest(
+      makeRequest("/start"),
+      baseDeps({
+        isDataRequest: true,
+        configRewrites: {
+          beforeFiles: [
+            { source: "/start", destination: "/middle?first=1" },
+            { source: "/middle", destination: "/destination?second=2" },
+          ],
+          afterFiles: [],
+          fallback: [],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/destination?first=1&second=2",
+      undefined,
+      expect.any(Headers),
+    );
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/destination?first=1&second=2");
+  });
+
+  it("excludes beforeFiles fragments from Pages route matching", async () => {
+    const matchPageRoute = vi.fn((pathname: string) =>
+      pathname === "/to" ? { route: { isDynamic: false } } : null,
+    );
+    await runPagesRequest(
+      makeRequest("/from"),
+      baseDeps({
+        configRewrites: {
+          beforeFiles: [{ source: "/from", destination: "/to#section" }],
+          afterFiles: [],
+          fallback: [],
+        },
+        matchPageRoute,
+        renderPage: makeRenderPage(200),
+      }),
+    );
+
+    expect(matchPageRoute).toHaveBeenCalledWith("/to", expect.any(Request));
+    expect(matchPageRoute).not.toHaveBeenCalledWith("/to#section", expect.any(Request));
   });
 });
 
@@ -496,6 +636,36 @@ describe("afterFiles rewrites", () => {
       expect.any(Headers),
     );
   });
+
+  it("continues afterFiles rewrites until a Pages destination resolves", async () => {
+    const renderPage = makeRenderPage(200);
+    const matchPageRoute = vi.fn((pathname: string) =>
+      pathname === "/resolved" ? { route: { isDynamic: false } } : null,
+    );
+    await runPagesRequest(
+      makeRequest("/from"),
+      baseDeps({
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [
+            { source: "/from", destination: "/missing" },
+            { source: "/missing", destination: "/resolved#section" },
+          ],
+          fallback: [],
+        },
+        matchPageRoute,
+        renderPage,
+      }),
+    );
+
+    expect(matchPageRoute).toHaveBeenCalledWith("/resolved", expect.any(Request));
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/resolved#section",
+      undefined,
+      expect.any(Headers),
+    );
+  });
 });
 
 // 14. Render intent when renderPage absent → {type:"render"}
@@ -516,6 +686,31 @@ describe("render intent", () => {
     if (result.type !== "render") return;
     expect(result.isDataReq).toBe(true);
     expect(result.renderOptions).toEqual({ isDataReq: true });
+  });
+
+  it("stages the final dev fallback rewrite target for data navigation", async () => {
+    const result = await runPagesRequest(
+      makeRequest("/to-blog/post"),
+      baseDeps({
+        isDataReq: true,
+        matchPageRoute: () => null,
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [
+            {
+              source: "/to-blog/:slug",
+              destination: "/fallback-true-blog/:slug",
+            },
+          ],
+        },
+      }),
+    );
+
+    expect(result.type).toBe("render");
+    if (result.type !== "render") return;
+    expect(result.resolvedUrl).toBe("/fallback-true-blog/post");
+    expect(result.stagedHeaders["x-nextjs-rewrite"]).toBe("/fallback-true-blog/post");
   });
 });
 
@@ -562,6 +757,38 @@ describe("fallback rewrites on 404", () => {
     if (result.type !== "response") return;
     expect(result.response.status).toBe(200);
     expect(callCount).toBe(2);
+  });
+
+  it("continues fallback rewrites after an unresolved destination", async () => {
+    const renderPage = vi.fn(
+      async (_req: Request, resolvedUrl: string) =>
+        new Response(resolvedUrl, { status: resolvedUrl.startsWith("/resolved") ? 200 : 404 }),
+    );
+    const result = await runPagesRequest(
+      makeRequest("/from"),
+      baseDeps({
+        matchPageRoute: vi.fn().mockReturnValue(null),
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [
+            { source: "/from", destination: "/missing" },
+            { source: "/missing", destination: "/resolved#section" },
+          ],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(result.response.status).toBe(200);
+    expect(renderPage).toHaveBeenLastCalledWith(
+      expect.any(Request),
+      "/resolved#section",
+      undefined,
+      expect.any(Headers),
+    );
   });
 });
 
@@ -617,6 +844,40 @@ describe("deferred error page re-render on 404", () => {
     expect(renderPage).toHaveBeenCalledTimes(1);
     expect(renderPage.mock.calls[0][2]).toBeUndefined();
   });
+
+  it("resolves fallback rewrites before rendering a production data request", async () => {
+    const renderPage = vi.fn(
+      async (_request: Request, url: string) => new Response(`data ${url}`, { status: 200 }),
+    );
+    const matchPageRoute = vi.fn((pathname: string) =>
+      pathname === "/fallback-target" ? ({ route: { isDynamic: false } } as any) : null,
+    );
+
+    const result = await runPagesRequest(
+      makeRequest("/missing-page"),
+      baseDeps({
+        isDataRequest: true,
+        matchPageRoute,
+        configRewrites: {
+          beforeFiles: [],
+          afterFiles: [],
+          fallback: [{ source: "/missing-page", destination: "/fallback-target?from=fallback" }],
+        },
+        renderPage,
+      }),
+    );
+
+    expect(result.type).toBe("response");
+    if (result.type !== "response") return;
+    expect(renderPage).toHaveBeenCalledOnce();
+    expect(renderPage).toHaveBeenCalledWith(
+      expect.any(Request),
+      "/fallback-target?from=fallback",
+      undefined,
+      expect.any(Headers),
+    );
+    expect(result.response.headers.get("x-nextjs-rewrite")).toBe("/fallback-target?from=fallback");
+  });
 });
 
 // 19. preserveCredentialHeaders: isExternalUrl(resolvedUrl) → passed to applyMiddlewareRequestHeaders
@@ -643,5 +904,47 @@ describe("preserveCredentialHeaders", () => {
     // Verify fetch was called (external proxy triggered)
     expect(mockFetch).toHaveBeenCalled();
     mockFetch.mockRestore();
+  });
+});
+
+// 20. wrapMiddlewareWithBasePath: shared adapter helper that re-adds the basePath
+// to the middleware request URL. Used by prod-server.ts and the generated worker
+// entry (deploy.ts) so middleware sees the original (pre-stripping) URL.
+describe("wrapMiddlewareWithBasePath", () => {
+  it("passes through unchanged when hadBasePath is false (out-of-basePath request)", async () => {
+    const runMiddleware = makeMiddleware({ continue: true });
+    const wrapped = wrapMiddlewareWithBasePath(runMiddleware, "/root", false);
+    // Out-of-basePath requests stay bare so middleware sees nextUrl.basePath === "" (#1830).
+    expect(wrapped).toBe(runMiddleware);
+    await wrapped(makeRequest("/dashboard"), null, { isDataRequest: false });
+    expect(runMiddleware.mock.calls[0][0].url).toBe("http://localhost/dashboard");
+  });
+
+  it("passes through unchanged when basePath is empty", () => {
+    const runMiddleware = makeMiddleware({ continue: true });
+    expect(wrapMiddlewareWithBasePath(runMiddleware, "", true)).toBe(runMiddleware);
+  });
+
+  it("re-adds the basePath to the request URL when hadBasePath is true", async () => {
+    const runMiddleware = makeMiddleware({ continue: true });
+    const wrapped = wrapMiddlewareWithBasePath(runMiddleware, "/root", true);
+    expect(wrapped).not.toBe(runMiddleware);
+    const result = await wrapped(makeRequest("/dashboard?q=1", { "x-test": "kept" }), "ctx", {
+      isDataRequest: true,
+    });
+    expect(result.continue).toBe(true);
+    const [mwReq, ctx, opts] = runMiddleware.mock.calls[0];
+    expect(mwReq.url).toBe("http://localhost/root/dashboard?q=1");
+    // Headers, ctx, and opts are forwarded untouched.
+    expect(mwReq.headers.get("x-test")).toBe("kept");
+    expect(ctx).toBe("ctx");
+    expect(opts).toEqual({ isDataRequest: true });
+  });
+
+  it("does not double-add an already-present basePath (addBasePathToPathname is idempotent)", async () => {
+    const runMiddleware = makeMiddleware({ continue: true });
+    const wrapped = wrapMiddlewareWithBasePath(runMiddleware, "/root", true);
+    await wrapped(makeRequest("/root/dashboard"), null, { isDataRequest: false });
+    expect(runMiddleware.mock.calls[0][0].url).toBe("http://localhost/root/dashboard");
   });
 });

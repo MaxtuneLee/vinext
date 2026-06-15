@@ -27,13 +27,16 @@ import { createCacheEntryReuseProof, type CacheEntryReuseProof } from "./cache-p
 import {
   navigationPlanner,
   resolveDefaultOrUnmatchedSlotPersistenceForLayouts,
-  type MountedParallelSlotSnapshotV0,
-  type NavigationDecisionV0,
+  type MountedParallelSlotSnapshot,
+  type NavigationDecision,
   type OperationLane,
   type OperationToken,
-  type RouteSnapshotV0,
+  type RouteSnapshot,
 } from "./navigation-planner.js";
-import type { ClientNavigationRenderSnapshot } from "vinext/shims/navigation";
+import {
+  createSnapshotPathAndSearch,
+  type ClientNavigationRenderSnapshot,
+} from "vinext/shims/navigation";
 import {
   countConsumedPathnameSegments,
   isInvisibleSegment,
@@ -564,15 +567,10 @@ function createPendingNavigationTraceFields(options: {
   };
 }
 
-function createNavigationSnapshotUrl(snapshot: ClientNavigationRenderSnapshot): string {
-  const query = snapshot.searchParams.toString();
-  return query === "" ? snapshot.pathname : `${snapshot.pathname}?${query}`;
-}
-
 function createMountedParallelSlotSnapshots(
   elements: AppElements,
-): readonly MountedParallelSlotSnapshotV0[] {
-  const snapshots: MountedParallelSlotSnapshotV0[] = [];
+): readonly MountedParallelSlotSnapshot[] {
+  const snapshots: MountedParallelSlotSnapshot[] = [];
   for (const slotId of getMountedSlotIds(elements)) {
     const parsed = AppElementsWire.parseElementKey(slotId);
     if (parsed?.kind !== "slot") continue;
@@ -584,8 +582,8 @@ function createMountedParallelSlotSnapshots(
   return snapshots;
 }
 
-function createVisibleRouteSnapshot(state: AppRouterState): RouteSnapshotV0 {
-  const displayUrl = createNavigationSnapshotUrl(state.navigationSnapshot);
+function createVisibleRouteSnapshot(state: AppRouterState): RouteSnapshot {
+  const displayUrl = createSnapshotPathAndSearch(state.navigationSnapshot);
   const matchedUrl = normalizeNavigationSnapshotMatchedUrl(state.navigationSnapshot.pathname);
   return {
     displayUrl,
@@ -607,8 +605,8 @@ function createVisibleRouteSnapshot(state: AppRouterState): RouteSnapshotV0 {
   };
 }
 
-function createPendingRouteSnapshot(pending: PendingNavigationCommit): RouteSnapshotV0 {
-  const displayUrl = createNavigationSnapshotUrl(pending.action.navigationSnapshot);
+function createPendingRouteSnapshot(pending: PendingNavigationCommit): RouteSnapshot {
+  const displayUrl = createSnapshotPathAndSearch(pending.action.navigationSnapshot);
   const matchedUrl = normalizeNavigationSnapshotMatchedUrl(
     pending.action.navigationSnapshot.pathname,
   );
@@ -633,7 +631,7 @@ function createPendingRouteSnapshot(pending: PendingNavigationCommit): RouteSnap
 function createPendingNavigationOperationToken(options: {
   pending: PendingNavigationCommit;
   routeManifest: RouteManifest | null;
-  targetSnapshot: RouteSnapshotV0;
+  targetSnapshot: RouteSnapshot;
 }): OperationToken {
   return {
     baseVisibleCommitVersion: options.pending.action.operation.startedVisibleCommitVersion,
@@ -645,7 +643,7 @@ function createPendingNavigationOperationToken(options: {
   };
 }
 
-function createRootBoundarySnapshotFingerprint(snapshot: RouteSnapshotV0): string {
+function createRootBoundarySnapshotFingerprint(snapshot: RouteSnapshot): string {
   return `${snapshot.routeId}|root:${snapshot.rootBoundaryId ?? "unknown"}`;
 }
 
@@ -655,7 +653,7 @@ function planPendingRootBoundaryFlightResponse(options: {
   routeManifest: RouteManifest | null;
   targetHref?: string;
   traceFields: NavigationTraceFields;
-}): NavigationDecisionV0 {
+}): NavigationDecision {
   const targetSnapshot = createPendingRouteSnapshot(options.pending);
   const token = createPendingNavigationOperationToken({
     pending: options.pending,
@@ -693,7 +691,7 @@ function planPendingRootBoundaryFlightResponse(options: {
 }
 
 function mapNavigationDecisionToPendingDisposition(
-  decision: NavigationDecisionV0,
+  decision: NavigationDecision,
 ): PendingNavigationCommitDispositionDecision {
   switch (decision.kind) {
     case "proposeCommit":
