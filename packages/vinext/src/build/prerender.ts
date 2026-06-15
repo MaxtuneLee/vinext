@@ -1169,6 +1169,13 @@ export async function prerenderApp({
               );
             }
             const urlPath = buildUrlFromParams(route.pattern, params);
+            // Dedup concrete URLs from duplicate (or differently-typed but
+            // equal) generateStaticParams entries. Mirrors Next.js, which
+            // dedups param combinations before rendering and again by resolved
+            // pathname (see https://github.com/vercel/next.js/blob/canary/packages/next/src/build/static-paths/app.ts filterUniqueParams + prerenderedRoutesByPathname).
+            // Without this, e.g. [{slug:'a'},{slug:'a'}] renders twice and
+            // writes a duplicate vinext-prerender.json entry.
+            if (queuedRouteUrls.has(urlPath)) continue;
             queuedRouteUrls.add(urlPath);
             urlsToRender.push({
               urlPath,
