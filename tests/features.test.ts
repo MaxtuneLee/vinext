@@ -677,7 +677,7 @@ describe("ISR (Pages Router)", () => {
     // __NEXT_DATA__ must also contain the fresh timestamp, proving both the
     // server-rendered HTML and the hydration data are in sync.
     const nextDataMatch = hitHtml.match(
-      /window\.__NEXT_DATA__\s*=\s*(\{[\s\S]*?\})(?:;|<\/script>)/,
+      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/,
     );
     expect(nextDataMatch).toBeTruthy();
     const nextData = JSON.parse(nextDataMatch![1]);
@@ -1213,7 +1213,9 @@ export default function About({ locale, locales, defaultLocale }) {
     const res = await fetch(`${i18nBaseUrl}/fr/about`);
     const html = await res.text();
     // Extract the JSON object from __NEXT_DATA__ (handles nested braces)
-    const dataMatch = html.match(/__NEXT_DATA__\s*=\s*(\{[^<]+\})/);
+    const dataMatch = html.match(
+      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/,
+    );
     expect(dataMatch).not.toBeNull();
     const data = JSON.parse(dataMatch![1]);
     expect(data.locale).toBe("fr");
@@ -1224,7 +1226,9 @@ export default function About({ locale, locales, defaultLocale }) {
   it("includes locale info in __NEXT_DATA__ for default locale", async () => {
     const res = await fetch(`${i18nBaseUrl}/about`);
     const html = await res.text();
-    const dataMatch = html.match(/__NEXT_DATA__\s*=\s*(\{[^<]+\})/);
+    const dataMatch = html.match(
+      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/,
+    );
     expect(dataMatch).not.toBeNull();
     const data = JSON.parse(dataMatch![1]);
     expect(data.locale).toBe("en");
@@ -1762,6 +1766,12 @@ describe("build-time defines (Pages Router)", () => {
     // code never trips. See issue #1405.
     const defineKey = "process.env.__NEXT_APP_SHELLS";
     expect(server.config.define?.[defineKey]).toBe(JSON.stringify(false));
+  });
+
+  it("App navigation failure handling defaults to false", () => {
+    expect(server.config.define?.["process.env.__NEXT_APP_NAV_FAIL_HANDLING"]).toBe(
+      JSON.stringify(false),
+    );
   });
 });
 
@@ -3031,6 +3041,237 @@ describe("MetadataHead rendering", () => {
     expect(html).toContain('content="val1"');
     expect(html).toContain('content="val2"');
   });
+
+  // trailingSlash canonical URL tests
+  // Ported from Next.js app-dir trailing-slash e2e: "should contain trailing slash to canonical url"
+  // see https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/trailingslash/trailingslash.test.ts#L31
+
+  it("trailingSlash:true appends slash to root canonical '/'", () => {
+    // metadataBase='http://trailingslash.com', canonical='/', pathname='/'
+    // → href='http://trailingslash.com/'
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/" },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/"');
+  });
+
+  it("trailingSlash:true appends slash to relative canonical './' at pathname '/a'", () => {
+    // metadataBase='http://trailingslash.com', canonical='./', pathname='/a'
+    // → href='http://trailingslash.com/a/'
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "./" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("trailingSlash:true does not append slash before query string", () => {
+    // canonical='/q?x=1' → href='http://trailingslash.com/q?x=1' (no slash before '?')
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/q?x=1" },
+      },
+      "/q",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/q?x=1"');
+    expect(html).not.toContain('href="http://trailingslash.com/q/?x=1"');
+  });
+
+  it("trailingSlash:true leaves external canonical unchanged", () => {
+    // canonical='http://other.com/a' → href='http://other.com/a' (external host)
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "http://other.com/a" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://other.com/a"');
+    expect(html).not.toContain('href="http://other.com/a/"');
+  });
+
+  it("trailingSlash:false preserves a user-provided trailing slash on canonical", () => {
+    // Match Next.js: trailingSlash:false (the default) does NOT strip a
+    // user-provided slash; canonical='/a/' renders verbatim.
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/a/" },
+      },
+      "/a",
+      { trailingSlash: false },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("trailingSlash:true is idempotent when canonical already ends with slash", () => {
+    // canonical='http://trailingslash.com/a/' → href='http://trailingslash.com/a/' (unchanged)
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "http://trailingslash.com/a/" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("trailingSlash:true appends slash to same-origin absolute canonical urls", () => {
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "http://trailingslash.com/a" },
+      },
+      "/a",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("trailingSlash:true does not append slash to file-like canonical urls", () => {
+    // canonical='/sitemap.xml' → href='http://trailingslash.com/sitemap.xml'
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/sitemap.xml" },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/sitemap.xml"');
+    expect(html).not.toContain("sitemap.xml/");
+  });
+
+  it("trailingSlash:true appends slash to .well-known canonical urls", () => {
+    // Ported from Next.js: packages/next/src/lib/metadata/resolvers/resolve-url.test.ts
+    // https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/metadata/resolvers/resolve-url.test.ts
+    // .well-known is excluded from the file regex, so it is treated as a normal path.
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/.well-known/apple-app-site-association" },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain(
+      'href="http://trailingslash.com/.well-known/apple-app-site-association/"',
+    );
+    expect(html).not.toContain('"http://trailingslash.com/.well-known/apple-app-site-association"');
+  });
+
+  it("trailingSlash:true appends slash to openGraph.url and alternate urls", () => {
+    // Ported from the resolver call sites in Next.js:
+    // packages/next/src/lib/metadata/resolvers/resolve-opengraph.ts and resolve-basics.ts
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        openGraph: { url: "/og" },
+        alternates: {
+          languages: { en: "/en" },
+          media: { print: "/print" },
+          types: { "application/rss+xml": "/feed" },
+        },
+      },
+      "/",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('property="og:url" content="http://trailingslash.com/og/"');
+    expect(html).toContain('href="http://trailingslash.com/en/" hreflang="en"');
+    expect(html).toContain('href="http://trailingslash.com/print/" media="print"');
+    expect(html).toContain('href="http://trailingslash.com/feed/" type="application/rss+xml"');
+  });
+
+  it("resolves URL-object alternates as bases for the current pathname", () => {
+    // Ported from Next.js: packages/next/src/lib/metadata/resolvers/resolve-basics.ts
+    // URL-object alternates are bases for pathname resolution and retain their query params.
+    const html = renderMetadataToHtml(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: {
+          languages: { en: new URL("http://trailingslash.com/base") },
+          media: { print: new URL("http://trailingslash.com/base?source=print") },
+        },
+      },
+      "/docs",
+      { trailingSlash: true },
+    );
+    expect(html).toContain('href="http://trailingslash.com/docs/" hreflang="en"');
+    expect(html).toContain('href="http://trailingslash.com/docs?source=print" media="print"');
+  });
+});
+
+describe("createAppPageRouteBodyMetadata (body-placement canonical)", () => {
+  let createAppPageRouteBodyMetadata: typeof import("../packages/vinext/src/server/app-page-route-wiring.js").createAppPageRouteBodyMetadata;
+  let _React: typeof import("react");
+  let renderToStaticMarkup: typeof import("react-dom/server").renderToStaticMarkup;
+
+  beforeAll(async () => {
+    ({ createAppPageRouteBodyMetadata } =
+      await import("../packages/vinext/src/server/app-page-route-wiring.js"));
+    _React = await import("react");
+    ({ renderToStaticMarkup } = await import("react-dom/server"));
+  });
+
+  it("body placement: applies trailingSlash to canonical href in the streamed body branch", () => {
+    const node = createAppPageRouteBodyMetadata(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/a" },
+      },
+      "/a",
+      "body",
+      true, // trailingSlash
+    );
+    const html = renderToStaticMarkup(node as React.ReactElement);
+    // Body branch wraps the metadata HTML in a hidden div (htmlLimitedBots
+    // / streamed-body path used when metadata can't be flushed into <head>
+    // before the first shell chunk).
+    expect(html).toContain("<div hidden");
+    expect(html).toContain('href="http://trailingslash.com/a/"');
+  });
+
+  it("body placement: no slash inserted before query string", () => {
+    const node = createAppPageRouteBodyMetadata(
+      {
+        metadataBase: new URL("http://trailingslash.com"),
+        alternates: { canonical: "/q?x=1" },
+      },
+      "/q",
+      "body",
+      true,
+    );
+    const html = renderToStaticMarkup(node as React.ReactElement);
+    expect(html).toContain('href="http://trailingslash.com/q?x=1"');
+    expect(html).not.toContain("/q/?");
+  });
+
+  it("body placement: returns null when placement is 'head' (no double-render)", () => {
+    const node = createAppPageRouteBodyMetadata(
+      { metadataBase: new URL("http://trailingslash.com"), alternates: { canonical: "/a" } },
+      "/a",
+      "head",
+      true,
+    );
+    expect(node).toBeNull();
+  });
+
+  it("body placement: returns null when metadata is null", () => {
+    expect(createAppPageRouteBodyMetadata(null, "/a", "body", true)).toBeNull();
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -3366,7 +3607,7 @@ describe("fetch cache (extended fetch with next options)", () => {
     }
   });
 
-  it("next.revalidate: false bypasses persistent cache but dedupes within a render", async () => {
+  it("next.revalidate: false caches indefinitely across render scopes", async () => {
     const { withFetchCache } = await import("../packages/vinext/src/shims/fetch-cache.js");
     const { setCacheHandler, MemoryCacheHandler } =
       await import("../packages/vinext/src/shims/cache.js");
@@ -3383,7 +3624,7 @@ describe("fetch cache (extended fetch with next options)", () => {
       cleanup();
       cleanup = withFetchCache();
       await fetch(`${mockServerUrl}/no-rev`, { next: { revalidate: false } });
-      expect(fetchCallCount).toBe(2);
+      expect(fetchCallCount).toBe(1); // Still cached across render scopes
     } finally {
       cleanup();
       setCacheHandler(new MemoryCacheHandler());
@@ -4481,7 +4722,9 @@ describe("Next.js edge cases", () => {
     expect(html).toMatch(/Article ID:.*1/);
     // Query params should NOT affect the rendered page content (they may appear in Vite module URLs)
     // Check the __NEXT_DATA__ doesn't leak query params into getStaticProps
-    const dataMatch = html.match(/__NEXT_DATA__\s*=\s*(\{[^<]+\})/);
+    const dataMatch = html.match(
+      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/,
+    );
     expect(dataMatch).not.toBeNull();
     const data = JSON.parse(dataMatch![1]);
     expect(data.props.pageProps.id).toBe("1");
@@ -4494,7 +4737,9 @@ describe("Next.js edge cases", () => {
   it("__NEXT_DATA__ query contains dynamic params for static pages", async () => {
     const res = await fetch(`${edgeBaseUrl}/articles/2?extra=value`);
     const html = await res.text();
-    const dataMatch = html.match(/__NEXT_DATA__\s*=\s*(\{[^<]+\})/);
+    const dataMatch = html.match(
+      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/,
+    );
     expect(dataMatch).not.toBeNull();
     const data = JSON.parse(dataMatch![1]);
     // query should contain the dynamic segment
@@ -5511,7 +5756,9 @@ export default function NestedProps({ user }) {
     const res = await fetch(`${edgeBaseUrl}/nested-props`);
     const html = await res.text();
     // __NEXT_DATA__ is injected as: <script>window.__NEXT_DATA__ = {...}</script>
-    const match = html.match(/window\.__NEXT_DATA__\s*=\s*(\{[\s\S]*?\})(?:;|<)/);
+    const match = html.match(
+      /<script id="__NEXT_DATA__" type="application\/json">([\s\S]*?)<\/script>/,
+    );
     expect(match).not.toBeNull();
     const data = JSON.parse(match![1]);
     expect(data.props.pageProps.user.name).toBe("Alice");

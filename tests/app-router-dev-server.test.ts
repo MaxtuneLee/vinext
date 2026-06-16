@@ -497,6 +497,20 @@ describe("App Router integration", () => {
     expect(html).toContain('data-testid="slot-collision-page"');
   });
 
+  // Ported from Next.js: test/e2e/app-dir/parallel-routes-group-depth/parallel-routes-group-depth.test.ts
+  // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/parallel-routes-group-depth/parallel-routes-group-depth.test.ts
+  it("renders a sibling parallel slot when children are inside a route group", async () => {
+    const res = await fetch(`${baseUrl}/parallel-route-group-depth`);
+    expect(res.status).toBe(200);
+
+    const html = await res.text();
+    expect(html).toContain('data-testid="parallel-route-group-depth-layout"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-slot-layout"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-slot-page"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-children-layout"');
+    expect(html).toContain('data-testid="parallel-route-group-depth-children-page"');
+  });
+
   it("parallel slots do not affect URL routing", async () => {
     // @team and @analytics should NOT be accessible as direct routes
     const teamRes = await fetch(`${baseUrl}/dashboard/team`);
@@ -1151,7 +1165,7 @@ describe("App Router integration", () => {
   // instead of silently returning a fallback value.
   it("errors when client hook is used in a Server Component without 'use client' (#834)", async () => {
     const { res, html } = await fetchHtml(baseUrl, "/missing-use-client-test");
-    expect(res.status).toBe(200); // error boundary renders, not a 500
+    expect(res.status).toBe(500);
     // The error message should be clear and actionable
     expect(html).toContain("usePathname()");
     expect(html).toContain("Client Components");
@@ -1162,7 +1176,7 @@ describe("App Router integration", () => {
 
   it("errors when React client hook is used in a Server Component without 'use client' (#834)", async () => {
     const { res, html } = await fetchHtml(baseUrl, "/missing-use-client-react-hook");
-    expect(res.status).toBe(200); // error boundary renders, not a 500
+    expect(res.status).toBe(500);
     // The error message should be clear and actionable
     expect(html).toContain("useState()");
     expect(html).toContain("Client Components");
@@ -1852,7 +1866,7 @@ describe("App Router integration", () => {
 
   it("applies dynamic = 'error' as only-cache fetch policy", async () => {
     const res = await fetch(`${baseUrl}/layout-segment-config/dynamic-error-fetch`);
-    expect(res.status).toBe(200);
+    expect(res.status).toBe(500);
     expect(await res.text()).toContain("only-cache");
   });
 
@@ -2071,7 +2085,7 @@ describe("App Router integration", () => {
     expect(await res.text()).toBe("Server action not found.");
   });
 
-  it("rejects cyclic multipart server action payloads before decodeReply", async () => {
+  it("returns action-not-found before reading cyclic multipart payloads for stale ids", async () => {
     const body = new FormData();
     body.set("0", '["$Q0"]');
 
@@ -2086,8 +2100,9 @@ describe("App Router integration", () => {
       signal: AbortSignal.timeout(5_000),
     });
 
-    expect(res.status).toBe(400);
-    expect(await res.text()).toBe("Invalid server action payload");
+    expect(res.status).toBe(404);
+    expect(res.headers.get("x-nextjs-action-not-found")).toBe("1");
+    expect(await res.text()).toBe("Server action not found.");
   });
 
   it("blocks server action POST with Origin 'null' (CSRF via sandboxed context)", async () => {

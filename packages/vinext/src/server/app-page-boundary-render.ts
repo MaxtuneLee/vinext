@@ -23,7 +23,8 @@ import {
   type AppPageSsrHandler,
 } from "./app-page-stream.js";
 import { AppElementsWire, type AppElements } from "./app-elements.js";
-import { createAppPageLayoutEntries } from "./app-page-route-wiring.js";
+import { createAppPageLayoutEntries, createAppPageSourcePage } from "./app-page-route-wiring.js";
+import { NEVER_CACHE_CONTROL } from "./cache-control.js";
 
 // oxlint-disable-next-line @typescript-eslint/no-explicit-any
 type AppPageComponent = ComponentType<any>;
@@ -48,6 +49,7 @@ type AppPageBoundaryRscPayloadOptions<TModule extends AppPageModule = AppPageMod
   layoutModules: readonly (TModule | null | undefined)[];
   pathname: string;
   route?: AppPageBoundaryRoute<TModule> | null;
+  sourcePageSegments?: readonly string[] | null;
 };
 
 type AppPageBoundaryLayoutEntry = {
@@ -86,6 +88,8 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   metadataRoutes: MetadataFileRoute[];
   /** Configured next.config `basePath`, threaded into file-based metadata href emission. */
   basePath?: string;
+  /** Configured next.config `trailingSlash`, threaded into canonical URL rendering. */
+  trailingSlash?: boolean;
   renderToReadableStream: (
     element: ReactNode | AppElements,
     options: { onError: AppPageBoundaryOnError },
@@ -98,6 +102,7 @@ type AppPageBoundaryRenderCommonOptions<TModule extends AppPageModule = AppPageM
   ) => string[];
   rootLayouts: readonly (TModule | null | undefined)[];
   scriptNonce?: string;
+  sourcePageSegments?: readonly string[] | null;
 };
 
 type RenderAppPageHttpAccessFallbackOptions<TModule extends AppPageModule = AppPageModule> = {
@@ -246,6 +251,7 @@ function createAppPageBoundaryRscPayload<TModule extends AppPageModule>(
 ): AppElements {
   const routeId = AppElementsWire.encodeRouteId(options.pathname, null);
   const layoutEntries = createAppPageBoundaryLayoutEntries(options.route, options.layoutModules);
+  const sourcePageSegments = options.sourcePageSegments ?? options.route?.routeSegments;
 
   return {
     ...AppElementsWire.createMetadataEntries({
@@ -253,6 +259,7 @@ function createAppPageBoundaryRscPayload<TModule extends AppPageModule>(
       layoutIds: layoutEntries.map((entry) => entry.id),
       rootLayoutTreePath: layoutEntries[0]?.treePath ?? null,
       routeId,
+      sourcePage: sourcePageSegments ? createAppPageSourcePage(sourcePageSegments) : null,
     }),
     [routeId]: options.element,
   };
@@ -276,6 +283,7 @@ async function renderAppPageBoundaryElementResponse<TModule extends AppPageModul
     layoutModules: options.layoutModules,
     pathname,
     route: options.route,
+    sourcePageSegments: options.sourcePageSegments,
   });
 
   return renderAppPageBoundaryResponse({
@@ -361,7 +369,14 @@ export async function renderAppPageHttpAccessFallback<TModule extends AppPageMod
     createElement("meta", { key: "robots", name: "robots", content: "noindex" }),
   ];
   if (metadata) {
-    headElements.push(createElement(MetadataHead, { key: "metadata", metadata, pathname }));
+    headElements.push(
+      createElement(MetadataHead, {
+        key: "metadata",
+        metadata,
+        pathname,
+        trailingSlash: options.trailingSlash,
+      }),
+    );
   }
   headElements.push(createElement(ViewportHead, { key: "viewport", viewport }));
 
@@ -430,7 +445,14 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
         routeSegments: options.route?.routeSegments,
       });
       if (metadata) {
-        headElements.push(createElement(MetadataHead, { key: "metadata", metadata, pathname }));
+        headElements.push(
+          createElement(MetadataHead, {
+            key: "metadata",
+            metadata,
+            pathname,
+            trailingSlash: options.trailingSlash,
+          }),
+        );
       }
       headElements.push(createElement(ViewportHead, { key: "viewport", viewport }));
     } catch (error) {
@@ -479,8 +501,8 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
     });
   };
 
-  const renderWith = (BoundaryComponent: AppPageComponent): Promise<Response> =>
-    renderAppPageBoundaryElementResponse({
+  const renderWith = async (BoundaryComponent: AppPageComponent): Promise<Response> => {
+    const response = await renderAppPageBoundaryElementResponse({
       ...options,
       element: buildElement(BoundaryComponent),
       initialDevServerError: rawError,
@@ -488,8 +510,16 @@ export async function renderAppPageErrorBoundary<TModule extends AppPageModule>(
       navigationParams: matchedParams,
       route: options.route,
       routePattern: options.route?.pattern,
-      status: 200,
+      status: errorBoundary.isGlobalError ? 500 : 200,
     });
+    if (errorBoundary.isGlobalError) {
+      response.headers.set("Cache-Control", NEVER_CACHE_CONTROL);
+      response.headers.delete("CDN-Cache-Control");
+      response.headers.delete("Cloudflare-CDN-Cache-Control");
+      response.headers.delete("Cache-Tag");
+    }
+    return response;
+  };
 
   try {
     return await renderWith(errorBoundary.component);

@@ -32,6 +32,11 @@ import {
   filterInternalHeaders,
   isOpenRedirectShaped,
 } from "./request-pipeline.js";
+import { VINEXT_PRERENDER_ROUTE_PARAMS_HEADER } from "./headers.js";
+import {
+  readTrustedPrerenderRouteParams,
+  serializePrerenderRouteParamsHeader,
+} from "./prerender-route-params.js";
 import {
   badRequestResponse,
   notFoundResponse,
@@ -104,7 +109,14 @@ async function handleRequest(
   // middleware sees them. Must happen before the RSC handler runs.
   // Builds a new Headers — Request.headers is immutable in Workers.
   {
+    const prerenderRouteParamsPayload = readTrustedPrerenderRouteParams(request);
     const filteredHeaders = filterInternalHeaders(request.headers);
+    const prerenderRouteParamsHeader = serializePrerenderRouteParamsHeader(
+      prerenderRouteParamsPayload,
+    );
+    if (prerenderRouteParamsHeader !== null) {
+      filteredHeaders.set(VINEXT_PRERENDER_ROUTE_PARAMS_HEADER, prerenderRouteParamsHeader);
+    }
     request = cloneRequestWithHeaders(request, filteredHeaders);
   }
 

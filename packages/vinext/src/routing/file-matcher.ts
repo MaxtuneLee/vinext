@@ -98,7 +98,7 @@ export function findFileWithExts(
   matcher: ValidFileMatcher,
 ): string | null {
   for (const ext of matcher.dottedExtensions) {
-    const filePath = path.join(dir, name + ext);
+    const filePath = path.posix.join(dir, name + ext);
     if (existsSync(filePath)) return filePath;
   }
   return null;
@@ -135,6 +135,28 @@ export function buildViteResolveExtensions(
     if (seen.has(ext)) continue;
     seen.add(ext);
     result.push(ext);
+  }
+  return result;
+}
+
+/**
+ * Normalize an explicit Next.js resolver extension list for Vite.
+ *
+ * Unlike `pageExtensions`, both Turbopack's `resolveExtensions` and webpack's
+ * `resolve.extensions` replace their resolver defaults. The empty string is a
+ * webpack/Turbopack convention for trying the import exactly as written; Vite
+ * already does that before appending extensions, so it must be omitted here.
+ */
+export function normalizeViteResolveExtensions(extensions: readonly string[]): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const extension of extensions) {
+    const trimmed = extension.trim();
+    if (!trimmed) continue;
+    const dotted = trimmed.startsWith(".") ? trimmed : `.${trimmed}`;
+    if (seen.has(dotted)) continue;
+    seen.add(dotted);
+    result.push(dotted);
   }
   return result;
 }
