@@ -135,8 +135,12 @@ describe("negotiateEncoding", () => {
     expect(negotiateEncoding(reqWith("gzip, br;q=0"))).toBe("gzip");
   });
 
-  it("honors wildcard: `*` → picks zstd (highest available preference)", () => {
-    expect(negotiateEncoding(reqWith("*"))).toBe("zstd");
+  it("honors wildcard: `*` → picks highest available preference", () => {
+    expect(negotiateEncoding(reqWith("*"))).toBe(HAS_ZSTD ? "zstd" : "br");
+  });
+
+  it("explicit refusal overrides wildcard: `*, br;q=0` → falls back to next preference", () => {
+    expect(negotiateEncoding(reqWith("*, br;q=0"))).toBe(HAS_ZSTD ? "zstd" : "gzip");
   });
 
   it("explicit refusal overrides wildcard: `*, br;q=0` → falls back to zstd", () => {
