@@ -241,8 +241,9 @@ function parseAcceptedEncodings(accept: string): ParsedAcceptEncoding {
  * 4. Otherwise the token is not accepted.
  */
 function isEncodingAccepted(parsed: ParsedAcceptEncoding, encoding: string): boolean {
-  if (parsed.accepted.has(encoding)) return true; // explicit q>0
-  if (parsed.refused.has(encoding)) return false; // explicit q=0 beats wildcard
+  const enc = encoding.toLowerCase();
+  if (parsed.accepted.has(enc)) return true; // explicit q>0
+  if (parsed.refused.has(enc)) return false; // explicit q=0 beats wildcard
   return parsed.wildcard; // no explicit mention → wildcard
 }
 
