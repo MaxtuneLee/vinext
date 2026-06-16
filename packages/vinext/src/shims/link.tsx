@@ -791,8 +791,15 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   }
 
   // If `as` is provided, use it as the actual URL (legacy Next.js pattern
-  // where href is a route pattern like "/user/[id]" and as is "/user/1")
+  // where href is a route pattern like "/user/[id]" and as is "/user/1").
+  // The rendered anchor / prefetch / locale / trailingSlash / basePath math
+  // all run on the display value below; the original route-pattern href is
+  // retained as `routeHrefRaw` so the Pages Router click branch can forward
+  // the (href, as) pair to `router.push/replace` and preserve upstream
+  // semantics (popstate fetches by href; same-asPath clicks coerce to
+  // replaceState). When `as` is absent, routeHrefRaw === rawResolvedHref.
   const rawResolvedHref = as ?? resolveHref(href);
+  const routeHrefRaw = typeof href === "string" ? href : resolveHref(href);
 
   // Mirror Next.js: emit a console.error when the href contains repeated
   // forward-slashes (e.g. "/foo//bar") or backslashes, and then normalize the
@@ -990,6 +997,17 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     const pagesNavigateHref = resolvedHref.startsWith("?")
       ? resolvePagesLinkNavigationHref(resolvedHref, locale)
       : navigateHref;
+    // When the Link author passed both `href` (route pattern) AND `as` (mask),
+    // forward the original route-pattern href to Pages Router as the `url`
+    // argument. The router uses `url` to fetch the page module / data, while
+    // `as` drives the address bar — matching upstream Next.js Link → Router
+    // semantics. When no mask is present, leave `pagesAsForLink` undefined so
+    // existing single-arg navigation (the dominant code path) is unaffected.
+    const pagesAsForLink =
+      typeof as === "string" && typeof routeHrefRaw === "string" && as !== routeHrefRaw
+        ? pagesNavigateHref
+        : undefined;
+    const pagesHrefForLink = pagesAsForLink === undefined ? pagesNavigateHref : routeHrefRaw;
     // Resolve relative hrefs (#hash, ?query) for onNavigate and the hard-navigation fallback.
     // Pages query-only links must use the rewrite-aware target resolved above,
     // so callbacks and router-error fallback agree with the actual navigation.
@@ -1077,7 +1095,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
         router: pagesRouter,
         loadRouter: async () => (await import("next/router")).default,
         navigation: {
-          href: pagesNavigateHref,
+          href: pagesHrefForLink,
+          as: pagesAsForLink,
           replace,
           scroll,
           shallow,

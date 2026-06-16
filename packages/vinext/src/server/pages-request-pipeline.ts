@@ -255,7 +255,9 @@ export async function runPagesRequest(
 
   // Step 2: Trailing-slash normalization
   {
-    const trailingSlashRedirect = normalizeTrailingSlash(pathname, basePath, trailingSlash, search);
+    const trailingSlashRedirect = isDataReq
+      ? null
+      : normalizeTrailingSlash(pathname, basePath, trailingSlash, search);
     if (trailingSlashRedirect) {
       return { type: "response", response: trailingSlashRedirect };
     }

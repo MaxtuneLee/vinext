@@ -15,6 +15,15 @@ type PagesRouterLinkRuntime = {
 
 type PagesRouterLinkNavigation = {
   href: string;
+  /**
+   * Optional `as` mask — the browser-bar URL when it differs from `href`
+   * (a Pages Router route pattern, e.g. `<Link href="/posts/[id]" as="/posts/1">`).
+   * When present, `router.push/replace(href, as, ...)` is invoked with both
+   * values so the upstream (url, as) pair survives end-to-end. Mirrors
+   * Next.js's Link → Router contract: packages/next/src/client/link.tsx
+   * → router.push(href, as).
+   */
+  as?: string;
   replace: boolean;
   scroll: boolean;
   shallow?: boolean;
@@ -58,6 +67,7 @@ export async function navigatePagesRouterLink(
   router: PagesRouterLinkRuntime,
   {
     href,
+    as,
     replace,
     scroll,
     shallow,
@@ -72,9 +82,9 @@ export async function navigatePagesRouterLink(
   if (interpolateDynamicRoute) routerOptions._vinextInterpolateDynamicRoute = true;
   if (shallow !== undefined) routerOptions.shallow = shallow;
   if (replace) {
-    await router.replace(href, undefined, routerOptions);
+    await router.replace(href, as, routerOptions);
   } else {
-    await router.push(href, undefined, routerOptions);
+    await router.push(href, as, routerOptions);
   }
 }
 
