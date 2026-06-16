@@ -1,5 +1,135 @@
 # vinext
 
+## 0.1.3
+
+### Bug Fixes
+
+#### App Router
+
+- align router autoscroll with Next (#2004)
+- recover SSR shell render errors via **next_error** document (#1908)
+- preserve front redirects through fallback route handlers (#2000)
+- expose active source page on window.next (#1995)
+- fold typeof window before resolution (#1956)
+- support extensionless variable imports (#1958)
+- preserve page notFound precedence during metadata failure (#1957)
+
+#### Deploy
+
+- preserve app module identity with deployment ids (#2005)
+- prevent Windows shell injection (#1946)
+- improve deployment id parity (#1949)
+
+#### Pages
+
+- preserve app props for GSSP requests (#1996)
+- preserve module identity with deployment ids (#2012)
+- harden cookie parsing (#1947)
+
+#### Pages Router
+
+- pass rewrite URL to edge API requests (#1998)
+- block fallback shell for crawler UAs on prerender (#1543) (#1663)
+- restore scroll across reload history traversal (#1905)
+
+#### Router
+
+- honor hybrid pages route priority (#1997)
+- share Pages Router context across chunks (#2010)
+- restore pages scroll traversal state (#1999)
+- hard navigate Pages links to App routes (#1960)
+
+#### Shims
+
+- guard AsyncLocalStorage construction for browser bundles (#2020)
+- add useUntrackedPathname hook for error boundary parity (#1933)
+- match next/error RSC diagnostic (#1939)
+
+#### Misc
+
+- **Image:** allow any quality 1-100 when images.qualities is unset (#2023)
+- **Server:** strip HTTP/2 pseudo-headers before building Headers (#2021)
+- **Prerender:** surface thrown generateStaticParams/getStaticPaths errors (#2017)
+- **Routing:** re-encode trailing-slash Location for non-Latin-1 paths (#2011)
+- **PPR:** gate fallback shells until request-time resume is supported (#1716)
+- **Build:** honour experimental.lightningCssFeatures include/exclude (#1498) (#1664)
+- **Image:** prevent optimizer cache-key amplification (#1944)
+- **Actions:** bound Flight payload graph validation (#1942)
+- **Link:** preserve basePath hash navigation (#1952)
+- **Headers:** prioritize config cache headers for metadata assets (#1953)
+- **Config:** share CommonJS module fallback (#1990)
+- **Config:** honor resolve extensions and improve webpack config processing (#1959)
+- **CSS:** load local CommonJS PostCSS plugins (#1961)
+- **Cache:** honor fetch opt-outs and force-dynamic revalidate parity (#1907)
+
+### Performance
+
+- skip unnecessary import parsing (#1991)
+- cache fs probes and precompute route sort keys in scan/deploy paths (#1930)
+
+### Contributors
+
+- @Divkix
+- @james-elicx
+- @JaredStowell
+- @NathanDrake2406
+- @Xplod13
+
+## 0.1.2
+
+### Bug Fixes
+
+#### App Router
+
+- include parallel slot params in useParams (#1904)
+- preserve unstable_catchError boundaries (#1906)
+- suppress redirect console errors in production onCaughtError (root-layout-redirect) (#1878)
+- preload next/dynamic chunks with CSP nonce (#1594)
+- extend OTel tracer provider for Cache Component span context (#1868)
+- return HTTP 200 when notFound() is thrown from generateMetadata (#1864)
+- discover parallel-slot pages inside route groups for catch-all + parallel-routes-group (#1865)
+
+#### Pages Router
+
+- support stream proxying in API routes (#1902)
+- set x-nextjs-deployment-id on SSG \_next/data responses (#1863)
+- buffer SSR response for crawler/bot User-Agents (#1876)
+- hard-navigate to App Router destinations from Pages Router links (#1879)
+- bridge deprecated Router.on<Event> property callbacks (#1869)
+
+#### Misc
+
+- **Router:** support experimental gesture push (#1909)
+- **Prod Server:** stop double-evaluating the server bundle when chunks import the entry back (#1924)
+- **Trailing Slash:** canonical url trailing slash support (#1888)
+- **Edge Wasm:** handle `*.wasm?module` imports in non-Cloudflare builds (#1877)
+- **Config:** define cache components flag as boolean (#1903)
+- **Scss:** preprocess SCSS CSS-module composes deps via SassAwareFileSystemLoader (#1882)
+- **Routing:** normalize route root to forward slashes, drop downstream path workarounds (#1896)
+- **Middleware:** clear nextUrl.basePath for absolute paths outside basePath (part of #1830) (#1872)
+- **Cloudflare:** update cache adapter jsdoc and examples (#1898)
+- **Fonts:** normalize shims dir so shim-skip guards match on Windows (#1885)
+- **Check:** normalize scanned file paths to forward slashes on Windows (#1887)
+- **Shims:** use path.posix.join in resolveShimModulePath for Windows (#1886)
+- **Scss:** resolve tilde (~) imports from node_modules and project root (#1881)
+- **Build:** define process.env.NEXT_RUNTIME for server bundles (#1880)
+- **Build:** inline ../-relative font assets in OG routes (#1866)
+- **Use Cache:** pass soft tags to cache lookup so revalidatePath invalidates use-cache entries in route handlers (#1867)
+
+### Performance
+
+- **Server:** eliminate redundant per-request parsing in the request pipeline (#1929)
+- **Server:** hoist per-request regex compilation out of SSR streaming and shim hot paths (#1915)
+
+### Contributors
+
+- @Divkix
+- @james-elicx
+- @jgeurts
+- @MaxtuneLee
+- @NathanDrake2406
+- @shulaoda
+
 ## 0.1.1
 
 ### Bug Fixes

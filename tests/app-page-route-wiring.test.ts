@@ -3,6 +3,8 @@ import { describe, expect, it } from "vite-plus/test";
 import { useSelectedLayoutSegments } from "../packages/vinext/src/shims/navigation.js";
 import {
   APP_PREFETCH_LOADING_SHELL_MARKER_KEY,
+  APP_SOURCE_PAGE_KEY,
+  AppElementsWire,
   APP_SLOT_BINDINGS_KEY,
   APP_UNMATCHED_SLOT_WIRE_VALUE,
   buildOutgoingAppPayload,
@@ -507,6 +509,62 @@ describe("app page route wiring helpers", () => {
     ]);
   });
 
+  it("encodes the active app source page from route segments", () => {
+    // Ported from Next.js: test/e2e/app-dir/app/index.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/app/index.test.ts
+    const cases: Array<{
+      routePath: string;
+      routeSegments: readonly string[];
+      sourcePage: string;
+    }> = [
+      {
+        routePath: "/dashboard",
+        routeSegments: ["dashboard"],
+        sourcePage: "/dashboard/page",
+      },
+      {
+        routePath: "/dynamic/category-1/id-2",
+        routeSegments: ["dynamic", "[category]", "[id]"],
+        sourcePage: "/dynamic/[category]/[id]/page",
+      },
+      {
+        routePath: "/dashboard/another",
+        routeSegments: ["(newroot)", "dashboard", "another"],
+        sourcePage: "/(newroot)/dashboard/another/page",
+      },
+    ];
+
+    for (const { routePath, routeSegments, sourcePage } of cases) {
+      const elements = buildAppPageElements({
+        element: createElement(PageProbe),
+        makeThenableParams(params) {
+          return Promise.resolve(params);
+        },
+        matchedParams: {},
+        resolvedMetadata: null,
+        resolvedViewport: {},
+        route: {
+          error: null,
+          errors: [],
+          layoutTreePositions: [],
+          layouts: [],
+          loading: null,
+          notFound: null,
+          notFounds: [],
+          routeSegments,
+          slots: null,
+          templateTreePositions: [],
+          templates: [],
+        },
+        routePath,
+        rootNotFoundModule: null,
+      });
+
+      expect(elements[APP_SOURCE_PAGE_KEY]).toBe(sourcePage);
+      expect(AppElementsWire.readMetadata(elements).sourcePage).toBe(sourcePage);
+    }
+  });
+
   it("builds a flat elements map with route, layout, template, page, and slot entries", async () => {
     const elements = buildAppPageElements({
       element: createElement(PageProbe),
@@ -552,6 +610,7 @@ describe("app page route wiring helpers", () => {
     });
 
     expect(elements.__route).toBe("route:/blog/post");
+    expect(elements.__sourcePage).toBe("/(marketing)/blog/[slug]/page");
     expect(elements.__layoutIds).toEqual(["layout:/", "layout:/(marketing)"]);
     expect(elements.__rootLayout).toBe("/");
     expect(elements["layout:/"]).toBeDefined();
@@ -1642,6 +1701,73 @@ describe("app page route wiring helpers", () => {
     const errorBoundary = findElementByTypeName(elements["route:/docs/intro"], "ErrorBoundary");
 
     expect(errorBoundary?.props.resetKey).toBe("slug|intro|d");
+  });
+
+  it("nests user global errors inside the default global error fallback", () => {
+    function UserGlobalError() {
+      return createElement("p", null, "User global error");
+    }
+
+    const elements = buildAppPageElements({
+      element: createElement(PageProbe),
+      globalErrorModule: { default: UserGlobalError },
+      makeThenableParams(params) {
+        return Promise.resolve(params);
+      },
+      matchedParams: {},
+      resolvedMetadata: null,
+      resolvedViewport: {},
+      route: {
+        error: null,
+        errors: [null],
+        layoutTreePositions: [0],
+        layouts: [{ default: RootLayout }],
+        loading: null,
+        notFound: null,
+        notFounds: [null],
+        routeSegments: [],
+        slots: {},
+        templateTreePositions: [],
+        templates: [],
+      },
+      routePath: "/",
+      rootNotFoundModule: null,
+    });
+
+    const routeEntry = elements["route:/"];
+    const outerBoundary = findElementByTypeName(routeEntry, "GlobalErrorBoundary");
+    const userBoundary = findElementByTypeName(outerBoundary?.props.children, "ErrorBoundary");
+
+    expect(getElementTypeName(outerBoundary?.props.fallback)).toBe("DefaultGlobalError");
+    expect(userBoundary?.props.fallback).toBe(UserGlobalError);
+  });
+
+  it("installs the default global error boundary without a user global error", () => {
+    const elements = buildAppPageElements({
+      element: createElement(PageProbe),
+      makeThenableParams: (params) => Promise.resolve(params),
+      matchedParams: {},
+      resolvedMetadata: null,
+      resolvedViewport: {},
+      route: {
+        error: null,
+        errors: [null],
+        layoutTreePositions: [0],
+        layouts: [{ default: RootLayout }],
+        loading: null,
+        notFound: null,
+        notFounds: [null],
+        routeSegments: [],
+        slots: {},
+        templateTreePositions: [],
+        templates: [],
+      },
+      routePath: "/",
+      rootNotFoundModule: null,
+    });
+
+    const outerBoundary = findElementByTypeName(elements["route:/"], "GlobalErrorBoundary");
+    expect(getElementTypeName(outerBoundary?.props.fallback)).toBe("DefaultGlobalError");
   });
 
   it("interleaves templates with their corresponding layouts", async () => {

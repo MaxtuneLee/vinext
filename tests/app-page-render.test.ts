@@ -29,11 +29,16 @@ import {
 } from "../packages/vinext/src/server/client-reuse-manifest.js";
 import { VINEXT_DYNAMIC_STALE_TIME_HEADER } from "../packages/vinext/src/server/headers.js";
 import type { CachedAppPageValue } from "../packages/vinext/src/shims/cache.js";
+import {
+  DefaultCdnCacheAdapter,
+  setCdnCacheAdapter,
+} from "../packages/vinext/src/shims/cdn-cache.js";
 import { markDynamicUsage } from "../packages/vinext/src/shims/headers.js";
 import {
   createRequestContext,
   runWithRequestContext,
 } from "../packages/vinext/src/shims/unified-request-context.js";
+import { CloudflareCdnCacheAdapter } from "../packages/cloudflare/src/cache/cdn-adapter.runtime.js";
 
 function captureRecord(value: ReactNode | AppOutgoingElements): Record<string, unknown> {
   if (!isAppElementsRecord(value)) {
@@ -182,6 +187,7 @@ function createCommonOptions() {
         headers: null,
         status: null,
       },
+      navigationParams: { slug: "post" },
       params: { slug: "post" },
       probeLayoutAt() {
         return null;
@@ -194,7 +200,6 @@ function createCommonOptions() {
       renderLayoutSpecialError,
       renderPageSpecialError,
       renderToReadableStream,
-      routeHasLocalBoundary: false,
       routePattern: "/posts/[slug]",
       runWithSuppressedHookWarning<T>(probe: () => Promise<T>) {
         return probe();
@@ -320,6 +325,51 @@ describe("clearRequestContext timing — issue #660", () => {
 
     // Context must be cleared after the stream is fully consumed.
     expect(contextCleared).toHaveLength(1);
+  });
+});
+
+describe("SSR shell error recovery", () => {
+  it("returns an uncached 500 response for a recovered dynamic shell error", async () => {
+    setCdnCacheAdapter(new CloudflareCdnCacheAdapter());
+    const common = createCommonOptions();
+    try {
+      const response = await renderAppPageLifecycle({
+        ...common.options,
+        isProduction: true,
+        middlewareContext: {
+          headers: new Headers({
+            "Cache-Control": "public, max-age=3600",
+            "CDN-Cache-Control": "public, max-age=3600",
+            "Cloudflare-CDN-Cache-Control": "public, max-age=3600",
+            "Cache-Tag": "shell-error",
+          }),
+          status: null,
+        },
+        revalidateSeconds: 30,
+        loadSsrHandler: async () => ({
+          async handleSsr() {
+            return {
+              htmlStream: createStream(['<html id="__next_error__"></html>']),
+              metadataReady: Promise.resolve(),
+              capturedRscData: null,
+              shellErrorRecovered: true,
+            };
+          },
+        }),
+      });
+
+      expect(response.status).toBe(500);
+      expect(response.headers.get("cache-control")).toBe(
+        "private, no-cache, no-store, max-age=0, must-revalidate",
+      );
+      expect(response.headers.get("cdn-cache-control")).toBeNull();
+      expect(response.headers.get("cloudflare-cdn-cache-control")).toBeNull();
+      expect(response.headers.get("cache-tag")).toBeNull();
+      await expect(response.text()).resolves.toContain("__next_error__");
+      expect(common.isrSet).not.toHaveBeenCalled();
+    } finally {
+      setCdnCacheAdapter(new DefaultCdnCacheAdapter());
+    }
   });
 });
 
@@ -521,7 +571,7 @@ describe("app page render lifecycle", () => {
     );
   });
 
-  it("rerenders HTML responses with the error boundary when a global RSC error was captured", async () => {
+  it("preserves HTML responses when a post-shell RSC error may be caught by a client boundary", async () => {
     const common = createCommonOptions();
 
     const response = await renderAppPageLifecycle({
@@ -532,8 +582,8 @@ describe("app page render lifecycle", () => {
       },
     });
 
-    expect(common.renderErrorBoundaryResponse).toHaveBeenCalledTimes(1);
-    await expect(response.text()).resolves.toBe("boundary:boom");
+    expect(common.renderErrorBoundaryResponse).not.toHaveBeenCalled();
+    await expect(response.text()).resolves.toBe("<html>page</html>");
   });
 
   it("prefers the captured RSC error over an SSR decoder error when rendering the error boundary", async () => {
@@ -1161,6 +1211,7 @@ describe("layoutFlags injection into RSC payload", () => {
       layoutCount: overrides.layoutCount ?? 0,
       loadSsrHandler: vi.fn(),
       middlewareContext: { headers: null, status: null },
+      navigationParams: {},
       params: {},
       probeLayoutAt: overrides.probeLayoutAt ?? (() => null),
       probePage: () => null,
@@ -1172,7 +1223,6 @@ describe("layoutFlags injection into RSC payload", () => {
         capturedElement = captureRecord(el);
         return createStream(["flight-data"]);
       },
-      routeHasLocalBoundary: false,
       routePattern: overrides.routePattern ?? "/test",
       runWithSuppressedHookWarning: <T>(probe: () => Promise<T>) => probe(),
       element: overrides.element ?? { "page:/test": "test-page" },
@@ -1286,6 +1336,7 @@ describe("layoutFlags injection into RSC payload", () => {
 
     await renderAppPageLifecycle({
       ...options,
+      navigationParams: { id: "123" },
       params: { id: "123" },
       peekRenderObservationState() {
         return {

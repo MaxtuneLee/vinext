@@ -46,6 +46,7 @@ import {
   runWithUnifiedStateMutation,
 } from "./unified-request-context.js";
 import { markDynamicUsage } from "./headers.js";
+import { trackPprFallbackShellCacheTask } from "./ppr-fallback-shell.js";
 
 // ---------------------------------------------------------------------------
 // Constants for nested-dynamic cache life detection
@@ -454,172 +455,173 @@ export function registerCachedFunction<TArgs extends unknown[], TResult>(
   // it's scoped to a single request and doesn't persist across HMR.
   const isDev = typeof process !== "undefined" && process.env.NODE_ENV === "development";
 
-  const cachedFn = async (...args: TArgs): Promise<TResult> => {
-    const rsc = await getRscModule();
-    const keySeed = getUseCacheKeySeed();
+  const cachedFn = (...args: TArgs): Promise<TResult> =>
+    trackPprFallbackShellCacheTask(async (): Promise<TResult> => {
+      const rsc = await getRscModule();
+      const keySeed = getUseCacheKeySeed();
 
-    // Build the cache key. Use encodeReply (RSC protocol) when available —
-    // it correctly handles React elements as temporary references (excluded
-    // from key). Falls back to stableStringify when RSC is unavailable.
-    let cacheKey: string;
-    try {
-      const processedArgs =
-        args.length > 0
-          ? unwrapThenableObjectArray(args, { omitAppPageSearchParamsFromFirstArg })
-          : [];
-      if (rsc && args.length > 0) {
-        // Temporary references let encodeReply handle non-serializable values
-        // (like React elements in args) by excluding them from the key.
-        const tempRefs = rsc.createClientTemporaryReferenceSet();
-        // Unwrap Promise-augmented objects before encoding.
-        // Next.js 16 params/searchParams are created via
-        // Object.assign(Promise.resolve(obj), obj) — a Promise with own
-        // enumerable properties. encodeReply treats Promises as temporary
-        // references (excluded from the key), which means different param
-        // values (e.g., section:"sports" vs section:"electronics") produce
-        // identical cache keys. We must extract the plain data so the actual
-        // values are included in the cache key.
-        const encoded = await rsc.encodeReply(processedArgs, {
-          temporaryReferences: tempRefs,
-        });
-        cacheKey = buildUseCacheKey(id, keySeed, await replyToCacheKey(encoded));
-      } else {
-        const argsKey = processedArgs.length > 0 ? stableStringify(processedArgs) : undefined;
-        cacheKey = buildUseCacheKey(id, keySeed, argsKey);
-      }
-    } catch {
-      // Non-serializable arguments — run without caching
-      return fn(...args);
-    }
-
-    // "use cache: private" uses per-request in-memory cache
-    if (cacheVariant === "private") {
-      const parentCtx = cacheContextStorage.getStore();
-      if (parentCtx && parentCtx.variant !== "private") {
-        throwPrivateUseCacheInsidePublicUseCacheError();
-      }
-
-      if (typeof process !== "undefined" && process.env.VINEXT_PRERENDER === "1") {
-        // Next.js treats "use cache: private" as dynamic during prerendering:
-        // it is excluded from the static artifact and resolved per request.
-        // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/use-cache/use-cache-wrapper.ts
-        markDynamicUsage();
-      }
-
-      const privateCache = _getPrivateState()._privateCache!;
-      const privateHit = privateCache.get(cacheKey);
-      if (privateHit !== undefined) {
-        // The private cache is heterogeneous across cached functions; the key
-        // includes this function's stable id, so a hit belongs to this TResult.
-        return privateHit as TResult;
-      }
-
-      const result = await executeWithContext(fn, args, cacheVariant);
-      privateCache.set(cacheKey, result);
-      return result;
-    }
-
-    // In dev mode, always execute fresh — skip shared cache lookup/storage.
-    // This ensures HMR changes are reflected immediately.
-    if (isDev) {
-      return executeWithContext(fn, args, cacheVariant);
-    }
-
-    // Shared cache ("use cache" / "use cache: remote")
-    const handler = getDataCacheHandler();
-
-    // Check cache — deserialize via RSC stream when available, JSON otherwise.
-    // Pass soft tags so that revalidatePath() / revalidateTag() invalidation
-    // applies to "use cache" entries even when the entry carries no hard tags.
-    // The soft tags are path-derived implicit tags set by the enclosing route
-    // handler or page dispatch — see setCurrentFetchSoftTags in fetch-cache.ts.
-    const softTags = getCurrentFetchSoftTags();
-    const existing = await handler.get(cacheKey, { kind: "FETCH", softTags });
-    if (existing?.value && existing.value.kind === "FETCH" && existing.cacheState !== "stale") {
+      // Build the cache key. Use encodeReply (RSC protocol) when available —
+      // it correctly handles React elements as temporary references (excluded
+      // from key). Falls back to stableStringify when RSC is unavailable.
+      let cacheKey: string;
       try {
-        // Surface the cached entry's tags to the surrounding request so the
-        // enclosing page / route-handler ISR entry carries them even on a data
-        // cache HIT — otherwise `revalidateTag()` could not evict the rendered
-        // output that embeds this cached value (issue #1453).
-        propagateCacheTagsToRequest(existing.value.tags);
-        if (rsc && existing.value.data.headers[VINEXT_RSC_MARKER_HEADER] === "1") {
-          // RSC-serialized entry: base64 → bytes → stream → deserialize
-          const bytes = base64ToUint8(existing.value.data.body);
-          const stream = uint8ToStream(bytes);
-          const result = await rsc.createFromReadableStream<TResult>(stream);
+        const processedArgs =
+          args.length > 0
+            ? unwrapThenableObjectArray(args, { omitAppPageSearchParamsFromFirstArg })
+            : [];
+        if (rsc && args.length > 0) {
+          // Temporary references let encodeReply handle non-serializable values
+          // (like React elements in args) by excluding them from the key.
+          const tempRefs = rsc.createClientTemporaryReferenceSet();
+          // Unwrap Promise-augmented objects before encoding.
+          // Next.js 16 params/searchParams are created via
+          // Object.assign(Promise.resolve(obj), obj) — a Promise with own
+          // enumerable properties. encodeReply treats Promises as temporary
+          // references (excluded from the key), which means different param
+          // values (e.g., section:"sports" vs section:"electronics") produce
+          // identical cache keys. We must extract the plain data so the actual
+          // values are included in the cache key.
+          const encoded = await rsc.encodeReply(processedArgs, {
+            temporaryReferences: tempRefs,
+          });
+          cacheKey = buildUseCacheKey(id, keySeed, await replyToCacheKey(encoded));
+        } else {
+          const argsKey = processedArgs.length > 0 ? stableStringify(processedArgs) : undefined;
+          cacheKey = buildUseCacheKey(id, keySeed, argsKey);
+        }
+      } catch {
+        // Non-serializable arguments — run without caching
+        return fn(...args);
+      }
+
+      // "use cache: private" uses per-request in-memory cache
+      if (cacheVariant === "private") {
+        const parentCtx = cacheContextStorage.getStore();
+        if (parentCtx && parentCtx.variant !== "private") {
+          throwPrivateUseCacheInsidePublicUseCacheError();
+        }
+
+        if (typeof process !== "undefined" && process.env.VINEXT_PRERENDER === "1") {
+          // Next.js treats "use cache: private" as dynamic during prerendering:
+          // it is excluded from the static artifact and resolved per request.
+          // https://github.com/vercel/next.js/blob/canary/packages/next/src/server/use-cache/use-cache-wrapper.ts
+          markDynamicUsage();
+        }
+
+        const privateCache = _getPrivateState()._privateCache!;
+        const privateHit = privateCache.get(cacheKey);
+        if (privateHit !== undefined) {
+          // The private cache is heterogeneous across cached functions; the key
+          // includes this function's stable id, so a hit belongs to this TResult.
+          return privateHit as TResult;
+        }
+
+        const result = await executeWithContext(fn, args, cacheVariant);
+        privateCache.set(cacheKey, result);
+        return result;
+      }
+
+      // In dev mode, always execute fresh — skip shared cache lookup/storage.
+      // This ensures HMR changes are reflected immediately.
+      if (isDev) {
+        return executeWithContext(fn, args, cacheVariant);
+      }
+
+      // Shared cache ("use cache" / "use cache: remote")
+      const handler = getDataCacheHandler();
+
+      // Check cache — deserialize via RSC stream when available, JSON otherwise.
+      // Pass soft tags so that revalidatePath() / revalidateTag() invalidation
+      // applies to "use cache" entries even when the entry carries no hard tags.
+      // The soft tags are path-derived implicit tags set by the enclosing route
+      // handler or page dispatch — see setCurrentFetchSoftTags in fetch-cache.ts.
+      const softTags = getCurrentFetchSoftTags();
+      const existing = await handler.get(cacheKey, { kind: "FETCH", softTags });
+      if (existing?.value && existing.value.kind === "FETCH" && existing.cacheState !== "stale") {
+        try {
+          // Surface the cached entry's tags to the surrounding request so the
+          // enclosing page / route-handler ISR entry carries them even on a data
+          // cache HIT — otherwise `revalidateTag()` could not evict the rendered
+          // output that embeds this cached value (issue #1453).
+          propagateCacheTagsToRequest(existing.value.tags);
+          if (rsc && existing.value.data.headers[VINEXT_RSC_MARKER_HEADER] === "1") {
+            // RSC-serialized entry: base64 → bytes → stream → deserialize
+            const bytes = base64ToUint8(existing.value.data.body);
+            const stream = uint8ToStream(bytes);
+            const result = await rsc.createFromReadableStream<TResult>(stream);
+            recordRequestScopedCacheControl(existing.cacheControl);
+            return result;
+          }
+          // JSON-serialized entry (legacy or no RSC available)
+          const result = JSON.parse(existing.value.data.body);
           recordRequestScopedCacheControl(existing.cacheControl);
           return result;
+        } catch {
+          // Corrupted entry, fall through to re-execute
         }
-        // JSON-serialized entry (legacy or no RSC available)
-        const result = JSON.parse(existing.value.data.body);
-        recordRequestScopedCacheControl(existing.cacheControl);
-        return result;
-      } catch {
-        // Corrupted entry, fall through to re-execute
-      }
-    }
-
-    // Cache miss (or stale) — execute with context
-    const { result, ctx, effectiveLife } = await runCachedFunctionWithContext(
-      fn,
-      args,
-      cacheVariant,
-    );
-
-    recordRequestScopedCacheLife(effectiveLife);
-    // Bubble the cache scope's tags up to the surrounding request so the
-    // enclosing page / route-handler ISR entry is tagged for on-demand
-    // revalidation (issue #1453). `ctx.tags` already includes any nested
-    // child cache's tags via `runCachedFunctionWithContext`.
-    propagateCacheTagsToRequest(ctx.tags);
-    const revalidateSeconds =
-      effectiveLife.revalidate ?? cacheLifeProfiles.default.revalidate ?? 900;
-
-    // Store in cache — use RSC stream serialization when available (handles
-    // React elements, client refs, Promises, etc.), JSON otherwise.
-    try {
-      let body: string;
-      const headers: Record<string, string> = {};
-
-      if (rsc) {
-        // RSC serialization: result → stream → bytes → base64.
-        // No temporaryReferences — cached values must be self-contained
-        // since they're persisted across requests.
-        const stream = rsc.renderToReadableStream(result);
-        const bytes = await collectStream(stream);
-        body = uint8ToBase64(bytes);
-        headers[VINEXT_RSC_MARKER_HEADER] = "1";
-      } else {
-        // JSON fallback
-        body = JSON.stringify(result);
-        if (body === undefined) return result;
       }
 
-      const cacheValue = {
-        kind: "FETCH",
-        data: {
-          headers,
-          body,
-          url: cacheKey,
-        },
-        tags: ctx.tags,
-        revalidate: revalidateSeconds,
-      } satisfies CachedFetchValue;
+      // Cache miss (or stale) — execute with context
+      const { result, ctx, effectiveLife } = await runCachedFunctionWithContext(
+        fn,
+        args,
+        cacheVariant,
+      );
 
-      await handler.set(cacheKey, cacheValue, {
-        fetchCache: true,
-        tags: ctx.tags,
-        cacheControl: {
+      recordRequestScopedCacheLife(effectiveLife);
+      // Bubble the cache scope's tags up to the surrounding request so the
+      // enclosing page / route-handler ISR entry is tagged for on-demand
+      // revalidation (issue #1453). `ctx.tags` already includes any nested
+      // child cache's tags via `runCachedFunctionWithContext`.
+      propagateCacheTagsToRequest(ctx.tags);
+      const revalidateSeconds =
+        effectiveLife.revalidate ?? cacheLifeProfiles.default.revalidate ?? 900;
+
+      // Store in cache — use RSC stream serialization when available (handles
+      // React elements, client refs, Promises, etc.), JSON otherwise.
+      try {
+        let body: string;
+        const headers: Record<string, string> = {};
+
+        if (rsc) {
+          // RSC serialization: result → stream → bytes → base64.
+          // No temporaryReferences — cached values must be self-contained
+          // since they're persisted across requests.
+          const stream = rsc.renderToReadableStream(result);
+          const bytes = await collectStream(stream);
+          body = uint8ToBase64(bytes);
+          headers[VINEXT_RSC_MARKER_HEADER] = "1";
+        } else {
+          // JSON fallback
+          body = JSON.stringify(result);
+          if (body === undefined) return result;
+        }
+
+        const cacheValue = {
+          kind: "FETCH",
+          data: {
+            headers,
+            body,
+            url: cacheKey,
+          },
+          tags: ctx.tags,
           revalidate: revalidateSeconds,
-          expire: effectiveLife.expire,
-        },
-      });
-    } catch {
-      // Result not serializable — skip caching, still return the result
-    }
+        } satisfies CachedFetchValue;
 
-    return result;
-  };
+        await handler.set(cacheKey, cacheValue, {
+          fetchCache: true,
+          tags: ctx.tags,
+          cacheControl: {
+            revalidate: revalidateSeconds,
+            expire: effectiveLife.expire,
+          },
+        });
+      } catch {
+        // Result not serializable — skip caching, still return the result
+      }
+
+      return result;
+    }, cacheVariant);
 
   // Preserve the original function's arity on the wrapper. The wrapper is
   // declared as `(...args)` (arity 0), which hides the original signature.

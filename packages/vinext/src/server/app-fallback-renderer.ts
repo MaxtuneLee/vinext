@@ -71,6 +71,8 @@ type AppFallbackRendererOptions<TModule extends AppPageModule = AppPageModule> =
   metadataRoutes: MetadataFileRoute[];
   /** Configured next.config `basePath`, threaded into file-based metadata href emission. */
   basePath?: string;
+  /** Configured next.config `trailingSlash`, threaded into canonical URL rendering. */
+  trailingSlash?: boolean;
   resolveChildSegments: (
     routeSegments: readonly string[],
     treePosition: number,
@@ -93,6 +95,7 @@ type AppFallbackRendererCallContext = {
    * render path. Defaults to `false` when no route is matched.
    */
   isEdgeRuntime?: boolean;
+  sourcePageSegments?: readonly string[] | null;
 };
 
 type AppFallbackRenderer<TModule extends AppPageModule = AppPageModule> = {
@@ -152,6 +155,7 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
     rscRenderer,
     sanitizer,
     ssrLoader,
+    trailingSlash,
   } = options;
 
   const { rootForbiddenModule, rootLayouts, rootNotFoundModule, rootUnauthorizedModule } =
@@ -253,6 +257,7 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
 
       return renderAppPageHttpAccessFallback({
         basePath,
+        trailingSlash,
         boundaryComponent: opts?.boundaryComponent ?? null,
         boundaryModule: opts?.boundaryModule ?? null,
         buildFontLinkHeader: fontProviders.buildFontLinkHeader,
@@ -282,6 +287,7 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
         route,
         renderToReadableStream: rscRenderer,
         scriptNonce,
+        sourcePageSegments: callContext?.sourcePageSegments,
         statusCode,
       });
     },
@@ -319,6 +325,7 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
     ) {
       return renderAppPageErrorBoundary({
         basePath,
+        trailingSlash,
         buildFontLinkHeader: fontProviders.buildFontLinkHeader,
         clearRequestContext,
         createRscOnErrorHandler(pathname, routePath) {
@@ -344,6 +351,7 @@ export function createAppFallbackRenderer<TModule extends AppPageModule>(
         renderToReadableStream: rscRenderer,
         sanitizeErrorForClient: sanitizer,
         scriptNonce,
+        sourcePageSegments: callContext?.sourcePageSegments,
       });
     },
   };

@@ -143,6 +143,26 @@ describe("App RSC route matching", () => {
     expect(matcher.findIntercept("/photos/42", "/gallery")).toBeNull();
   });
 
+  it("does not use an unrelated concrete route for legacy interception entries", () => {
+    const matcher = createAppRscRouteMatcher([
+      route("/feed", ["feed"], {
+        modal: {
+          intercepts: [
+            {
+              targetPattern: "/photos/:id",
+              interceptLayouts: ["modal-layout"],
+              page: "photo-page",
+              params: ["id"],
+            },
+          ],
+        },
+      }),
+      route("/gallery", ["gallery"]),
+    ]);
+
+    expect(matcher.findIntercept("/photos/42", "/gallery")).toBeNull();
+  });
+
   it("canonicalizes encoded source path parts for interception params", () => {
     const matcher = createAppRscRouteMatcher([
       route("/_sites/:tenant", ["_sites", ":tenant"], {
@@ -162,6 +182,44 @@ describe("App RSC route matching", () => {
     expect(matcher.findIntercept("/photos/a%2Fb", "/%5Fsites/acme")).toMatchObject({
       targetPattern: "/photos/:id",
       matchedParams: { tenant: "acme", id: "a/b" },
+    });
+  });
+
+  it("renders a root-slot interception from the concrete matched source route", () => {
+    const matcher = createAppRscRouteMatcher([
+      route("/", [], {
+        modal: {
+          intercepts: [
+            {
+              sourceMatchPattern: "/",
+              targetPattern: "/org/:orgId/team/:teamId/settings",
+              interceptLayouts: ["modal-layout"],
+              page: "settings-modal",
+              params: ["orgId", "teamId"],
+            },
+          ],
+        },
+      }),
+      route("/org/:orgId/team/:teamId", ["org", ":orgId", "team", ":teamId"], {
+        modal: {
+          intercepts: [
+            {
+              sourceMatchPattern: "/",
+              targetPattern: "/org/:orgId/team/:teamId/settings",
+              interceptLayouts: ["modal-layout"],
+              page: "settings-modal",
+              params: ["orgId", "teamId"],
+            },
+          ],
+        },
+      }),
+    ]);
+
+    expect(
+      matcher.findIntercept("/org/acme/team/engineering/settings", "/org/acme/team/engineering"),
+    ).toMatchObject({
+      sourceRouteIndex: 1,
+      matchedParams: { orgId: "acme", teamId: "engineering" },
     });
   });
 
@@ -322,6 +380,7 @@ describe("App RSC route matching", () => {
             {
               targetPattern: "/hoge",
               sourceMatchPattern: "/foo/bar",
+              sourcePageSegments: ["foo", "bar", "(..)(..)hoge"],
               slotId: "slot:__vinext_sibling_intercept:/foo/bar",
               interceptLayouts: [],
               page: { default: () => null },
@@ -337,6 +396,7 @@ describe("App RSC route matching", () => {
       const hit = matcher.findIntercept("/hoge", "/foo/bar");
       expect(hit).not.toBeNull();
       expect(hit?.slotKey).toBe(SIBLING_PAGE_INTERCEPT_SLOT_KEY);
+      expect(hit?.sourcePageSegments).toEqual(["foo", "bar", "(..)(..)hoge"]);
 
       // Hard-nav (no source): must return null
       expect(matcher.findIntercept("/hoge", null)).toBeNull();
@@ -389,6 +449,7 @@ function route(
 type TestSiblingIntercept = {
   targetPattern: string;
   sourceMatchPattern: string | null;
+  sourcePageSegments?: readonly string[];
   slotId: string | null;
   interceptLayouts: readonly unknown[];
   page: unknown;

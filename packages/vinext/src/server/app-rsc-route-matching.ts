@@ -36,6 +36,7 @@ type AppRscInterceptForMatching = {
    * @see https://github.com/vercel/next.js/blob/canary/packages/next/src/lib/generate-interception-routes-rewrites.ts
    */
   sourceMatchPattern?: string;
+  sourcePageSegments?: readonly string[];
   interceptLayouts: readonly unknown[];
   page: unknown;
   __pageLoader?: (() => Promise<unknown>) | null;
@@ -50,6 +51,7 @@ type AppRscSlotForMatching = {
 type AppRscSiblingInterceptForMatching = {
   targetPattern: string;
   sourceMatchPattern: string | null;
+  sourcePageSegments?: readonly string[];
   slotId: string | null;
   interceptLayouts: readonly unknown[];
   page: unknown;
@@ -79,6 +81,7 @@ type AppRscInterceptLookupEntry = {
   targetPatternParts: string[];
   sourceMatchPattern: string | null;
   sourceMatchPatternParts: string[] | null;
+  sourcePageSegments: readonly string[] | null;
   interceptLayouts: readonly unknown[];
   page: unknown;
   __pageLoader?: (() => Promise<unknown>) | null;
@@ -104,6 +107,7 @@ export function createAppRscRouteMatcher<Route extends AppRscRouteForMatching>(
 } {
   const routeTrie = buildRouteTrie(routes);
   const interceptLookup = createInterceptLookup(routes);
+  const routeIndexes = new Map<Route, number>(routes.map((route, index) => [route, index]));
 
   return {
     matchRoute(url) {
@@ -119,6 +123,7 @@ export function createAppRscRouteMatcher<Route extends AppRscRouteForMatching>(
 
       const urlParts = appRscPathnameParts(pathname);
       const sourceParts = appRscPathnameParts(sourcePathname);
+      const matchedSourceRoute = trieMatch(routeTrie, sourceParts);
 
       for (const entry of interceptLookup) {
         // Primary gate: when the intercept declares a `sourceMatchPattern`
@@ -131,10 +136,17 @@ export function createAppRscRouteMatcher<Route extends AppRscRouteForMatching>(
         const params = matchAppRscRoutePattern(urlParts, entry.targetPatternParts);
         if (params === null) continue;
 
-        const sourceRoute = routes[entry.sourceRouteIndex];
-        const matchedSourceParams = sourceRoute
-          ? matchAppRscRoutePattern(sourceParts, sourceRoute.patternParts)
-          : null;
+        const concreteSourceRouteIndex =
+          matchedSourceRoute && entry.sourceMatchPatternParts !== null
+            ? (routeIndexes.get(matchedSourceRoute.route) ?? entry.sourceRouteIndex)
+            : entry.sourceRouteIndex;
+        const sourceRoute = routes[concreteSourceRouteIndex];
+        const matchedSourceParams =
+          matchedSourceRoute && entry.sourceMatchPatternParts !== null
+            ? matchedSourceRoute.params
+            : sourceRoute
+              ? matchAppRscRoutePattern(sourceParts, sourceRoute.patternParts)
+              : null;
 
         // Secondary gate (from #1249): when the entry has no
         // `sourceMatchPatternParts` declared (older manifest shapes), reject
@@ -149,7 +161,11 @@ export function createAppRscRouteMatcher<Route extends AppRscRouteForMatching>(
           continue;
         }
         const sourceParams = matchedSourceParams ?? createRouteParams();
-        return { ...entry, matchedParams: mergeMatchedParams(sourceParams, params) };
+        return {
+          ...entry,
+          sourceRouteIndex: concreteSourceRouteIndex,
+          matchedParams: mergeMatchedParams(sourceParams, params),
+        };
       }
       return null;
     },
@@ -213,6 +229,7 @@ function createInterceptLookup<Route extends AppRscRouteForMatching>(
             targetPatternParts: intercept.targetPattern.split("/").filter(Boolean),
             sourceMatchPattern,
             sourceMatchPatternParts,
+            sourcePageSegments: intercept.sourcePageSegments ?? null,
             interceptLayouts: intercept.interceptLayouts,
             page: intercept.page,
             __pageLoader: intercept.__pageLoader,
@@ -235,6 +252,7 @@ function createInterceptLookup<Route extends AppRscRouteForMatching>(
           targetPatternParts: intercept.targetPattern.split("/").filter(Boolean),
           sourceMatchPattern,
           sourceMatchPatternParts,
+          sourcePageSegments: intercept.sourcePageSegments ?? null,
           interceptLayouts: intercept.interceptLayouts,
           page: intercept.page,
           __pageLoader: intercept.__pageLoader,

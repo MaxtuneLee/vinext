@@ -39,6 +39,7 @@ import { filterInternalHeaders, isOpenRedirectShaped } from "./request-pipeline.
 import { notFoundResponse } from "./http-error-responses.js";
 import {
   runPagesRequest,
+  wrapMiddlewareWithBasePath,
   type PagesPipelineDeps,
   type PagesRenderOptions,
 } from "./pages-request-pipeline.js";
@@ -53,20 +54,8 @@ import {
   ASSET_PREFIX_URL_DIR,
   assetPrefixPathname,
   isAbsoluteAssetPrefix,
-  resolveAssetsDir,
 } from "../utils/asset-prefix.js";
-import { computeLazyChunks } from "../utils/lazy-chunks.js";
-import { manifestFileWithBase } from "../utils/manifest-paths.js";
-import {
-  findClientEntryFile,
-  findPagesClientEntryFile,
-  readClientBuildManifest,
-} from "../utils/client-build-manifest.js";
-import {
-  findClientEntryFileFromVinextManifest,
-  findPagesClientEntryFileFromVinextManifest,
-  readClientEntryManifest,
-} from "../utils/client-entry-manifest.js";
+import { computeClientRuntimeMetadata } from "../utils/client-runtime-metadata.js";
 import { normalizePathnameForRouteMatchStrict } from "../routing/utils.js";
 import { isUnknownRecord } from "../utils/record.js";
 import type { ExecutionContextLike } from "vinext/shims/request-context";
@@ -90,15 +79,116 @@ import {
   resolveRequestHost as resolveHost,
 } from "./proxy-trust.js";
 
+/**
+ * mtime of the build each bare (query-less) server-entry URL was first
+ * imported from in this process. Node's ESM cache pins a bare URL to that
+ * build forever, so rebuilds to the same path must be detected and loaded
+ * through a cache-busted URL instead.
+ */
+const bareServerEntryMtimes = new Map<string, number>();
+
+/**
+ * Import a built server entry module (App Router RSC entry or Pages Router
+ * server entry) by absolute file path.
+ *
+ * The first import of a given path uses the plain file:// URL with NO query
+ * string. This is load-bearing: code-split builds emit lazy chunks that
+ * import the entry back by bare specifier (default Vite builds on both
+ * supported majors — Rollup on Vite 7 and Rolldown on Vite 8 — hoist modules
+ * shared between the entry's static graph and lazy route chunks into the
+ * entry chunk, which the chunks then import as e.g. "../../index.js").
+ * Node keys its ESM cache on the full URL including the query string, so if
+ * the server imported the entry as `index.js?t=<mtime>`, a chunk's bare
+ * back-import would evaluate the entire server bundle a second time and
+ * module-level singletons (db pools, service registries) would silently
+ * diverge between the two copies. See
+ * https://github.com/cloudflare/vinext/issues/1923.
+ *
+ * A `?t=<mtime>` query string is appended only when the same path is
+ * imported again after a rebuild (different mtime) — e.g. test suites that
+ * rebuild a fixture to the same output path within one process — where the
+ * bare URL's cache entry would return the stale previous build. Note this
+ * rebuild branch trades the single-instance guarantee back: chunks that
+ * import the entry by bare path still resolve to the FIRST build's cache
+ * entry, so freshness and single-instance only hold together on the first
+ * import of a path. Production processes import each entry path exactly
+ * once and always get both.
+ *
+ * The entry is imported via its canonical real path: the bundler
+ * canonicalizes module ids with fs.realpathSync.native, so chunks evaluate
+ * under realpath-based URLs and their relative imports resolve to realpath
+ * URLs too. Importing the entry through a symlinked path (macOS /var/...
+ * tmpdirs, symlinked deploy directories) would otherwise create a second
+ * instance keyed on the symlinked URL.
+ *
+ * Exported for direct unit testing of the URL choice.
+ */
+export function resolveServerEntryImportUrl(entryPath: string): string {
+  // The catch only covers realpathSync.native failing on filesystems that
+  // don't support it; it does not make a missing entry path "work" — that
+  // still throws at the statSync below, same as before this helper existed.
+  let canonicalEntryPath: string;
+  try {
+    canonicalEntryPath = fs.realpathSync.native(entryPath);
+  } catch {
+    canonicalEntryPath = entryPath;
+  }
+  const href = pathToFileURL(canonicalEntryPath).href;
+  const mtime = fs.statSync(canonicalEntryPath).mtimeMs;
+  const bareMtime = bareServerEntryMtimes.get(href);
+  if (bareMtime === undefined || bareMtime === mtime) {
+    bareServerEntryMtimes.set(href, mtime);
+    return href;
+  }
+  return `${href}?t=${mtime}`;
+}
+
+// oxlint-disable-next-line typescript/no-explicit-any -- built entry modules are untyped, matching the previous inline `await import(...)`
+export async function importServerEntryModule(entryPath: string): Promise<any> {
+  return import(resolveServerEntryImportUrl(entryPath));
+}
+
 /** Convert a Node.js IncomingMessage into a ReadableStream for Web Request body. */
-function readNodeStream(req: IncomingMessage): ReadableStream<Uint8Array> {
-  return new ReadableStream({
+export function readNodeStream(req: IncomingMessage): ReadableStream<Uint8Array> {
+  let cancelled = false;
+  let cleanup = () => {};
+
+  const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      req.on("data", (chunk: Buffer) => controller.enqueue(new Uint8Array(chunk)));
-      req.on("end", () => controller.close());
-      req.on("error", (err) => controller.error(err));
+      cleanup = () => {
+        req.off("data", onData);
+        req.off("end", onEnd);
+        req.off("error", onError);
+      };
+      const onData = (chunk: Buffer) => {
+        if (cancelled) return;
+        controller.enqueue(new Uint8Array(chunk));
+        if ((controller.desiredSize ?? 0) <= 0) req.pause();
+      };
+      const onEnd = () => {
+        cleanup();
+        if (!cancelled) controller.close();
+      };
+      const onError = (error: Error) => {
+        cleanup();
+        if (!cancelled) controller.error(error);
+      };
+
+      req.on("data", onData);
+      req.on("end", onEnd);
+      req.on("error", onError);
+      req.pause();
+    },
+    pull() {
+      if (!cancelled) req.resume();
+    },
+    cancel() {
+      cancelled = true;
+      cleanup();
+      req.resume();
     },
   });
+  return stream;
 }
 
 export type ProdServerOptions = {
@@ -335,6 +425,11 @@ function appendWebHeader(
   value: string | string[] | undefined,
 ): void {
   if (value === undefined) return;
+  // HTTP/2 requests expose RFC 7540 §8.1.2.1 pseudo-headers (`:method`,
+  // `:authority`, `:path`, `:scheme`) on `req.headers`. WHATWG `Headers`
+  // rejects any name containing `:`, so they must be dropped before building
+  // a `Headers` object. See: https://github.com/cloudflare/vinext/issues/2013
+  if (key.startsWith(":")) return;
   if (Array.isArray(value)) {
     for (const item of value) headers.append(key, item);
     return;
@@ -355,11 +450,22 @@ function nodeHeadersToWebHeaders(headersRecord: IncomingMessage["headers"]): Hea
 
 const NO_BODY_RESPONSE_STATUSES = new Set([204, 205, 304]);
 
+// Constant header-name sets for `omitHeadersCaseInsensitive`. Hoisted to module
+// scope so the `.map().toLowerCase()` + `Set` allocation happens once at module
+// load instead of per response. All entries must be lowercase; the static-file
+// header constant is already `x-vinext-static-file`.
+const OMIT_BODY_HEADERS: ReadonlySet<string> = new Set(["content-length", "content-type"]);
+const OMIT_STATIC_RESPONSE_HEADERS: ReadonlySet<string> = new Set([
+  VINEXT_STATIC_FILE_HEADER,
+  "content-encoding",
+  "content-length",
+  "content-type",
+]);
+
 function omitHeadersCaseInsensitive(
   headersRecord: Record<string, string | string[]>,
-  names: readonly string[],
+  targets: ReadonlySet<string>,
 ): Record<string, string | string[]> {
-  const targets = new Set(names.map((name) => name.toLowerCase()));
   const filtered: Record<string, string | string[]> = {};
   for (const [key, value] of Object.entries(headersRecord)) {
     if (targets.has(key.toLowerCase())) continue;
@@ -377,6 +483,15 @@ function matchesIfNoneMatchHeader(ifNoneMatch: string | undefined, etag: string)
     .some((value) => value === etag);
 }
 
+function installClientBuildManifestGlobals(
+  clientDir: string,
+  assetBase: string,
+  assetPrefix: string,
+): void {
+  const metadata = computeClientRuntimeMetadata({ clientDir, assetBase, assetPrefix });
+  globalThis.__VINEXT_LAZY_CHUNKS__ = metadata.lazyChunks;
+  globalThis.__VINEXT_DYNAMIC_PRELOADS__ = metadata.dynamicPreloads;
+}
 function isNoBodyResponseStatus(status: number): boolean {
   return NO_BODY_RESPONSE_STATUSES.has(status);
 }
@@ -442,10 +557,7 @@ function sendCompressed(
   const buf = typeof body === "string" ? Buffer.from(body) : body;
   const baseType = contentType.split(";")[0].trim();
   const encoding = compress ? negotiateEncoding(req) : null;
-  const headersWithoutBodyHeaders = omitHeadersCaseInsensitive(extraHeaders, [
-    "content-length",
-    "content-type",
-  ]);
+  const headersWithoutBodyHeaders = omitHeadersCaseInsensitive(extraHeaders, OMIT_BODY_HEADERS);
 
   const writeHead = (headers: Record<string, string | string[]>) => {
     if (statusText) {
@@ -796,13 +908,12 @@ function nodeToWebRequest(
   };
 
   if (hasBody) {
-    // Convert Node.js readable stream to Web ReadableStream for request body.
-    // Readable.toWeb() is available since Node.js 17.
-    init.body = Readable.toWeb(req) as ReadableStream;
+    init.body = readNodeStream(req);
     init.duplex = "half"; // Required for streaming request bodies
   }
 
-  return new Request(url, init);
+  const request = new Request(url, init);
+  return request;
 }
 
 /**
@@ -1112,7 +1223,7 @@ function readSsrManifest(clientDir: string): Record<string, string[]> {
 
 function installPagesClientAssetGlobals(options: {
   clientDir: string;
-  assetsSubdir: string;
+  assetPrefix: string;
   assetBase: string;
   clientEntryLookup: PagesClientEntryLookup;
 }): Record<string, string[]> {
@@ -1120,31 +1231,17 @@ function installPagesClientAssetGlobals(options: {
   globalThis.__VINEXT_SSR_MANIFEST__ =
     Object.keys(ssrManifest).length > 0 ? ssrManifest : undefined;
 
-  const buildManifest = readClientBuildManifest(
-    path.join(options.clientDir, ".vite", "manifest.json"),
-  );
-  const clientEntryManifest = readClientEntryManifest(options.clientDir);
-  const entryOptions = {
+  const metadata = computeClientRuntimeMetadata({
     clientDir: options.clientDir,
-    assetsSubdir: options.assetsSubdir,
     assetBase: options.assetBase,
-    ...(buildManifest ? { buildManifest } : {}),
-  };
-  globalThis.__VINEXT_CLIENT_ENTRY__ =
-    options.clientEntryLookup === "pages-client-entry"
-      ? (findPagesClientEntryFileFromVinextManifest(clientEntryManifest, options.assetBase) ??
-        findPagesClientEntryFile(entryOptions))
-      : (findClientEntryFileFromVinextManifest(clientEntryManifest, options.assetBase) ??
-        findClientEntryFile(entryOptions));
+    assetPrefix: options.assetPrefix,
+    includeClientEntry:
+      options.clientEntryLookup === "pages-client-entry" ? "pages-client-entry" : true,
+  });
 
-  if (buildManifest) {
-    const lazyChunks = computeLazyChunks(buildManifest).map((file) =>
-      manifestFileWithBase(file, options.assetBase),
-    );
-    globalThis.__VINEXT_LAZY_CHUNKS__ = lazyChunks.length > 0 ? lazyChunks : undefined;
-  } else {
-    globalThis.__VINEXT_LAZY_CHUNKS__ = undefined;
-  }
+  globalThis.__VINEXT_CLIENT_ENTRY__ = metadata.clientEntryFile;
+  globalThis.__VINEXT_LAZY_CHUNKS__ = metadata.lazyChunks;
+  globalThis.__VINEXT_DYNAMIC_PRELOADS__ = metadata.dynamicPreloads;
 
   return ssrManifest;
 }
@@ -1185,12 +1282,11 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   // Used to authenticate internal /__vinext/prerender/* HTTP endpoints.
   const prerenderSecret = readPrerenderSecret(path.dirname(rscEntryPath));
 
-  // Import the RSC handler (use file:// URL for reliable dynamic import).
-  // Cache-bust with mtime so that if this function is called multiple times
-  // (e.g. across test describe blocks that rebuild to the same path) Node's
-  // module cache does not return the stale module from a previous build.
-  const rscMtime = fs.statSync(rscEntryPath).mtimeMs;
-  const rscModule = await import(`${pathToFileURL(rscEntryPath).href}?t=${rscMtime}`);
+  // Import the RSC handler. importServerEntryModule uses the bare file://
+  // URL so lazy chunks that import the entry back resolve to the same module
+  // instance, and only cache-busts when this function runs again after a
+  // rebuild to the same path (e.g. across test describe blocks).
+  const rscModule = await importServerEntryModule(rscEntryPath);
   const rscHandler = resolveAppRouterHandler(rscModule.default);
 
   // `assetPrefix` is embedded as a compile-time constant in the generated
@@ -1217,10 +1313,12 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
   if (appRouterHasPagesDir) {
     installPagesClientAssetGlobals({
       clientDir,
-      assetsSubdir: resolveAssetsDir(appRouterAssetPrefix),
+      assetPrefix: appRouterAssetPrefix,
       assetBase: appAssetBase,
       clientEntryLookup: "pages-client-entry",
     });
+  } else {
+    installClientBuildManifestGlobals(clientDir, appAssetBase, appRouterAssetPrefix);
   }
 
   // Seed the memory cache with pre-rendered routes so the first request to
@@ -1321,8 +1419,11 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
     // serves the original file with cache headers and security headers)
     if (isImageOptimizationPath(pathname)) {
       const parsedUrl = new URL(rawUrl, "http://localhost");
-      const defaultAllowedWidths = [...DEFAULT_DEVICE_SIZES, ...DEFAULT_IMAGE_SIZES];
-      const params = parseImageParams(parsedUrl, defaultAllowedWidths);
+      const allowedWidths = [
+        ...(imageConfig?.deviceSizes ?? DEFAULT_DEVICE_SIZES),
+        ...(imageConfig?.imageSizes ?? DEFAULT_IMAGE_SIZES),
+      ];
+      const params = parseImageParams(parsedUrl, allowedWidths, imageConfig?.qualities);
       if (!params) {
         res.writeHead(400);
         res.end("Bad Request");
@@ -1385,7 +1486,7 @@ async function startAppRouterServer(options: AppRouterServerOptions) {
 
         const staticResponseHeaders = omitHeadersCaseInsensitive(
           mergeResponseHeaders({}, response),
-          [VINEXT_STATIC_FILE_HEADER, "content-encoding", "content-length", "content-type"],
+          OMIT_STATIC_RESPONSE_HEADERS,
         );
 
         const served = await tryServeStatic(
@@ -1485,11 +1586,11 @@ function readPagesServerEntryPageRoutes(value: unknown): PagesServerEntryPageRou
 async function startPagesRouterServer(options: PagesRouterServerOptions) {
   const { port, host, clientDir, serverEntryPath, compress, purpose } = options;
 
-  // Import the server entry module (use file:// URL for reliable dynamic import).
-  // Cache-bust with mtime so that rebuilds to the same output path always load
-  // the freshly built module rather than a stale cached copy.
-  const serverMtime = fs.statSync(serverEntryPath).mtimeMs;
-  const serverEntry = await import(`${pathToFileURL(serverEntryPath).href}?t=${serverMtime}`);
+  // Import the server entry module. importServerEntryModule uses the bare
+  // file:// URL so lazy chunks that import the entry back resolve to the same
+  // module instance, and only cache-busts when this function runs again after
+  // a rebuild to the same output path.
+  const serverEntry = await importServerEntryModule(serverEntryPath);
   const {
     renderPage,
     handleApiRoute: handleApi,
@@ -1532,6 +1633,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     ? {
         dangerouslyAllowSVG: vinextConfig.images.dangerouslyAllowSVG,
         dangerouslyAllowLocalIP: vinextConfig.images.dangerouslyAllowLocalIP,
+        qualities: vinextConfig.images.qualities,
         contentDispositionType: vinextConfig.images.contentDispositionType,
         contentSecurityPolicy: vinextConfig.images.contentSecurityPolicy,
       }
@@ -1542,7 +1644,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
   // Cloudflare builds inject into the Worker entry at build time.
   const ssrManifest = installPagesClientAssetGlobals({
     clientDir,
-    assetsSubdir: resolveAssetsDir(assetPrefix),
+    assetPrefix,
     assetBase,
     clientEntryLookup: "any-client-entry",
   });
@@ -1652,7 +1754,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
     // ── Image optimization passthrough ──────────────────────────────
     if (isImageOptimizationPath(pathname) || isImageOptimizationPath(staticLookupPath)) {
       const parsedUrl = new URL(rawUrl, "http://localhost");
-      const params = parseImageParams(parsedUrl, allowedImageWidths);
+      const params = parseImageParams(parsedUrl, allowedImageWidths, pagesImageConfig?.qualities);
       if (!params) {
         res.writeHead(400);
         res.end("Bad Request");
@@ -1716,6 +1818,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       // here — stale clients can fall back to a hard navigation without
       // accidentally triggering middleware/SSR on a bogus path.
       let isDataReq = false;
+      const originalRenderUrl = url;
       if (isNextDataPathname(pathname)) {
         const dataMatch = pagesBuildId ? parseNextDataPathname(pathname, pagesBuildId) : null;
         if (!dataMatch) {
@@ -1735,10 +1838,10 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const protocol = resolveRequestProtocol(req);
       const hostHeader = resolveHost(req, `${host}:${port}`);
       const rawReqHeaders = nodeHeadersToWebHeaders(req.headers);
-      // Capture `x-nextjs-data` before filterInternalHeaders strips it — the
-      // middleware redirect protocol needs to know whether the inbound request
-      // was a `_next/data` fetch to emit `x-nextjs-redirect` instead of a 3xx.
-      const isDataRequest = rawReqHeaders.get("x-nextjs-data") === "1";
+      // Only a successfully parsed `/_next/data/...json` URL is a data
+      // request. The inbound x-nextjs-data header is internal and must not let
+      // callers opt normal URLs into the data redirect protocol.
+      const isDataRequest = isDataReq;
       // Strip internal headers from inbound requests before any handler or
       // middleware sees them.
       const reqHeaders = filterInternalHeaders(rawReqHeaders);
@@ -1767,7 +1870,13 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
         // Raw query from req.url so redirect Locations aren't re-encoded by URL parsing.
         rawSearch: rawQs,
         matchPageRoute: matchPageRoute ?? null,
-        runMiddleware: typeof runMiddleware === "function" ? runMiddleware : null,
+        // Pass the original (pre-basePath-stripping) URL to middleware so that
+        // request.nextUrl.basePath reflects whether the URL actually had the
+        // basePath prefix (see wrapMiddlewareWithBasePath).
+        runMiddleware:
+          typeof runMiddleware === "function"
+            ? wrapMiddlewareWithBasePath(runMiddleware, basePath, hadBasePath)
+            : null,
         renderPage:
           typeof renderPage === "function"
             ? (
@@ -1775,7 +1884,11 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
                 resolvedUrl: string,
                 options?: PagesRenderOptions,
                 stagedHeaders?: Headers,
-              ) => renderPage(request, resolvedUrl, ssrManifest, undefined, stagedHeaders, options)
+              ) =>
+                renderPage(request, resolvedUrl, ssrManifest, undefined, stagedHeaders, {
+                  ...options,
+                  originalUrl: originalRenderUrl,
+                })
             : null,
         handleApi:
           typeof handleApi === "function"
@@ -1789,11 +1902,13 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
         // (/_next/static/*) were already served above. Middleware response headers
         // (including next.config headers staged by the pipeline) are passed through so
         // Set-Cookie / security headers from middleware are included in the response.
-        serveStaticFile: async (requestPathname, stagedHeaders) => {
+        serveFilesystemRoute: async (requestPathname, stagedHeaders, phase) => {
           if (
+            (req.method !== "GET" && req.method !== "HEAD") ||
             requestPathname === "/" ||
+            requestPathname === "/api" ||
             requestPathname.startsWith("/api/") ||
-            requestPathname.startsWith(`/${ASSET_PREFIX_URL_DIR}/`)
+            (phase === "direct" && requestPathname.startsWith(`/${ASSET_PREFIX_URL_DIR}/`))
           ) {
             return false;
           }
@@ -1812,7 +1927,7 @@ async function startPagesRouterServer(options: PagesRouterServerOptions) {
       const result = await runPagesRequest(webRequest, deps);
 
       if (result.type === "handled") {
-        // serveStaticFile already wrote the response to `res`.
+        // serveFilesystemRoute already wrote the response to `res`.
         return;
       }
 

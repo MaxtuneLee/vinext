@@ -210,6 +210,9 @@ describe("app page request helpers", () => {
         return sourceRoute;
       },
       isRscRequest: true,
+      resolveNavigationParams(_route, params) {
+        return { ...params, catchAll: ["photos", "123"] };
+      },
       renderInterceptResponse,
       searchParams: new URLSearchParams("from=feed"),
       setNavigationContext,
@@ -225,7 +228,7 @@ describe("app page request helpers", () => {
     expect(result.interceptOpts).toBeUndefined();
     expect(result.response).toBeInstanceOf(Response);
     expect(setNavigationContext).toHaveBeenCalledWith({
-      params: { id: "123" },
+      params: { id: "123", catchAll: ["photos", "123"] },
       pathname: "/photos/123",
       searchParams: new URLSearchParams("from=feed"),
     });
@@ -267,6 +270,9 @@ describe("app page request helpers", () => {
         return currentRoute;
       },
       isRscRequest: true,
+      resolveNavigationParams(_route, params) {
+        return params;
+      },
       async renderInterceptResponse() {
         throw new Error("should not render a separate intercept response");
       },
@@ -326,6 +332,41 @@ describe("app page request helpers", () => {
 
     expect(result.element).toBeNull();
     expect(result.response).toBe(boundaryResponse);
+  });
+
+  it("prefers an already-thrown page notFound over a later metadata notFound", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-thrown/metadata-thrown.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/metadata-thrown/metadata-thrown.test.ts
+    const pageError = { digest: "NEXT_HTTP_ERROR_FALLBACK;404" };
+    const metadataError = { digest: "NEXT_HTTP_ERROR_FALLBACK;404", fromMetadata: true };
+    const result = await buildAppPageElement({
+      async buildPageElement() {
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        throw metadataError;
+      },
+      async probePageSpecialError() {
+        return resolveAppPageSpecialError(pageError);
+      },
+      async renderErrorBoundaryPage() {
+        throw new Error("should not render boundary for special errors");
+      },
+      async renderSpecialError(specialError) {
+        return new Response(specialError.fromMetadata ? "metadata" : "page", {
+          status: specialError.statusCode,
+        });
+      },
+      resolveSpecialError(error) {
+        const specialError = resolveAppPageSpecialError(error);
+        if (specialError && error === metadataError) {
+          specialError.fromMetadata = true;
+        }
+        return specialError;
+      },
+    });
+
+    expect(result.element).toBeNull();
+    expect(result.response?.status).toBe(404);
+    await expect(result.response?.text()).resolves.toBe("page");
   });
 });
 

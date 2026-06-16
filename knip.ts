@@ -104,12 +104,6 @@ export default {
     // probed via require.resolve
     "next-intl",
 
-    // Optional peer dependency probed by tests/scss.test.ts.
-    "sass",
-
-    // Vite+ reporter name used outside CI in vite.config.ts.
-    "agent",
-
     // internal module name, not an actual dependency
     "private-next-instrumentation-client",
 
@@ -128,6 +122,7 @@ export default {
   ],
   ignoreFiles: [
     "tests/e2e/app-router/nextjs-compat/playwright.nextjs-compat.config.ts",
+    "tests/e2e/app-front-redirect-issue/fixture/**/*.{js,ts,tsx}",
     // stub module loaded via `path.resolve()` as a Vite alias target
     "packages/vinext/src/client/empty-module.ts",
   ],
