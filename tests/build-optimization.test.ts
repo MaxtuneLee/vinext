@@ -3345,13 +3345,44 @@ describe("createRscFrameworkChunkOutputConfig", () => {
     const config = createRscFrameworkChunkOutputConfig(7);
     expect(config).not.toHaveProperty("codeSplitting");
     expect(config).toHaveProperty("manualChunks");
-    const manualChunks = (config as { manualChunks: (id: string) => string | undefined })
-      .manualChunks;
-    expect(manualChunks("/app/node_modules/react/index.js")).toBe("framework");
-    expect(manualChunks("/app/node_modules/react-server-dom-webpack/client.js")).toBe("framework");
+    const manualChunks = (
+      config as {
+        manualChunks: (
+          id: string,
+          meta: {
+            getModuleInfo(id: string): { importers: string[]; isEntry: boolean } | null;
+          },
+        ) => string | undefined;
+      }
+    ).manualChunks;
+    const moduleInfo = new Map([
+      ["/app/src/entry.js", { importers: [], isEntry: true }],
+      ["/app/src/middleman.js", { importers: ["/app/src/entry.js"], isEntry: false }],
+      ["/app/src/lazy.js", { importers: [], isEntry: false }],
+      [
+        "/app/node_modules/react/index.js",
+        { importers: ["/app/src/middleman.js"], isEntry: false },
+      ],
+      [
+        "/app/node_modules/react-server-dom-webpack/client.js",
+        { importers: ["/app/src/entry.js"], isEntry: false },
+      ],
+      [
+        "/app/node_modules/react-dom/server.react-server.js",
+        { importers: ["/app/src/lazy.js"], isEntry: false },
+      ],
+    ]);
+    const meta = { getModuleInfo: (id: string) => moduleInfo.get(id) ?? null };
+    expect(manualChunks("/app/node_modules/react/index.js", meta)).toBe("framework");
+    expect(manualChunks("/app/node_modules/react-server-dom-webpack/client.js", meta)).toBe(
+      "framework",
+    );
+    expect(
+      manualChunks("/app/node_modules/react-dom/server.react-server.js", meta),
+    ).toBeUndefined();
     // Non-framework node_modules and local files are left to the default algo.
-    expect(manualChunks("/app/node_modules/react-icons/lib/index.js")).toBeUndefined();
-    expect(manualChunks("/app/src/page.tsx")).toBeUndefined();
+    expect(manualChunks("/app/node_modules/react-icons/lib/index.js", meta)).toBeUndefined();
+    expect(manualChunks("/app/src/page.tsx", meta)).toBeUndefined();
   });
 
   it("returns codeSplitting for Vite 8+ (Rolldown), not the deprecated advancedChunks", () => {
@@ -3360,14 +3391,26 @@ describe("createRscFrameworkChunkOutputConfig", () => {
     expect(config).not.toHaveProperty("manualChunks");
     expect(config).toEqual({
       codeSplitting: {
-        groups: [{ name: "framework", test: RSC_FRAMEWORK_CHUNK_TEST }],
+        groups: [
+          {
+            name: "framework",
+            test: RSC_FRAMEWORK_CHUNK_TEST,
+            entriesAware: true,
+          },
+        ],
       },
     });
 
     // Vite 9+ uses the same Rolldown shape.
     expect(createRscFrameworkChunkOutputConfig(9)).toEqual({
       codeSplitting: {
-        groups: [{ name: "framework", test: RSC_FRAMEWORK_CHUNK_TEST }],
+        groups: [
+          {
+            name: "framework",
+            test: RSC_FRAMEWORK_CHUNK_TEST,
+            entriesAware: true,
+          },
+        ],
       },
     });
   });
@@ -3383,6 +3426,8 @@ describe("RSC framework package matching", () => {
     "/app/node_modules/react-server-dom-webpack/client.js",
     // pnpm-style nested path.
     "/app/node_modules/.pnpm/react@19.0.0/node_modules/react/index.js",
+    // Windows-style path used by the Vite 7 getPackageName predicate.
+    "C:\\app\\node_modules\\react-dom\\server.js",
   ];
   const notMatching = [
     "/app/node_modules/react-icons/lib/index.js",
