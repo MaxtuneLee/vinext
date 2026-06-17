@@ -8,7 +8,6 @@ export type NegotiatedEncoding = ContentEncoding | "identity" | null;
 export type ParsedAcceptEncoding = {
   qualities: Map<string, number>;
   wildcardQuality: number | null;
-  implicitIdentityQuality: number;
 };
 
 const Q_VALUE = /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/;
@@ -17,7 +16,6 @@ const Q_VALUE = /^(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)$/;
 export function parseAcceptedEncodings(accept: string): ParsedAcceptEncoding {
   const qualities = new Map<string, number>();
   let wildcardQuality: number | null = null;
-  let implicitIdentityQuality = 1;
 
   for (const part of accept.toLowerCase().split(",")) {
     const trimmed = part.trim();
@@ -46,10 +44,9 @@ export function parseAcceptedEncodings(accept: string): ParsedAcceptEncoding {
     } else {
       qualities.set(token, Math.max(qualities.get(token) ?? 0, quality));
     }
-    implicitIdentityQuality = Math.min(implicitIdentityQuality, quality || 1);
   }
 
-  return { qualities, wildcardQuality, implicitIdentityQuality };
+  return { qualities, wildcardQuality };
 }
 
 /** Return the effective quality for a coding, including wildcard/identity rules. */
@@ -57,8 +54,8 @@ export function getEncodingQuality(parsed: ParsedAcceptEncoding, encoding: strin
   const normalized = encoding.toLowerCase();
   const explicit = parsed.qualities.get(normalized);
   if (explicit !== undefined) return explicit;
+  if (normalized === "identity") return parsed.wildcardQuality === 0 ? 0 : 1;
   if (parsed.wildcardQuality !== null) return parsed.wildcardQuality;
-  if (normalized === "identity") return parsed.implicitIdentityQuality;
   return 0;
 }
 

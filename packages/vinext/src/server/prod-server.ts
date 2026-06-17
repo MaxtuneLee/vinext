@@ -360,6 +360,26 @@ function omitHeadersCaseInsensitive(
   return filtered;
 }
 
+function mergeVaryHeader(
+  headers: Record<string, string | string[]>,
+  value: string,
+): Record<string, string | string[]> {
+  const merged = { ...headers };
+  const existingKey = Object.keys(merged).find((key) => key.toLowerCase() === "vary");
+  if (!existingKey) {
+    merged.Vary = value;
+    return merged;
+  }
+
+  const rawVary = merged[existingKey];
+  const existingVary = Array.isArray(rawVary) ? rawVary.join(", ") : rawVary;
+  const values = existingVary.split(",").map((entry) => entry.trim().toLowerCase());
+  if (!values.includes("*") && !values.includes(value.toLowerCase())) {
+    merged[existingKey] = `${existingVary}, ${value}`;
+  }
+  return merged;
+}
+
 function matchesIfNoneMatchHeader(ifNoneMatch: string | undefined, etag: string): boolean {
   if (!ifNoneMatch) return false;
   if (ifNoneMatch === "*") return true;
@@ -459,7 +479,7 @@ function sendCompressed(
 
   if (encoding === null) {
     writeHead(
-      { ...headersWithoutBodyHeaders, "Content-Length": "0", Vary: "Accept-Encoding" },
+      mergeVaryHeader({ ...headersWithoutBodyHeaders, "Content-Length": "0" }, "Accept-Encoding"),
       406,
       undefined,
     );
@@ -471,43 +491,34 @@ function sendCompressed(
       requestEncodingQuality(req, encoding) > requestEncodingQuality(req, "identity"))
   ) {
     const compressor = createCompressor(encoding);
-    // Merge Accept-Encoding into existing Vary header from extraHeaders instead
-    // of overwriting. Preserves Vary values set by the App Router for content
-    // negotiation (e.g. "RSC, Accept").
-    const rawVary = extraHeaders["Vary"] ?? extraHeaders["vary"];
-    const existingVary = Array.isArray(rawVary) ? rawVary.join(", ") : rawVary;
-    let varyValue: string;
-    if (existingVary) {
-      const existing = existingVary.toLowerCase();
-      varyValue = existing.includes("accept-encoding")
-        ? existingVary
-        : existingVary + ", Accept-Encoding";
-    } else {
-      varyValue = "Accept-Encoding";
-    }
-    writeHead({
-      ...headersWithoutBodyHeaders,
-      "Content-Type": contentType,
-      "Content-Encoding": encoding,
-      Vary: varyValue,
-    });
+    writeHead(
+      mergeVaryHeader(
+        {
+          ...headersWithoutBodyHeaders,
+          "Content-Type": contentType,
+          "Content-Encoding": encoding,
+        },
+        "Accept-Encoding",
+      ),
+    );
     compressor.end(buf);
     pipeline(compressor, res, () => {
       /* ignore pipeline errors on closed connections */
     });
-  } else if (!requestAcceptsIdentity(req)) {
+  } else if (compress && !requestAcceptsIdentity(req)) {
     writeHead(
-      { ...headersWithoutBodyHeaders, "Content-Length": "0", Vary: "Accept-Encoding" },
+      mergeVaryHeader({ ...headersWithoutBodyHeaders, "Content-Length": "0" }, "Accept-Encoding"),
       406,
       undefined,
     );
     res.end();
   } else {
-    writeHead({
+    const identityHeaders = {
       ...headersWithoutBodyHeaders,
       "Content-Type": contentType,
       "Content-Length": String(buf.length),
-    });
+    };
+    writeHead(compress ? mergeVaryHeader(identityHeaders, "Accept-Encoding") : identityHeaders);
     res.end(buf);
   }
 }
@@ -520,6 +531,17 @@ function requestEncodingQuality(req: IncomingMessage, encoding: string): number 
 
 function requestAcceptsIdentity(req: IncomingMessage): boolean {
   return requestEncodingQuality(req, "identity") > 0;
+}
+
+function requestAcceptsContentEncoding(req: IncomingMessage, contentEncoding: string): boolean {
+  const accept = req.headers["accept-encoding"];
+  if (typeof accept !== "string") return true;
+  const parsed = parseAcceptedEncodings(accept);
+  return contentEncoding
+    .split(",")
+    .map((encoding) => encoding.trim())
+    .filter(Boolean)
+    .every((encoding) => getEncodingQuality(parsed, encoding) > 0);
 }
 
 /**
@@ -570,22 +592,6 @@ async function tryServeStatic(
     const entry = cache.lookup(lookupPath);
     if (!entry) return false;
 
-    // 304 Not Modified: string compare against pre-computed ETag
-    const ifNoneMatch = req.headers["if-none-match"];
-    if (
-      responseStatus === 200 &&
-      typeof ifNoneMatch === "string" &&
-      matchesIfNoneMatchHeader(ifNoneMatch, entry.etag)
-    ) {
-      if (extraHeaders) {
-        res.writeHead(304, { ...entry.notModifiedHeaders, ...extraHeaders });
-      } else {
-        res.writeHead(304, entry.notModifiedHeaders);
-      }
-      res.end();
-      return true;
-    }
-
     // Pick the best precompressed variant: zstd → br → gzip → original.
     // Each variant has pre-computed headers — zero string building.
     // Encoding tokens are case-insensitive per RFC 9110, and we honor q=0
@@ -607,7 +613,7 @@ async function tryServeStatic(
     ];
     const selected = parsed ? selectAcceptedEncoding(parsed, availableVariants) : "identity";
     if (selected === null) {
-      res.writeHead(406, { Vary: "Accept-Encoding", ...extraHeaders });
+      res.writeHead(406, mergeVaryHeader({ ...extraHeaders }, "Accept-Encoding"));
       res.end();
       return true;
     }
@@ -620,11 +626,27 @@ async function tryServeStatic(
             ? entry.gz!
             : entry.original;
 
-    if (extraHeaders) {
-      res.writeHead(responseStatus, { ...variant.headers, ...extraHeaders });
-    } else {
-      res.writeHead(responseStatus, variant.headers);
+    const ifNoneMatch = req.headers["if-none-match"];
+    if (
+      responseStatus === 200 &&
+      typeof ifNoneMatch === "string" &&
+      matchesIfNoneMatchHeader(ifNoneMatch, entry.etag)
+    ) {
+      const notModifiedHeaders = mergeVaryHeader(
+        { ...entry.notModifiedHeaders, ...extraHeaders },
+        "Accept-Encoding",
+      );
+      if (selected !== "identity") notModifiedHeaders["Content-Encoding"] = selected;
+      res.writeHead(304, notModifiedHeaders);
+      res.end();
+      return true;
     }
+
+    const responseHeaders = { ...variant.headers, ...extraHeaders };
+    res.writeHead(
+      responseStatus,
+      compress ? mergeVaryHeader(responseHeaders, "Accept-Encoding") : responseHeaders,
+    );
 
     if (omitBody || req.method === "HEAD") {
       res.end();
@@ -684,29 +706,6 @@ async function tryServeStatic(
   const baseType = ct.split(";")[0].trim();
   const isCompressible = compress && COMPRESSIBLE_TYPES.has(baseType);
 
-  // 304 Not Modified — parity with the fast (cache) path.
-  // Include Vary: Accept-Encoding only when compress=true AND the content type
-  // is compressible. When compress=false (e.g. image optimization caller),
-  // Vary is intentionally omitted — matching the fast-path behaviour where
-  // compress=false also skips all compressed variants.
-  // Spreading undefined is a no-op in object literals (ES2018+).
-  const ifNoneMatch = req.headers["if-none-match"];
-  if (
-    responseStatus === 200 &&
-    typeof ifNoneMatch === "string" &&
-    matchesIfNoneMatchHeader(ifNoneMatch, etag)
-  ) {
-    const notModifiedHeaders: Record<string, string | string[]> = {
-      ETag: etag,
-      "Cache-Control": cacheControl,
-      ...(isCompressible ? { Vary: "Accept-Encoding" } : undefined),
-      ...extraHeaders,
-    };
-    res.writeHead(304, notModifiedHeaders);
-    res.end();
-    return true;
-  }
-
   const baseHeaders: Record<string, string | string[]> = {
     "Content-Type": ct,
     "Cache-Control": cacheControl,
@@ -717,18 +716,29 @@ async function tryServeStatic(
   if (isCompressible) {
     const encoding = negotiateEncoding(req);
     if (encoding === null) {
-      res.writeHead(406, { ...baseHeaders, Vary: "Accept-Encoding" });
+      res.writeHead(406, mergeVaryHeader(baseHeaders, "Accept-Encoding"));
+      res.end();
+      return true;
+    }
+    const ifNoneMatch = req.headers["if-none-match"];
+    if (
+      responseStatus === 200 &&
+      typeof ifNoneMatch === "string" &&
+      matchesIfNoneMatchHeader(ifNoneMatch, etag)
+    ) {
+      const notModifiedHeaders = mergeVaryHeader(baseHeaders, "Accept-Encoding");
+      if (encoding !== "identity") notModifiedHeaders["Content-Encoding"] = encoding;
+      res.writeHead(304, notModifiedHeaders);
       res.end();
       return true;
     }
     if (encoding !== "identity") {
       // Content-Length omitted intentionally: compressed size isn't known
       // ahead of time, so Node.js uses chunked transfer encoding.
-      res.writeHead(responseStatus, {
-        ...baseHeaders,
-        "Content-Encoding": encoding,
-        Vary: "Accept-Encoding",
-      });
+      res.writeHead(
+        responseStatus,
+        mergeVaryHeader({ ...baseHeaders, "Content-Encoding": encoding }, "Accept-Encoding"),
+      );
       if (omitBody || req.method === "HEAD") {
         res.end();
         return true;
@@ -746,16 +756,31 @@ async function tryServeStatic(
     }
   }
 
-  if (!requestAcceptsIdentity(req)) {
-    res.writeHead(406, { ...baseHeaders, Vary: "Accept-Encoding" });
+  if (compress && !requestAcceptsIdentity(req)) {
+    res.writeHead(406, mergeVaryHeader(baseHeaders, "Accept-Encoding"));
     res.end();
     return true;
   }
 
-  res.writeHead(responseStatus, {
+  const ifNoneMatch = req.headers["if-none-match"];
+  if (
+    responseStatus === 200 &&
+    typeof ifNoneMatch === "string" &&
+    matchesIfNoneMatchHeader(ifNoneMatch, etag)
+  ) {
+    res.writeHead(304, compress ? mergeVaryHeader(baseHeaders, "Accept-Encoding") : baseHeaders);
+    res.end();
+    return true;
+  }
+
+  const identityHeaders = {
     ...baseHeaders,
     "Content-Length": String(resolved.size),
-  });
+  };
+  res.writeHead(
+    responseStatus,
+    compress ? mergeVaryHeader(identityHeaders, "Accept-Encoding") : identityHeaders,
+  );
   if (omitBody || req.method === "HEAD") {
     res.end();
     return true;
@@ -891,28 +916,35 @@ async function sendWebResponse(
     }
   });
 
+  // Check if we should compress the response.
+  // Skip if the upstream already compressed (avoid double-compression).
+  const contentEncoding = webResponse.headers.get("content-encoding");
+  const alreadyEncoded = contentEncoding !== null;
+  if (contentEncoding && !requestAcceptsContentEncoding(req, contentEncoding)) {
+    cancelResponseBody(webResponse);
+    res.writeHead(406, mergeVaryHeader({}, "Accept-Encoding"));
+    res.end();
+    return;
+  }
   if (!webResponse.body) {
-    writeHead(nodeHeaders);
+    writeHead(alreadyEncoded ? mergeVaryHeader(nodeHeaders, "Accept-Encoding") : nodeHeaders);
     res.end();
     return;
   }
 
-  // Check if we should compress the response.
-  // Skip if the upstream already compressed (avoid double-compression).
-  const alreadyEncoded = webResponse.headers.has("content-encoding");
   const contentType = webResponse.headers.get("content-type") ?? "";
   const baseType = contentType.split(";")[0].trim();
   const encoding = compress && !alreadyEncoded ? negotiateEncoding(req) : "identity";
   if (encoding === null) {
     cancelResponseBody(webResponse);
-    res.writeHead(406, { Vary: "Accept-Encoding" });
+    res.writeHead(406, mergeVaryHeader({}, "Accept-Encoding"));
     res.end();
     return;
   }
   const shouldCompress = encoding !== "identity" && COMPRESSIBLE_TYPES.has(baseType);
-  if (!shouldCompress && !alreadyEncoded && !requestAcceptsIdentity(req)) {
+  if (compress && !shouldCompress && !alreadyEncoded && !requestAcceptsIdentity(req)) {
     cancelResponseBody(webResponse);
-    res.writeHead(406, { Vary: "Accept-Encoding" });
+    res.writeHead(406, mergeVaryHeader({}, "Accept-Encoding"));
     res.end();
     return;
   }
@@ -921,21 +953,11 @@ async function sendWebResponse(
     delete nodeHeaders["content-length"];
     delete nodeHeaders["Content-Length"];
     nodeHeaders["Content-Encoding"] = encoding!;
-    // Merge Accept-Encoding into existing Vary header (e.g. "RSC, Accept") instead
-    // of overwriting. This prevents stripping the Vary values that the App Router
-    // sets for content negotiation (RSC stream vs HTML).
-    const existingVary = nodeHeaders["Vary"] ?? nodeHeaders["vary"];
-    if (existingVary) {
-      const existing = String(existingVary).toLowerCase();
-      if (!existing.includes("accept-encoding")) {
-        nodeHeaders["Vary"] = existingVary + ", Accept-Encoding";
-      }
-    } else {
-      nodeHeaders["Vary"] = "Accept-Encoding";
-    }
   }
 
-  writeHead(nodeHeaders);
+  writeHead(
+    compress || alreadyEncoded ? mergeVaryHeader(nodeHeaders, "Accept-Encoding") : nodeHeaders,
+  );
 
   // HEAD requests: send headers only, skip the body
   if (req.method === "HEAD") {

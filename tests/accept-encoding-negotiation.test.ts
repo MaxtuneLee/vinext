@@ -75,14 +75,14 @@ describe("parseAcceptedEncodings", () => {
     expect(getEncodingQuality(parsed, "br")).toBe(0);
   });
 
-  it("applies wildcard quality to identity when identity is not explicit", () => {
+  it("does not apply positive wildcard quality to identity", () => {
     expect(getEncodingQuality(parseAcceptedEncodings("*;q=0"), "identity")).toBe(0);
-    expect(getEncodingQuality(parseAcceptedEncodings("*;q=0.4"), "identity")).toBe(0.4);
+    expect(getEncodingQuality(parseAcceptedEncodings("*;q=0.4"), "identity")).toBe(1);
   });
 
-  it("gives implicit identity the lowest positive listed quality without a wildcard", () => {
+  it("gives implicit identity quality one without a wildcard", () => {
     const parsed = parseAcceptedEncodings("gzip;q=0.8, br;q=0.2");
-    expect(getEncodingQuality(parsed, "identity")).toBe(0.2);
+    expect(getEncodingQuality(parsed, "identity")).toBe(1);
   });
 });
 
@@ -93,7 +93,7 @@ describe("selectAcceptedEncoding", () => {
   });
 
   it("uses available order as the tie-breaker", () => {
-    const parsed = parseAcceptedEncodings("gzip;q=0.5, br;q=0.5");
+    const parsed = parseAcceptedEncodings("gzip;q=0.5, br;q=0.5, identity;q=0.5");
     expect(selectAcceptedEncoding(parsed, ["br", "gzip", "identity"])).toBe("br");
   });
 
@@ -110,11 +110,11 @@ describe("negotiateEncoding", () => {
 
   it("honors unequal positive client preferences", () => {
     expect(negotiateEncoding(reqWith("gzip;q=1, br;q=0.1"))).toBe("gzip");
-    expect(negotiateEncoding(reqWith("br;q=0.5, gzip;q=0.9"))).toBe("gzip");
+    expect(negotiateEncoding(reqWith("br;q=0.5, gzip;q=0.9"))).toBe("identity");
   });
 
   it("uses server preference when client qualities tie", () => {
-    expect(negotiateEncoding(reqWith("gzip;q=0.5, br;q=0.5"))).toBe("br");
+    expect(negotiateEncoding(reqWith("gzip;q=0.5, br;q=0.5, identity;q=0.5"))).toBe("br");
   });
 
   it("honors explicit refusals and exact matching", () => {
@@ -124,7 +124,7 @@ describe("negotiateEncoding", () => {
 
   it("honors wildcard quality and explicit overrides", () => {
     expect(negotiateEncoding(reqWith("*"))).toBe(HAS_ZSTD ? "zstd" : "br");
-    expect(negotiateEncoding(reqWith("*;q=0.8, br;q=0"))).toBe(HAS_ZSTD ? "zstd" : "gzip");
+    expect(negotiateEncoding(reqWith("*;q=0.8, br;q=0"))).toBe("identity");
     expect(negotiateEncoding(reqWith("*;q=0, gzip"))).toBe("gzip");
   });
 
@@ -139,8 +139,8 @@ describe("negotiateEncoding", () => {
 
   if (HAS_ZSTD) {
     it("includes zstd in quality negotiation when supported", () => {
-      expect(negotiateEncoding(reqWith("zstd;q=0.2, gzip;q=0.9"))).toBe("gzip");
-      expect(negotiateEncoding(reqWith("zstd;q=0.9, br;q=0.8"))).toBe("zstd");
+      expect(negotiateEncoding(reqWith("zstd;q=0.2, gzip;q=0.9, identity;q=0"))).toBe("gzip");
+      expect(negotiateEncoding(reqWith("zstd;q=0.9, br;q=0.8, identity;q=0"))).toBe("zstd");
     });
   }
 });

@@ -605,7 +605,7 @@ describe("tryServeStatic (with StaticFileCache)", () => {
     );
 
     const cache = await StaticFileCache.create(clientDir);
-    const req = mockReq("*;q=0.8, br;q=0.");
+    const req = mockReq("*;q=0.8, br;q=0., identity;q=0.2");
     const { res, captured } = mockRes();
 
     await tryServeStatic(req, res, clientDir, "/_next/static/trailing-dot-kkk111.js", true, cache);
@@ -641,6 +641,61 @@ describe("tryServeStatic (with StaticFileCache)", () => {
     expect(captured.status).toBe(406);
     expect(captured.headers.Vary).toBe("Accept-Encoding");
     expect(captured.body).toHaveLength(0);
+  });
+
+  it("merges Accept-Encoding into Vary on a cached 406 response", async () => {
+    const jsContent = "const vary406 = true;\n".repeat(200);
+    await writeFile(clientDir, "_next/static/vary-406-mmm333.js", jsContent);
+    const cache = await StaticFileCache.create(clientDir);
+    const req = mockReq("*;q=0");
+    const { res, captured } = mockRes();
+
+    await tryServeStatic(req, res, clientDir, "/_next/static/vary-406-mmm333.js", true, cache, {
+      Vary: "RSC",
+    });
+
+    await captured.ended;
+    expect(captured.status).toBe(406);
+    expect(captured.headers.Vary).toBe("RSC, Accept-Encoding");
+  });
+
+  it("serves cached identity with Vary when it outranks an encoded variant", async () => {
+    const jsContent = "const identityPreferred = true;\n".repeat(200);
+    await writeFile(clientDir, "_next/static/identity-nnn444.js", jsContent);
+    await writeFile(
+      clientDir,
+      "_next/static/identity-nnn444.js.br",
+      zlib.brotliCompressSync(Buffer.from(jsContent)),
+    );
+    const cache = await StaticFileCache.create(clientDir);
+    const req = mockReq("br;q=0.5");
+    const { res, captured } = mockRes();
+
+    await tryServeStatic(req, res, clientDir, "/_next/static/identity-nnn444.js", true, cache);
+
+    await captured.ended;
+    expect(captured.status).toBe(200);
+    expect(captured.headers["Content-Encoding"]).toBeUndefined();
+    expect(captured.headers.Vary).toBe("Accept-Encoding");
+    expect(captured.body.toString()).toBe(jsContent);
+  });
+
+  it("checks cached representation acceptability before returning 304", async () => {
+    const relativePath = "_next/static/conditional-ooo555.js";
+    await writeFile(clientDir, relativePath, "conditional cached");
+    const cache = await StaticFileCache.create(clientDir);
+    const firstReq = mockReq();
+    const { res: firstRes, captured: firstCaptured } = mockRes();
+    await tryServeStatic(firstReq, firstRes, clientDir, `/${relativePath}`, true, cache);
+    await firstCaptured.ended;
+
+    const req = mockReq("*;q=0", { "if-none-match": firstCaptured.headers.ETag as string });
+    const { res, captured } = mockRes();
+    await tryServeStatic(req, res, clientDir, `/${relativePath}`, true, cache);
+
+    await captured.ended;
+    expect(captured.status).toBe(406);
+    expect(captured.headers.Vary).toBe("Accept-Encoding");
   });
 
   // ── Slow path (no cache) ───────────────────────────────────────
@@ -934,6 +989,18 @@ describe("tryServeStatic (with StaticFileCache)", () => {
     await captured.ended;
     expect(captured.status).toBe(304);
     expect(captured.headers["Vary"]).toBe("Accept-Encoding");
+  });
+
+  it("checks slow-path representation acceptability before returning 304", async () => {
+    await writeFile(clientDir, "_next/static/conditional-slow-pqr678.js", "conditional slow");
+    const req = mockReq("*;q=0", { "if-none-match": 'W/"pqr678"' });
+    const { res, captured } = mockRes();
+
+    await tryServeStatic(req, res, clientDir, "/_next/static/conditional-slow-pqr678.js", true);
+
+    await captured.ended;
+    expect(captured.status).toBe(406);
+    expect(captured.headers.Vary).toBe("Accept-Encoding");
   });
 
   it("slow path 304 omits Vary for non-compressible content (compress=false)", async () => {

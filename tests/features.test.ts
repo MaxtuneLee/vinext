@@ -4133,6 +4133,7 @@ describe("production server compression", () => {
 
     // PNG should not be compressed
     expect(writtenHeaders["Content-Encoding"]).toBeUndefined();
+    expect(writtenHeaders["Vary"]).toBe("Accept-Encoding");
   });
 });
 
@@ -4396,6 +4397,53 @@ describe("Set-Cookie header preservation in prod-server", () => {
     expect(ended).toBe(true);
     expect(chunks).toEqual([]);
     expect(canceled).toBe(true);
+  });
+
+  it("sendWebResponse rejects an upstream encoding refused by the client", async () => {
+    const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
+    const response = new Response("encoded", {
+      headers: {
+        "content-encoding": "br",
+        "content-type": "text/html; charset=utf-8",
+      },
+    });
+    const req = {
+      method: "GET",
+      headers: { "accept-encoding": "gzip, br;q=0, identity;q=0" },
+    };
+    const res = new CapturingNodeResponse();
+    const chunks: Buffer[] = [];
+    res.on("data", (chunk: Buffer) => chunks.push(Buffer.from(chunk)));
+
+    await sendWebResponse(response, req as any, res as any, true);
+    await finished(res);
+
+    expect(res.statusCode).toBe(406);
+    expect(res.headers["Vary"]).toBe("Accept-Encoding");
+    expect(chunks).toEqual([]);
+  });
+
+  it("sendWebResponse varies identity responses by Accept-Encoding", async () => {
+    const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
+    const response = new Response("small", {
+      headers: {
+        "content-type": "text/html; charset=utf-8",
+        vary: "RSC",
+      },
+    });
+    const req = {
+      method: "GET",
+      headers: { "accept-encoding": "br;q=0.5" },
+    };
+    const res = new CapturingNodeResponse();
+    res.resume();
+
+    await sendWebResponse(response, req as any, res as any, true);
+    await finished(res);
+
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["content-encoding"]).toBeUndefined();
+    expect(res.headers.vary).toBe("RSC, Accept-Encoding");
   });
 
   it("sendWebResponse cancels compressed streams on client disconnect", async () => {
