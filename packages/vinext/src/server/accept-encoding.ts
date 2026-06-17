@@ -1,7 +1,7 @@
 import zlib from "node:zlib";
 import { type IncomingMessage } from "node:http";
 
-export type ContentEncoding = "zstd" | "br" | "gzip" | "deflate";
+type ContentEncoding = "zstd" | "br" | "gzip" | "deflate";
 export type NegotiatedEncoding = ContentEncoding | "identity" | null;
 
 /** Parsed explicit coding qualities plus the wildcard quality, when present. */

@@ -4001,10 +4001,10 @@ describe("production server compression", () => {
     expect(negotiateEncoding(req as any)).toBe("gzip");
   });
 
-  it("negotiateEncoding returns null when no encoding header", async () => {
+  it("negotiateEncoding returns identity when no encoding header", async () => {
     const { negotiateEncoding } = await import("../packages/vinext/src/server/prod-server.js");
     const req = { headers: {} };
-    expect(negotiateEncoding(req as any)).toBeNull();
+    expect(negotiateEncoding(req as any)).toBe("identity");
   });
 
   it("COMPRESSIBLE_TYPES includes expected content types", async () => {
