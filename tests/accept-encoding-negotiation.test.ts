@@ -16,7 +16,7 @@ import {
   parseAcceptedEncodings,
   isEncodingAccepted,
   negotiateEncoding,
-} from "../packages/vinext/src/server/prod-server.js";
+} from "../packages/vinext/src/server/accept-encoding.js";
 
 const HAS_ZSTD = typeof zlib.createZstdCompress === "function";
 
