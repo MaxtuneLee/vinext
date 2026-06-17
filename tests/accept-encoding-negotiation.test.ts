@@ -11,14 +11,12 @@
  */
 import { describe, it, expect } from "vite-plus/test";
 import type { IncomingMessage } from "node:http";
-import zlib from "node:zlib";
 import {
   parseAcceptedEncodings,
   isEncodingAccepted,
   negotiateEncoding,
+  HAS_ZSTD,
 } from "../packages/vinext/src/server/accept-encoding.js";
-
-const HAS_ZSTD = typeof zlib.createZstdCompress === "function";
 
 function reqWith(acceptEncoding?: string): IncomingMessage {
   const headers: Record<string, string> = {};
