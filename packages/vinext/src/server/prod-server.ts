@@ -79,9 +79,10 @@ import {
   resolveRequestHost as resolveHost,
 } from "./proxy-trust.js";
 import {
-  isEncodingAccepted,
+  getEncodingQuality,
   negotiateEncoding,
   parseAcceptedEncodings,
+  selectAcceptedEncoding,
 } from "./accept-encoding.js";
 
 /**
@@ -441,18 +442,34 @@ function sendCompressed(
 ): void {
   const buf = typeof body === "string" ? Buffer.from(body) : body;
   const baseType = contentType.split(";")[0].trim();
-  const encoding = compress ? negotiateEncoding(req) : null;
+  const encoding = compress ? negotiateEncoding(req) : "identity";
   const headersWithoutBodyHeaders = omitHeadersCaseInsensitive(extraHeaders, OMIT_BODY_HEADERS);
 
-  const writeHead = (headers: Record<string, string | string[]>) => {
-    if (statusText) {
-      res.writeHead(statusCode, statusText, headers);
+  const writeHead = (
+    headers: Record<string, string | string[]>,
+    responseStatus = statusCode,
+    responseStatusText = statusText,
+  ) => {
+    if (responseStatusText) {
+      res.writeHead(responseStatus, responseStatusText, headers);
     } else {
-      res.writeHead(statusCode, headers);
+      res.writeHead(responseStatus, headers);
     }
   };
 
-  if (encoding && COMPRESSIBLE_TYPES.has(baseType) && buf.length >= COMPRESS_THRESHOLD) {
+  if (encoding === null) {
+    writeHead(
+      { ...headersWithoutBodyHeaders, "Content-Length": "0", Vary: "Accept-Encoding" },
+      406,
+      undefined,
+    );
+    res.end();
+  } else if (
+    encoding !== "identity" &&
+    COMPRESSIBLE_TYPES.has(baseType) &&
+    (buf.length >= COMPRESS_THRESHOLD ||
+      requestEncodingQuality(req, encoding) > requestEncodingQuality(req, "identity"))
+  ) {
     const compressor = createCompressor(encoding);
     // Merge Accept-Encoding into existing Vary header from extraHeaders instead
     // of overwriting. Preserves Vary values set by the App Router for content
@@ -478,6 +495,13 @@ function sendCompressed(
     pipeline(compressor, res, () => {
       /* ignore pipeline errors on closed connections */
     });
+  } else if (!requestAcceptsIdentity(req)) {
+    writeHead(
+      { ...headersWithoutBodyHeaders, "Content-Length": "0", Vary: "Accept-Encoding" },
+      406,
+      undefined,
+    );
+    res.end();
   } else {
     writeHead({
       ...headersWithoutBodyHeaders,
@@ -486,6 +510,16 @@ function sendCompressed(
     });
     res.end(buf);
   }
+}
+
+function requestEncodingQuality(req: IncomingMessage, encoding: string): number {
+  const accept = req.headers["accept-encoding"];
+  if (typeof accept !== "string") return encoding === "identity" ? 1 : 0;
+  return getEncodingQuality(parseAcceptedEncodings(accept), encoding);
+}
+
+function requestAcceptsIdentity(req: IncomingMessage): boolean {
+  return requestEncodingQuality(req, "identity") > 0;
 }
 
 /**
@@ -565,12 +599,26 @@ async function tryServeStatic(
     // The HAS_ZSTD guard only matters for the slow-path's on-the-fly compression.
     const rawAe = compress ? req.headers["accept-encoding"] : undefined;
     const parsed = typeof rawAe === "string" ? parseAcceptedEncodings(rawAe) : undefined;
-    const variant = parsed
-      ? (isEncodingAccepted(parsed, "zstd") && entry.zst) ||
-        (isEncodingAccepted(parsed, "br") && entry.br) ||
-        (isEncodingAccepted(parsed, "gzip") && entry.gz) ||
-        entry.original
-      : entry.original;
+    const availableVariants = [
+      ...(entry.zst ? (["zstd"] as const) : []),
+      ...(entry.br ? (["br"] as const) : []),
+      ...(entry.gz ? (["gzip"] as const) : []),
+      "identity",
+    ];
+    const selected = parsed ? selectAcceptedEncoding(parsed, availableVariants) : "identity";
+    if (selected === null) {
+      res.writeHead(406, { Vary: "Accept-Encoding", ...extraHeaders });
+      res.end();
+      return true;
+    }
+    const variant =
+      selected === "zstd"
+        ? entry.zst!
+        : selected === "br"
+          ? entry.br!
+          : selected === "gzip"
+            ? entry.gz!
+            : entry.original;
 
     if (extraHeaders) {
       res.writeHead(responseStatus, { ...variant.headers, ...extraHeaders });
@@ -668,7 +716,12 @@ async function tryServeStatic(
 
   if (isCompressible) {
     const encoding = negotiateEncoding(req);
-    if (encoding) {
+    if (encoding === null) {
+      res.writeHead(406, { ...baseHeaders, Vary: "Accept-Encoding" });
+      res.end();
+      return true;
+    }
+    if (encoding !== "identity") {
       // Content-Length omitted intentionally: compressed size isn't known
       // ahead of time, so Node.js uses chunked transfer encoding.
       res.writeHead(responseStatus, {
@@ -691,6 +744,12 @@ async function tryServeStatic(
       });
       return true;
     }
+  }
+
+  if (!requestAcceptsIdentity(req)) {
+    res.writeHead(406, { ...baseHeaders, Vary: "Accept-Encoding" });
+    res.end();
+    return true;
   }
 
   res.writeHead(responseStatus, {
@@ -843,8 +902,20 @@ async function sendWebResponse(
   const alreadyEncoded = webResponse.headers.has("content-encoding");
   const contentType = webResponse.headers.get("content-type") ?? "";
   const baseType = contentType.split(";")[0].trim();
-  const encoding = compress && !alreadyEncoded ? negotiateEncoding(req) : null;
-  const shouldCompress = !!(encoding && COMPRESSIBLE_TYPES.has(baseType));
+  const encoding = compress && !alreadyEncoded ? negotiateEncoding(req) : "identity";
+  if (encoding === null) {
+    cancelResponseBody(webResponse);
+    res.writeHead(406, { Vary: "Accept-Encoding" });
+    res.end();
+    return;
+  }
+  const shouldCompress = encoding !== "identity" && COMPRESSIBLE_TYPES.has(baseType);
+  if (!shouldCompress && !alreadyEncoded && !requestAcceptsIdentity(req)) {
+    cancelResponseBody(webResponse);
+    res.writeHead(406, { Vary: "Accept-Encoding" });
+    res.end();
+    return;
+  }
 
   if (shouldCompress) {
     delete nodeHeaders["content-length"];

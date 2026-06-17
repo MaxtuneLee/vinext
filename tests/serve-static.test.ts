@@ -566,6 +566,83 @@ describe("tryServeStatic (with StaticFileCache)", () => {
     expect(captured.headers["Content-Encoding"]).toBe("br");
   });
 
+  it("prefers the available variant with the highest client q-value", async () => {
+    const jsContent = "const weighted = true;\n".repeat(200);
+    await writeFile(clientDir, "_next/static/weighted-jjj000.js", jsContent);
+    await writeFile(
+      clientDir,
+      "_next/static/weighted-jjj000.js.br",
+      zlib.brotliCompressSync(Buffer.from(jsContent)),
+    );
+    await writeFile(
+      clientDir,
+      "_next/static/weighted-jjj000.js.gz",
+      zlib.gzipSync(Buffer.from(jsContent)),
+    );
+
+    const cache = await StaticFileCache.create(clientDir);
+    const req = mockReq("br;q=0.1, gzip;q=1");
+    const { res, captured } = mockRes();
+
+    await tryServeStatic(req, res, clientDir, "/_next/static/weighted-jjj000.js", true, cache);
+
+    await captured.ended;
+    expect(captured.headers["Content-Encoding"]).toBe("gzip");
+  });
+
+  it("honors an RFC-valid trailing-dot refusal over a wildcard", async () => {
+    const jsContent = "const trailingDot = true;\n".repeat(200);
+    await writeFile(clientDir, "_next/static/trailing-dot-kkk111.js", jsContent);
+    await writeFile(
+      clientDir,
+      "_next/static/trailing-dot-kkk111.js.br",
+      zlib.brotliCompressSync(Buffer.from(jsContent)),
+    );
+    await writeFile(
+      clientDir,
+      "_next/static/trailing-dot-kkk111.js.gz",
+      zlib.gzipSync(Buffer.from(jsContent)),
+    );
+
+    const cache = await StaticFileCache.create(clientDir);
+    const req = mockReq("*;q=0.8, br;q=0.");
+    const { res, captured } = mockRes();
+
+    await tryServeStatic(req, res, clientDir, "/_next/static/trailing-dot-kkk111.js", true, cache);
+
+    await captured.ended;
+    expect(captured.headers["Content-Encoding"]).toBe("gzip");
+  });
+
+  it("returns 406 when every available representation is refused", async () => {
+    const jsContent = "const unacceptable = true;\n".repeat(200);
+    await writeFile(clientDir, "_next/static/unacceptable-lll222.js", jsContent);
+    await writeFile(
+      clientDir,
+      "_next/static/unacceptable-lll222.js.br",
+      zlib.brotliCompressSync(Buffer.from(jsContent)),
+    );
+
+    const cache = await StaticFileCache.create(clientDir);
+    const req = mockReq("*;q=0");
+    const { res, captured } = mockRes();
+
+    const served = await tryServeStatic(
+      req,
+      res,
+      clientDir,
+      "/_next/static/unacceptable-lll222.js",
+      true,
+      cache,
+    );
+
+    await captured.ended;
+    expect(served).toBe(true);
+    expect(captured.status).toBe(406);
+    expect(captured.headers.Vary).toBe("Accept-Encoding");
+    expect(captured.body).toHaveLength(0);
+  });
+
   // ── Slow path (no cache) ───────────────────────────────────────
 
   it("slow path serves static file without cache", async () => {
