@@ -206,6 +206,7 @@ import fs from "node:fs";
 import { createHash, randomBytes, randomUUID } from "node:crypto";
 import commonjs from "vite-plugin-commonjs";
 import { normalizePathSeparators, stripJsExtension, stripViteModuleQuery } from "./utils/path.js";
+import { escapeRegExp } from "./utils/regex.js";
 import {
   getDepOptimizeNodeEnvOptions,
   getViteMajorVersion,
@@ -221,6 +222,11 @@ import {
 installSocketErrorBackstop();
 
 type ASTNode = ReturnType<typeof parseAst>["body"][number]["parent"];
+
+function getCacheDirPrefix(cacheDir: string): string {
+  const normalizedCacheDir = normalizePathSeparators(cacheDir);
+  return normalizedCacheDir.endsWith("/") ? normalizedCacheDir : `${normalizedCacheDir}/`;
+}
 
 function isInsideDirectory(dir: string, filePath: string): boolean {
   const relativePath = path.relative(dir, filePath);
@@ -844,6 +850,10 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   // `configResolved` binds the resolved config, so multiple vinext builds in
   // one process never preprocess `composes` deps with another build's config.
   const sassComposesLoader = createSassAwareFileSystemLoader();
+
+  // Populated from the resolved Vite config before transform filters are
+  // compiled, while keeping the filter object referenced by the plugin stable.
+  const typeofWindowIdFilter = { exclude: /(?!)/ };
 
   // Build-time layout classification manifest, captured in the RSC virtual
   // module's load hook and consumed in renderChunk to patch the generated
@@ -2503,6 +2513,9 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       },
 
       async configResolved(config) {
+        const cacheDirPrefix = getCacheDirPrefix(config.cacheDir);
+        typeofWindowIdFilter.exclude = new RegExp(`^${escapeRegExp(cacheDirPrefix)}`);
+
         // Provide the resolved config to the Sass-aware CSS Modules Loader so
         // it can call Vite's `preprocessCSS` when processing SCSS files
         // referenced by `composes: className from './file.module.scss'`.
@@ -4365,8 +4378,15 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
       name: "vinext:typeof-window",
       enforce: "post",
       transform: {
-        filter: { code: /typeof\s+window/ },
-        handler(code) {
+        filter: {
+          id: typeofWindowIdFilter,
+          code: /typeof\s+window/,
+        },
+        handler(code, id) {
+          const cacheDirPrefix = getCacheDirPrefix(this.environment.config.cacheDir);
+          if (normalizePathSeparators(id).startsWith(cacheDirPrefix)) {
+            return null;
+          }
           return replaceTypeofWindow(code, getTypeofWindowReplacement(this.environment));
         },
       },
