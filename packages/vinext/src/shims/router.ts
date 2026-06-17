@@ -78,6 +78,7 @@ import {
   setStampInitialHistoryState,
 } from "./pages-router-runtime.js";
 import { assertSafeNavigationUrl } from "./url-safety.js";
+import { interpolateAs } from "./internal/interpolate-as.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
 import { getDeploymentId, NEXT_DEPLOYMENT_ID_HEADER } from "../utils/deployment-id.js";
 
@@ -2439,19 +2440,90 @@ async function performNavigation(
 
   resolved = normalizePathTrailingSlash(resolved, __trailingSlash);
   resolvedRoute = normalizePathTrailingSlash(resolvedRoute, __trailingSlash);
+  // Bracket-pattern interpolation: callers that bypass <Link> (e.g.
+  // `Router.push("/posts/[id]", "/posts/1")` or
+  // `Router.push({pathname:"/posts/[id]", query:{id:1}})`) can hand us a route
+  // URL whose pathname still contains `[id]` placeholders. The data endpoint
+  // (`_next/data/<id>/posts/[id].json`) and HTML endpoint (`/posts/[id]`)
+  // both 404 on those literal characters, so project the brackets back into
+  // concrete values before deriving the fetch target. Mirrors Next.js
+  // `Router.change()` which runs `interpolateAs(route, asPathname, query)`
+  // for the same reason (packages/next/src/shared/lib/router/router.ts L987+).
+  //
+  // Match-source priority: `as` first (extracts param values from the
+  // resolved display URL), query second (object-form callers passing
+  // `{pathname, query}`). When neither yields all required params, fall back
+  // to the display URL — the user's typical intent for a literal bracket
+  // pathname is "navigate to the address as written", and `resolved` is the
+  // best concrete URL we have.
+  let interpolatedRoute = resolvedRoute;
+  if (resolvedRoute.includes("[")) {
+    const routePathname = stripHash(resolvedRoute).split("?", 1)[0];
+    const asPathname = stripHash(resolved).split("?", 1)[0];
+    const query: Record<string, string | string[]> = {};
+    if (typeof url !== "string" && url.query) {
+      for (const [k, v] of Object.entries(url.query)) {
+        if (v === undefined) continue;
+        query[k] = Array.isArray(v) ? v.map(String) : String(v);
+      }
+    } else {
+      const searchIdx = resolvedRoute.indexOf("?");
+      if (searchIdx !== -1) {
+        const search = stripHash(resolvedRoute.slice(searchIdx + 1));
+        for (const [k, v] of new URLSearchParams(search)) {
+          const existing = query[k];
+          if (existing === undefined) query[k] = v;
+          else if (Array.isArray(existing)) existing.push(v);
+          else query[k] = [existing, v];
+        }
+      }
+    }
+    const { result, params: consumedParams } = interpolateAs(routePathname, asPathname, query);
+    if (result) {
+      const tail = resolvedRoute.slice(routePathname.length);
+      interpolatedRoute = `${result}${tail}`;
+
+      // No-mask case: caller didn't pass `as`, so the address bar would
+      // otherwise show the literal bracket pathname. Reproject `resolved` /
+      // `full` against the interpolated pathname, dropping query keys that
+      // were consumed by path params — matches upstream Next.js Router.change
+      // which rebuilds `as` from `interpolatedAs.result` + `omit(query, params)`.
+      if (as === undefined && asPathname === routePathname) {
+        const remaining = new URLSearchParams();
+        const consumed = new Set(consumedParams);
+        for (const [k, v] of Object.entries(query)) {
+          if (consumed.has(k)) continue;
+          if (Array.isArray(v)) v.forEach((entry) => remaining.append(k, entry));
+          else remaining.append(k, v);
+        }
+        const searchStr = remaining.toString();
+        const hashStr = extractHash(resolved);
+        resolved = normalizePathTrailingSlash(
+          `${result}${searchStr ? `?${searchStr}` : ""}${hashStr}`,
+          __trailingSlash,
+        );
+      }
+    } else {
+      // Required params missing — `resolved` (display URL) is the best
+      // concrete URL we can use. Matches the pre-mask behaviour and avoids
+      // serving a 404 from the data endpoint.
+      interpolatedRoute = resolved;
+    }
+  }
+  // Recompute `full` after potential `resolved` rewrite above. Cheap when
+  // unchanged; correctness-critical when bracket interpolation rewrote it.
   const full = normalizePathTrailingSlash(
     toBrowserNavigationHref(resolved, window.location.href, __basePath),
     __trailingSlash,
   );
-  // When `url` is a plain string AND the route differs from the display URL,
-  // fetch HTML/data by the route URL — not the masked address. UrlObject
-  // values may carry route patterns with brackets (e.g. "/posts/[id]") which
-  // cannot be served directly, so for those the caller must already supply
-  // a resolvable `as`; we fall back to `full` in that case.
+  // When the (now concrete) route differs from the display URL, fetch HTML/
+  // data by the route URL — not the masked address — so the page module that
+  // actually renders is the one fetched. When they match (no mask) this is a
+  // no-op and `fullRouteUrl === full`.
   const fullRouteUrl =
-    typeof url === "string" && resolvedRoute !== resolved
+    interpolatedRoute !== resolved
       ? normalizePathTrailingSlash(
-          toBrowserNavigationHref(resolvedRoute, window.location.href, __basePath),
+          toBrowserNavigationHref(interpolatedRoute, window.location.href, __basePath),
           __trailingSlash,
         )
       : full;
@@ -2489,7 +2561,7 @@ async function performNavigation(
   const currentLocale = getCurrentUrlLocale();
   if (
     mode === "push" &&
-    resolvedRoute !== resolved &&
+    interpolatedRoute !== resolved &&
     full === routerRuntimeState.lastPathnameAndSearch &&
     navigationLocale === currentLocale
   ) {
@@ -2507,7 +2579,7 @@ async function performNavigation(
   const navStateOptions: { locale?: string; shallow: boolean } = { shallow };
   if (navigationLocale !== undefined) navStateOptions.locale = navigationLocale;
   const resolvedNoHash = stripHash(resolved);
-  const resolvedRouteNoHash = stripHash(resolvedRoute);
+  const resolvedRouteNoHash = stripHash(interpolatedRoute);
   const navState = {
     url: resolvedRouteNoHash,
     as: resolvedNoHash,
@@ -2519,7 +2591,7 @@ async function performNavigation(
   // disagree), the underlying page module changes even if the address bar
   // didn't — so the hash-only shortcut MUST NOT skip the fetch. Mirrors
   // Next.js where `onlyAHashChange` runs only after the route is unchanged.
-  if (options?._h !== 1 && resolvedRoute === resolved && isHashOnlyChange(full)) {
+  if (options?._h !== 1 && interpolatedRoute === resolved && isHashOnlyChange(full)) {
     // Snapshot the outgoing entry's scroll before updateHistory mints a new
     // key, so a later back-popstate restores the position the user had
     // reached here rather than {x: 0, y: 0}. Upstream snapshots inside
