@@ -219,7 +219,8 @@ export type PagesPipelineResult =
  * ASSUMPTION: request already has internal headers filtered and basePath stripped.
  * The adapter is responsible for that pre-processing before calling runPagesRequest.
  * The adapter also handles: open-redirect guard, _next/static 404, image optimization,
- * _next/data normalization, Node decode/normalize/400, public-file serving.
+ * _next/data normalization and classification (`isDataReq` is the source of truth here),
+ * Node decode/normalize/400, public-file serving.
  * runPagesRequest receives a "clean" request with basePath-stripped URL.
  */
 export async function runPagesRequest(
@@ -253,7 +254,8 @@ export async function runPagesRequest(
   // Step 1: Reconstruct basePathState
   const basePathState: BasePathMatchState = { basePath, hadBasePath };
 
-  // Step 2: Trailing-slash normalization
+  // Step 2: Trailing-slash normalization. Adapters must classify `_next/data`
+  // requests via `isDataReq`; those requests must never receive path redirects.
   {
     const trailingSlashRedirect = isDataReq
       ? null

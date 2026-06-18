@@ -2570,9 +2570,9 @@ async function performNavigation(
 
   // History state metadata — surfaces the active locale to popstate and the
   // Safari-replay filter. `as` is the canonical app-relative path (no
-  // basePath, no hash) so it can be compared against the runtime state's
-  // `lastPathnameAndSearch` (which is `pathname + search` only) in the popstate
-  // handler. `url` is the route-pattern path (Next.js's internal href) the
+  // basePath, no hash) used by the popstate handler's comparison against
+  // `lastPathnameAndSearch`; this is separate from the push→replace coercion
+  // above, which compares `stripHash(full)`. `url` is the route-pattern path the
   // popstate handler uses to load the correct page module when `as` differs.
   // Mirrors Next.js Router.changeState(): navState = { url, as, ... } where
   // url and as are kept distinct.
