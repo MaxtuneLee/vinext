@@ -14,6 +14,7 @@ import {
   negotiateEncoding,
   parseAcceptedEncodings,
   selectAcceptedEncoding,
+  selectContentEncoding,
 } from "../packages/vinext/src/server/accept-encoding.js";
 
 function reqWith(acceptEncoding?: string): IncomingMessage {
@@ -35,20 +36,28 @@ describe("parseAcceptedEncodings", () => {
     expect(getEncodingQuality(parsed, "br")).toBe(1);
   });
 
-  it("accepts RFC-valid trailing-dot q-values", () => {
+  it("accepts trailing-dot q-values", () => {
     expect(getEncodingQuality(parseAcceptedEncodings("gzip;q=1."), "gzip")).toBe(1);
     expect(getEncodingQuality(parseAcceptedEncodings("br;q=0."), "br")).toBe(0);
   });
 
-  it("accepts up to three fractional digits", () => {
+  it("accepts numeric q-values using Next.js parser semantics", () => {
     expect(getEncodingQuality(parseAcceptedEncodings("gzip;q=0.123"), "gzip")).toBe(0.123);
     expect(getEncodingQuality(parseAcceptedEncodings("gzip;q=1.000"), "gzip")).toBe(1);
+    expect(getEncodingQuality(parseAcceptedEncodings("gzip;q=.5"), "gzip")).toBe(0.5);
+    expect(getEncodingQuality(parseAcceptedEncodings("gzip;q=0.1234"), "gzip")).toBe(0.1234);
+    expect(getEncodingQuality(parseAcceptedEncodings("gzip;q=1.5"), "gzip")).toBe(1.5);
   });
 
-  it("drops malformed or out-of-range q-values", () => {
-    for (const value of ["abc", "1.5", "0.1.2", "0.1234", "1.0000", ".5"]) {
+  it("drops q-values that do not start with a number", () => {
+    for (const value of ["abc", ""] as const) {
       expect(getEncodingQuality(parseAcceptedEncodings(`gzip;q=${value}`), "gzip")).toBe(0);
     }
+  });
+
+  it("matches Next.js handling of bare q and spaced parameter names", () => {
+    expect(getEncodingQuality(parseAcceptedEncodings("gzip;q"), "gzip")).toBe(0);
+    expect(getEncodingQuality(parseAcceptedEncodings("gzip; q = 0.2"), "gzip")).toBe(1);
   });
 
   it("matches coding tokens exactly and case-insensitively", () => {
@@ -58,10 +67,16 @@ describe("parseAcceptedEncodings", () => {
     expect(isEncodingAccepted(parsed, "brotli-future")).toBe(true);
   });
 
-  it("finds q among other parameters and uses the last repeated q parameter", () => {
+  it("matches Next.js parameter-name casing semantics", () => {
+    expect(getEncodingQuality(parseAcceptedEncodings("gzip;Q=0"), "gzip")).toBe(1);
+    expect(getEncodingQuality(parseAcceptedEncodings("gzip;q=0"), "gzip")).toBe(0);
+  });
+
+  it("finds q among other parameters and uses the first repeated q parameter", () => {
     expect(getEncodingQuality(parseAcceptedEncodings("br;foo=bar;q=0"), "br")).toBe(0);
     expect(getEncodingQuality(parseAcceptedEncodings("br;q=0;foo=bar"), "br")).toBe(0);
-    expect(getEncodingQuality(parseAcceptedEncodings("br;q=0;q=0.5"), "br")).toBe(0.5);
+    expect(getEncodingQuality(parseAcceptedEncodings("br;q=0;q=0.5"), "br")).toBe(0);
+    expect(getEncodingQuality(parseAcceptedEncodings("br;q=0.5;q=0"), "br")).toBe(0.5);
   });
 
   it("uses the highest quality across duplicate coding entries", () => {
@@ -103,6 +118,64 @@ describe("selectAcceptedEncoding", () => {
   });
 });
 
+describe("selectContentEncoding", () => {
+  it("uses implicit identity as a fallback, matching Next.js compression", () => {
+    const parsed = parseAcceptedEncodings("gzip;q=0.5");
+    expect(selectContentEncoding(parsed, ["br", "gzip"])).toBe("gzip");
+  });
+
+  it("allows an explicit higher identity preference to win", () => {
+    const parsed = parseAcceptedEncodings("gzip;q=0.2, identity;q=0.8");
+    expect(selectContentEncoding(parsed, ["gzip"])).toBe("identity");
+  });
+
+  it("uses client header order for equal explicit qualities", () => {
+    expect(
+      selectContentEncoding(parseAcceptedEncodings("identity;q=0.5, gzip;q=0.5"), ["gzip"]),
+    ).toBe("identity");
+    expect(
+      selectContentEncoding(parseAcceptedEncodings("gzip;q=0.5, identity;q=0.5"), ["gzip"]),
+    ).toBe("gzip");
+  });
+
+  it("prefers explicit identity over an equal-quality wildcard", () => {
+    expect(selectContentEncoding(parseAcceptedEncodings("*;q=0.5, identity;q=0.5"), ["br"])).toBe(
+      "identity",
+    );
+  });
+
+  it("uses the later equal-quality duplicate for identity tie ordering", () => {
+    expect(
+      selectContentEncoding(parseAcceptedEncodings("gzip;q=0.8, identity;q=0.8, gzip;q=0.8"), [
+        "gzip",
+      ]),
+    ).toBe("identity");
+  });
+
+  it("lets later invalid duplicate qualities reject an earlier valid entry", () => {
+    expect(selectContentEncoding(parseAcceptedEncodings("gzip, gzip;q"), ["gzip"])).toBe(
+      "identity",
+    );
+    expect(selectContentEncoding(parseAcceptedEncodings("gzip;q=0.8, gzip;q=abc"), ["gzip"])).toBe(
+      "identity",
+    );
+    expect(
+      selectContentEncoding(parseAcceptedEncodings("identity, identity;q, gzip;q=0.5"), ["gzip"]),
+    ).toBe("gzip");
+  });
+
+  it("applies duplicate-invalid replacement semantics to wildcard entries", () => {
+    expect(selectContentEncoding(parseAcceptedEncodings("*, *;q"), ["br"])).toBe("identity");
+    expect(selectContentEncoding(parseAcceptedEncodings("*;q, *"), ["br"])).toBe("br");
+    expect(selectContentEncoding(parseAcceptedEncodings("*;q=0.8, *;q"), ["br"])).toBe("identity");
+    expect(selectContentEncoding(parseAcceptedEncodings("*;q=abc, *;q=0.8"), ["br"])).toBe("br");
+  });
+
+  it("falls back to identity when no content coding is acceptable", () => {
+    expect(selectContentEncoding(parseAcceptedEncodings("*;q=0"), ["br", "gzip"])).toBe("identity");
+  });
+});
+
 describe("negotiateEncoding", () => {
   it("uses identity when no Accept-Encoding header is present", () => {
     expect(negotiateEncoding(reqWith(undefined))).toBe("identity");
@@ -110,7 +183,7 @@ describe("negotiateEncoding", () => {
 
   it("honors unequal positive client preferences", () => {
     expect(negotiateEncoding(reqWith("gzip;q=1, br;q=0.1"))).toBe("gzip");
-    expect(negotiateEncoding(reqWith("br;q=0.5, gzip;q=0.9"))).toBe("identity");
+    expect(negotiateEncoding(reqWith("br;q=0.5, gzip;q=0.9"))).toBe("gzip");
   });
 
   it("uses server preference when client qualities tie", () => {
@@ -124,7 +197,7 @@ describe("negotiateEncoding", () => {
 
   it("honors wildcard quality and explicit overrides", () => {
     expect(negotiateEncoding(reqWith("*"))).toBe(HAS_ZSTD ? "zstd" : "br");
-    expect(negotiateEncoding(reqWith("*;q=0.8, br;q=0"))).toBe("identity");
+    expect(negotiateEncoding(reqWith("*;q=0.8, br;q=0"))).toBe(HAS_ZSTD ? "zstd" : "gzip");
     expect(negotiateEncoding(reqWith("*;q=0, gzip"))).toBe("gzip");
   });
 
@@ -132,9 +205,11 @@ describe("negotiateEncoding", () => {
     expect(negotiateEncoding(reqWith("gzip;q=0.2, identity;q=0.8"))).toBe("identity");
   });
 
-  it("returns null when identity and every supported coding are refused", () => {
-    expect(negotiateEncoding(reqWith("*;q=0"))).toBe(null);
-    expect(negotiateEncoding(reqWith("gzip;q=0, br;q=0, deflate;q=0, identity;q=0"))).toBe(null);
+  it("falls back to identity when every supported coding is refused", () => {
+    expect(negotiateEncoding(reqWith("*;q=0"))).toBe("identity");
+    expect(negotiateEncoding(reqWith("gzip;q=0, br;q=0, deflate;q=0, identity;q=0"))).toBe(
+      "identity",
+    );
   });
 
   if (HAS_ZSTD) {

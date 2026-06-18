@@ -4094,6 +4094,42 @@ describe("production server compression", () => {
     expect(writtenBody).toBeTruthy();
   });
 
+  it("sendCompressed keeps the size threshold even when identity is refused", async () => {
+    const { sendCompressed } = await import("../packages/vinext/src/server/prod-server.js");
+    const req = { headers: { "accept-encoding": "gzip;q=1, identity;q=0" } };
+    const chunks: Buffer[] = [];
+    let writtenHeaders: Record<string, string> = {};
+    const res = {
+      writeHead: (_status: number, headers: Record<string, string>) => {
+        writtenHeaders = headers;
+      },
+      end: (chunk?: Buffer) => {
+        if (chunk) chunks.push(chunk);
+      },
+    };
+
+    sendCompressed(req as any, res as any, "tiny", "text/plain", 200, {}, true);
+
+    expect(writtenHeaders["Content-Encoding"]).toBeUndefined();
+    expect(Buffer.concat(chunks).toString()).toBe("tiny");
+  });
+
+  it("sendCompressed does not vary non-compressible responses", async () => {
+    const { sendCompressed } = await import("../packages/vinext/src/server/prod-server.js");
+    const req = { headers: { "accept-encoding": "gzip" } };
+    let writtenHeaders: Record<string, string> = {};
+    const res = {
+      writeHead: (_status: number, headers: Record<string, string>) => {
+        writtenHeaders = headers;
+      },
+      end: () => {},
+    };
+
+    sendCompressed(req as any, res as any, Buffer.from([1, 2, 3]), "image/png", 200, {}, true);
+
+    expect(writtenHeaders.Vary).toBeUndefined();
+  });
+
   it("sendCompressed does not compress small bodies", async () => {
     const { sendCompressed } = await import("../packages/vinext/src/server/prod-server.js");
 
@@ -4133,7 +4169,7 @@ describe("production server compression", () => {
 
     // PNG should not be compressed
     expect(writtenHeaders["Content-Encoding"]).toBeUndefined();
-    expect(writtenHeaders["Vary"]).toBe("Accept-Encoding");
+    expect(writtenHeaders["Vary"]).toBeUndefined();
   });
 });
 
@@ -4399,7 +4435,7 @@ describe("Set-Cookie header preservation in prod-server", () => {
     expect(canceled).toBe(true);
   });
 
-  it("sendWebResponse rejects an upstream encoding refused by the client", async () => {
+  it("sendWebResponse preserves an existing upstream encoding", async () => {
     const { sendWebResponse } = await import("../packages/vinext/src/server/prod-server.js");
     const response = new Response("encoded", {
       headers: {
@@ -4418,9 +4454,9 @@ describe("Set-Cookie header preservation in prod-server", () => {
     await sendWebResponse(response, req as any, res as any, true);
     await finished(res);
 
-    expect(res.statusCode).toBe(406);
-    expect(res.headers["Vary"]).toBe("Accept-Encoding");
-    expect(chunks).toEqual([]);
+    expect(res.statusCode).toBe(200);
+    expect(res.headers["Vary"]).toBeUndefined();
+    expect(Buffer.concat(chunks).toString()).toBe("encoded");
   });
 
   it("sendWebResponse varies identity responses by Accept-Encoding", async () => {
@@ -4442,7 +4478,7 @@ describe("Set-Cookie header preservation in prod-server", () => {
     await finished(res);
 
     expect(res.statusCode).toBe(200);
-    expect(res.headers["content-encoding"]).toBeUndefined();
+    expect(res.headers["Content-Encoding"]).toBe("br");
     expect(res.headers.vary).toBe("RSC, Accept-Encoding");
   });
 
