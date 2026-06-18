@@ -9,7 +9,6 @@ export type ParsedAcceptEncoding = {
   qualities: Map<string, number>;
   orders: Map<string, number>;
   wildcardQuality: number | null;
-  wildcardOrder: number | null;
 };
 
 /** Parse an Accept-Encoding header into exact-token numeric qualities. */
@@ -17,7 +16,6 @@ export function parseAcceptedEncodings(accept: string): ParsedAcceptEncoding {
   const qualities = new Map<string, number>();
   const orders = new Map<string, number>();
   let wildcardQuality: number | null = null;
-  let wildcardOrder: number | null = null;
 
   for (const [order, part] of accept.split(",").entries()) {
     const trimmed = part.trim();
@@ -50,7 +48,6 @@ export function parseAcceptedEncodings(accept: string): ParsedAcceptEncoding {
         quality >= wildcardQuality
       ) {
         wildcardQuality = quality;
-        wildcardOrder = order;
       }
     } else {
       const currentQuality = qualities.get(token);
@@ -66,7 +63,7 @@ export function parseAcceptedEncodings(accept: string): ParsedAcceptEncoding {
     }
   }
 
-  return { qualities, orders, wildcardQuality, wildcardOrder };
+  return { qualities, orders, wildcardQuality };
 }
 
 /** Return the effective quality for a coding, including wildcard/identity rules. */
