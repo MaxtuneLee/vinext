@@ -19,12 +19,49 @@
  */
 
 import { removeTrailingSlash } from "../../utils/base-path.js";
+import type { UrlQuery } from "../../utils/query.js";
 
 /**
  * Wire-compatible alias for Node's `querystring.ParsedUrlQuery`. Inlined here
  * so this module has no dependency on the `querystring` types package.
  */
 export type ParsedUrlQuery = { [key: string]: string | string[] | undefined };
+
+export type DynamicRouteHrefProjection = {
+  href: string;
+  params: string[];
+  query: ParsedUrlQuery;
+  routePathname: string;
+};
+
+function normalizeQuery(query: UrlQuery | undefined): ParsedUrlQuery {
+  const normalized: ParsedUrlQuery = {};
+  if (!query) return normalized;
+
+  for (const [key, value] of Object.entries(query)) {
+    if (value === undefined) continue;
+    normalized[key] = Array.isArray(value) ? value.map(String) : String(value);
+  }
+  return normalized;
+}
+
+function parseRouteHrefQuery(
+  routeHref: string,
+  queryIndex: number,
+  hashIndex: number,
+): ParsedUrlQuery {
+  const query: ParsedUrlQuery = {};
+  if (queryIndex === -1 || (hashIndex !== -1 && queryIndex > hashIndex)) return query;
+
+  const searchEnd = hashIndex === -1 ? routeHref.length : hashIndex;
+  for (const [key, value] of new URLSearchParams(routeHref.slice(queryIndex + 1, searchEnd))) {
+    const existing = query[key];
+    if (existing === undefined) query[key] = value;
+    else if (Array.isArray(existing)) existing.push(value);
+    else query[key] = [existing, value];
+  }
+  return query;
+}
 
 type RouteRegexGroup = {
   pos: number;
@@ -227,5 +264,39 @@ export function interpolateAs(
   return {
     params,
     result: interpolatedRoute,
+  };
+}
+
+/**
+ * Resolve a bracket-pattern route href against its displayed href. Query
+ * values can be supplied directly (object-form hrefs) or parsed from the route
+ * href (string-form hrefs). A `?` after `#` is part of the fragment, not a
+ * query delimiter.
+ */
+export function interpolateDynamicRouteHref(
+  routeHref: string,
+  asHref: string,
+  queryInput?: UrlQuery,
+): DynamicRouteHrefProjection | null {
+  if (!routeHref.includes("[")) return null;
+
+  const hashIndex = routeHref.indexOf("#");
+  const queryIndex = routeHref.indexOf("?");
+  const pathEnd = [hashIndex, queryIndex]
+    .filter((index) => index !== -1)
+    .reduce((earliest, index) => Math.min(earliest, index), routeHref.length);
+  const routePathname = routeHref.slice(0, pathEnd);
+  const trailing = routeHref.slice(pathEnd);
+  const asPathname = asHref.split(/[?#]/, 1)[0];
+  const query = queryInput
+    ? normalizeQuery(queryInput)
+    : parseRouteHrefQuery(routeHref, queryIndex, hashIndex);
+  const { result, params } = interpolateAs(routePathname, asPathname, query);
+
+  return {
+    href: result ? `${result}${trailing}` : "",
+    params,
+    query,
+    routePathname,
   };
 }

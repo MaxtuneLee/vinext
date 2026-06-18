@@ -48,6 +48,50 @@ describe("vinext next data client helpers", () => {
   });
 });
 
+describe("dynamic route href interpolation", () => {
+  it("preserves query and hash suffixes while interpolating", async () => {
+    const { interpolateDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(interpolateDynamicRouteHref("/blog/[slug]?preview=1#section", "/blog/post")).toEqual({
+      href: "/blog/post?preview=1#section",
+      params: ["slug"],
+      query: { preview: "1" },
+      routePathname: "/blog/[slug]",
+    });
+  });
+
+  it("treats a query marker after the hash as fragment text", async () => {
+    const { interpolateDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(interpolateDynamicRouteHref("/blog/[slug]#a?b=1", "/blog/post")).toEqual({
+      href: "/blog/post#a?b=1",
+      params: ["slug"],
+      query: {},
+      routePathname: "/blog/[slug]",
+    });
+  });
+
+  it("normalizes object-form query values for interpolation", async () => {
+    const { interpolateDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(
+      interpolateDynamicRouteHref("/blog/[slug]?draft=true", "/blog/[slug]", {
+        slug: 42,
+        tag: ["one", 2],
+        missing: undefined,
+      }),
+    ).toEqual({
+      href: "/blog/42?draft=true",
+      params: ["slug"],
+      query: { slug: "42", tag: ["one", "2"] },
+      routePathname: "/blog/[slug]",
+    });
+  });
+});
+
 describe("slot BFCache entry ordering", () => {
   it("keeps the three most recent state-key entries", async () => {
     const { updateBfcacheSlotEntryOrder } = await import("../packages/vinext/src/shims/slot.js");

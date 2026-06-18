@@ -72,7 +72,7 @@ import {
   prefetchPagesData,
   resolvePagesDataNavigationTarget,
 } from "./internal/pages-data-target.js";
-import { interpolateAs, type ParsedUrlQuery } from "./internal/interpolate-as.js";
+import { interpolateDynamicRouteHref } from "./internal/interpolate-as.js";
 import { markAppRouteDetectedOnPrefetch } from "./internal/app-route-detection.js";
 import { resolveHybridClientRouteOwner } from "./internal/hybrid-client-route-owner.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
@@ -775,44 +775,12 @@ function applyLocaleToHref(href: string, locale: string | false | undefined): st
 function resolveConcreteRouteHref(href: LinkProps["href"], as: string | undefined): string | null {
   if (typeof as !== "string") return null;
   const hrefStr = typeof href === "string" ? href : resolveHref(href);
-  if (!hrefStr.includes("[")) return null;
-
-  // Pull the route pathname off the href; `interpolateAs` works on pathnames,
-  // not full URLs (a leading `?search` would derail PARAMETER_PATTERN).
-  const hashIdx = hrefStr.indexOf("#");
-  const qIdx = hrefStr.indexOf("?");
-  const pathEnd =
-    hashIdx === -1
-      ? qIdx === -1
-        ? hrefStr.length
-        : qIdx
-      : qIdx === -1
-        ? hashIdx
-        : Math.min(qIdx, hashIdx);
-  const routePathname = hrefStr.slice(0, pathEnd);
-  const trailing = hrefStr.slice(pathEnd);
-
-  const asPathname = as.split(/[?#]/, 1)[0];
-
-  const query: ParsedUrlQuery = {};
-  if (typeof href !== "string" && href.query) {
-    for (const [k, v] of Object.entries(href.query)) {
-      if (v === undefined) continue;
-      query[k] = Array.isArray(v) ? v.map(String) : String(v);
-    }
-  } else if (qIdx !== -1) {
-    const search = hashIdx === -1 ? hrefStr.slice(qIdx + 1) : hrefStr.slice(qIdx + 1, hashIdx);
-    for (const [k, v] of new URLSearchParams(search)) {
-      const existing = query[k];
-      if (existing === undefined) query[k] = v;
-      else if (Array.isArray(existing)) existing.push(v);
-      else query[k] = [existing, v];
-    }
-  }
-
-  const { result } = interpolateAs(routePathname, asPathname, query);
-  if (!result) return null;
-  return `${result}${trailing}`;
+  const projection = interpolateDynamicRouteHref(
+    hrefStr,
+    as,
+    typeof href === "string" ? undefined : href.query,
+  );
+  return projection?.href || null;
 }
 
 const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(

@@ -78,7 +78,7 @@ import {
   setStampInitialHistoryState,
 } from "./pages-router-runtime.js";
 import { assertSafeNavigationUrl } from "./url-safety.js";
-import { interpolateAs } from "./internal/interpolate-as.js";
+import { interpolateDynamicRouteHref } from "./internal/interpolate-as.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
 import { getDeploymentId, NEXT_DEPLOYMENT_ID_HEADER } from "../utils/deployment-id.js";
 
@@ -2455,48 +2455,32 @@ async function performNavigation(
   // best concrete URL we have.
   let interpolatedRoute = resolvedRoute;
   if (resolvedRoute.includes("[")) {
-    const routePathname = stripHash(resolvedRoute).split("?", 1)[0];
-    const asPathname = stripHash(resolved).split("?", 1)[0];
-    const query: Record<string, string | string[]> = {};
-    if (typeof url !== "string" && url.query) {
-      for (const [k, v] of Object.entries(url.query)) {
-        if (v === undefined) continue;
-        query[k] = Array.isArray(v) ? v.map(String) : String(v);
-      }
-    } else {
-      const searchIdx = resolvedRoute.indexOf("?");
-      if (searchIdx !== -1) {
-        const search = stripHash(resolvedRoute.slice(searchIdx + 1));
-        for (const [k, v] of new URLSearchParams(search)) {
-          const existing = query[k];
-          if (existing === undefined) query[k] = v;
-          else if (Array.isArray(existing)) existing.push(v);
-          else query[k] = [existing, v];
-        }
-      }
-    }
-    const { result, params: consumedParams } = interpolateAs(routePathname, asPathname, query);
-    if (result) {
-      const tail = resolvedRoute.slice(routePathname.length);
-      interpolatedRoute = `${result}${tail}`;
+    const projection = interpolateDynamicRouteHref(
+      resolvedRoute,
+      resolved,
+      typeof url === "string" ? undefined : url.query,
+    );
+    if (projection?.href) {
+      interpolatedRoute = projection.href;
 
       // No-mask case: caller didn't pass `as`, so the address bar would
       // otherwise show the literal bracket pathname. Reproject `resolved` /
       // `full` against the interpolated pathname, dropping query keys that
       // were consumed by path params — matches upstream Next.js Router.change
       // which rebuilds `as` from `interpolatedAs.result` + `omit(query, params)`.
-      if (as === undefined && asPathname === routePathname) {
+      if (as === undefined && stripHash(resolved).split("?", 1)[0] === projection.routePathname) {
         const remaining = new URLSearchParams();
-        const consumed = new Set(consumedParams);
-        for (const [k, v] of Object.entries(query)) {
+        const consumed = new Set(projection.params);
+        for (const [k, v] of Object.entries(projection.query)) {
           if (consumed.has(k)) continue;
+          if (v === undefined) continue;
           if (Array.isArray(v)) v.forEach((entry) => remaining.append(k, entry));
           else remaining.append(k, v);
         }
         const searchStr = remaining.toString();
         const hashStr = extractHash(resolved);
         resolved = normalizePathTrailingSlash(
-          `${result}${searchStr ? `?${searchStr}` : ""}${hashStr}`,
+          `${projection.href.split(/[?#]/, 1)[0]}${searchStr ? `?${searchStr}` : ""}${hashStr}`,
           __trailingSlash,
         );
       }
