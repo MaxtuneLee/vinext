@@ -2284,20 +2284,17 @@ function dispatchNavigateEvent(): void {
 function updateHistory(
   mode: "push" | "replace",
   fullUrl: string,
-  navState?: { url?: string; as?: string; options?: { locale?: string; shallow?: boolean } },
+  navState: { url: string; as: string; options: { locale?: string; shallow?: boolean } },
 ): void {
   const previousKey = getRouterStateKey(window.history.state);
   const key =
     mode === "push"
       ? createHistoryKey()
       : (previousKey ?? routerRuntimeState.currentHistoryKey ?? createHistoryKey());
-  const stateUrl = navState?.url ?? fullUrl;
-  const stateAs = navState?.as ?? fullUrl;
-  const options = navState?.options ?? {};
   const state: VinextHistoryState = {
-    url: stateUrl,
-    as: stateAs,
-    options,
+    url: navState.url,
+    as: navState.as,
+    options: navState.options,
     __N: true,
     key,
   };
@@ -2885,10 +2882,10 @@ function handlePagesRouterPopState(e: PopStateEvent): void {
   const wasFirst = routerRuntimeState.isFirstPopStateEvent;
   routerRuntimeState.isFirstPopStateEvent = false;
 
-  // History entries written by third-party code (state without `__N: true`)
-  // are not owned by the router. Mirror Next.js's `if (!state.__N) return`
-  // early-exit so a non-router pushState doesn't trigger a spurious page
-  // fetch.
+  // History entries that do not match the complete router state shape are not
+  // owned by this runtime, even if they carry `__N: true`. Mirror Next.js's
+  // foreign-state early exit so third-party or stale partial entries do not
+  // trigger a spurious page fetch.
   //
   // The `null` state case (e.g. the initial document load, scroll-restoration
   // popstate, or tests that fire popstate without state) keeps the legacy
