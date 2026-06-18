@@ -78,6 +78,7 @@ import {
   setStampInitialHistoryState,
 } from "./pages-router-runtime.js";
 import { assertSafeNavigationUrl } from "./url-safety.js";
+import { interpolateDynamicRouteHref } from "./internal/interpolate-as.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
 import { getDeploymentId, NEXT_DEPLOYMENT_ID_HEADER } from "../utils/deployment-id.js";
 
@@ -320,7 +321,7 @@ function installManualScrollRestoration(): void {
 type BeforePopStateCallback = (state: {
   url: string;
   as: string;
-  options: { shallow: boolean };
+  options: TransitionOptions;
 }) => boolean;
 
 export type NextRouter = {
@@ -2043,6 +2044,15 @@ async function navigateClient(
   url: string,
   fetchUrl = url,
   options: NavigateClientOptions = {},
+  /**
+   * Route-pattern URL when it differs from the display URL (`<Link href as>`).
+   * Used to derive the `_next/data` target so the page module that actually
+   * renders is fetched, not the masked address-bar value. Defaults to `url`
+   * so callers without a mask are unaffected. Mirrors Next.js Router.change()
+   * which threads `parsedUrl.pathname` (route) separately from `parsedAs`
+   * (display) into the data fetch step.
+   */
+  routeUrl: string = url,
 ): Promise<void> {
   if (typeof window === "undefined") return;
 
@@ -2076,7 +2086,12 @@ async function navigateClient(
     } else {
       let browserUrl = url;
       let htmlFetchUrl = fetchUrl;
-      let dataTarget = resolvePagesDataNavigationTarget(browserUrl, __basePath);
+      // Resolve the `_next/data` target from the ROUTE URL, not the display
+      // URL — so `<Link href="/something-else" as="/hello">` fetches
+      // `_next/data/<id>/something-else.json` (the page that actually renders)
+      // rather than `_next/data/<id>/hello.json` (the masked address). When
+      // routeUrl === url (no mask), behaviour is unchanged.
+      let dataTarget = resolvePagesDataNavigationTarget(routeUrl, __basePath);
       let middlewareDataResponse: Response | undefined;
       if (!dataTarget) {
         let middlewareEffect: MiddlewareDataEffect | null;
@@ -2152,9 +2167,16 @@ async function runNavigateClient(
   resolvedUrl: string,
   fetchUrl = fullUrl,
   options: NavigateClientOptions = {},
+  /**
+   * Route-pattern URL when masked (`<Link href as>` with differing values).
+   * Forwarded to navigateClient so `_next/data` resolution targets the page
+   * module that actually renders, not the masked address bar value.
+   * Defaults to `fullUrl`, making this a no-op for callers without a mask.
+   */
+  routeUrl: string = fullUrl,
 ): Promise<"completed" | "cancelled" | "failed"> {
   try {
-    await navigateClient(fullUrl, fetchUrl, options);
+    await navigateClient(fullUrl, fetchUrl, options, routeUrl);
     return "completed";
   } catch (err: unknown) {
     routerEvents.emit("routeChangeError", err, resolvedUrl, { shallow: false });
@@ -2262,20 +2284,17 @@ function dispatchNavigateEvent(): void {
 function updateHistory(
   mode: "push" | "replace",
   fullUrl: string,
-  navState?: { url?: string; as?: string; options?: { locale?: string; shallow?: boolean } },
+  navState: { url: string; as: string; options: { locale?: string; shallow?: boolean } },
 ): void {
   const previousKey = getRouterStateKey(window.history.state);
   const key =
     mode === "push"
       ? createHistoryKey()
       : (previousKey ?? routerRuntimeState.currentHistoryKey ?? createHistoryKey());
-  const stateUrl = navState?.url ?? fullUrl;
-  const stateAs = navState?.as ?? fullUrl;
-  const options = navState?.options ?? {};
   const state: VinextHistoryState = {
-    url: stateUrl,
-    as: stateAs,
-    options,
+    url: navState.url,
+    as: navState.as,
+    options: navState.options,
     __N: true,
     key,
   };
@@ -2377,6 +2396,18 @@ async function performNavigation(
       (typeof url.search === "string" && url.search.length > 0) ||
       (typeof url.hash === "string" && url.hash.length > 0));
   let resolved = resolveNavigationTarget(url, as, navigationLocale, replaceInheritedLocale);
+  // `resolvedRoute` is the route-pattern URL (Next.js's internal `href`). It
+  // drives which page module renders and which `_next/data` payload is
+  // fetched. When `as` is absent it equals `resolved`. When `as` is a string
+  // (i.e. `<Link href="/route" as="/mask">`) it follows `url`, so the page
+  // module and data fetch target the actual route while the address bar shows
+  // the mask. Mirrors Next.js `Router.change()` keeping `parsedUrl.pathname`
+  // and `parsedAs.pathname` distinct.
+  let resolvedRoute = applyNavigationLocale(
+    resolveUrl(url),
+    navigationLocale,
+    replaceInheritedLocale,
+  );
   const inheritsCurrentPath =
     as === undefined &&
     ((typeof url === "string" && options?._vinextInterpolateDynamicRoute === true) ||
@@ -2386,6 +2417,7 @@ async function performNavigation(
           (typeof url.search === "string" && url.search.length > 0))));
   if (inheritsCurrentPath) {
     resolved = interpolateCurrentDynamicRoute(resolved);
+    resolvedRoute = interpolateCurrentDynamicRoute(resolvedRoute);
   }
 
   // External URLs — delegate to browser (unless same-origin)
@@ -2398,14 +2430,87 @@ async function performNavigation(
     }
     resolved = localPath;
   }
+  if (isExternalUrl(resolvedRoute)) {
+    const localPath = toSameOriginAppPath(resolvedRoute, __basePath);
+    if (localPath != null) resolvedRoute = localPath;
+  }
 
   resolved = normalizePathTrailingSlash(resolved, __trailingSlash);
+  resolvedRoute = normalizePathTrailingSlash(resolvedRoute, __trailingSlash);
+  // Bracket-pattern interpolation: callers that bypass <Link> (e.g.
+  // `Router.push("/posts/[id]", "/posts/1")` or
+  // `Router.push({pathname:"/posts/[id]", query:{id:1}})`) can hand us a route
+  // URL whose pathname still contains `[id]` placeholders. The data endpoint
+  // (`_next/data/<id>/posts/[id].json`) and HTML endpoint (`/posts/[id]`)
+  // both 404 on those literal characters, so project the brackets back into
+  // concrete values before deriving the fetch target. Mirrors Next.js
+  // `Router.change()` which runs `interpolateAs(route, asPathname, query)`
+  // for the same reason (packages/next/src/shared/lib/router/router.ts L987+).
+  //
+  // Match-source priority: `as` first (extracts param values from the
+  // resolved display URL), query second (object-form callers passing
+  // `{pathname, query}`). When neither yields all required params, fall back
+  // to the display URL — the user's typical intent for a literal bracket
+  // pathname is "navigate to the address as written", and `resolved` is the
+  // best concrete URL we have.
+  let interpolatedRoute = resolvedRoute;
+  if (resolvedRoute.includes("[")) {
+    const projection = interpolateDynamicRouteHref(
+      resolvedRoute,
+      resolved,
+      typeof url === "string" ? undefined : url.query,
+    );
+    if (projection?.href) {
+      interpolatedRoute = projection.href;
+
+      // No-mask case: caller didn't pass `as`, so the address bar would
+      // otherwise show the literal bracket pathname. Reproject `resolved` /
+      // `full` against the interpolated pathname, dropping query keys that
+      // were consumed by path params — matches upstream Next.js Router.change
+      // which rebuilds `as` from `interpolatedAs.result` + `omit(query, params)`.
+      if (as === undefined && stripHash(resolved).split("?", 1)[0] === projection.routePathname) {
+        const remaining = new URLSearchParams();
+        const consumed = new Set(projection.params);
+        for (const [k, v] of Object.entries(projection.query)) {
+          if (consumed.has(k)) continue;
+          if (v === undefined) continue;
+          if (Array.isArray(v)) v.forEach((entry) => remaining.append(k, entry));
+          else remaining.append(k, v);
+        }
+        const searchStr = remaining.toString();
+        const hashStr = extractHash(resolved);
+        resolved = normalizePathTrailingSlash(
+          `${projection.href.split(/[?#]/, 1)[0]}${searchStr ? `?${searchStr}` : ""}${hashStr}`,
+          __trailingSlash,
+        );
+      }
+    } else {
+      // Required params missing — `resolved` (display URL) is the best
+      // concrete URL we can use. Matches the pre-mask behaviour and avoids
+      // serving a 404 from the data endpoint.
+      interpolatedRoute = resolved;
+    }
+  }
+  // Recompute `full` after potential `resolved` rewrite above. Cheap when
+  // unchanged; correctness-critical when bracket interpolation rewrote it.
   const full = normalizePathTrailingSlash(
     toBrowserNavigationHref(resolved, window.location.href, __basePath),
     __trailingSlash,
   );
+  // When the (now concrete) route differs from the display URL, fetch HTML/
+  // data by the route URL — not the masked address — so the page module that
+  // actually renders is the one fetched. When they match (no mask) this is a
+  // no-op and `fullRouteUrl === full`.
+  const fullRouteUrl =
+    interpolatedRoute !== resolved
+      ? normalizePathTrailingSlash(
+          toBrowserNavigationHref(interpolatedRoute, window.location.href, __basePath),
+          __trailingSlash,
+        )
+      : full;
   const errorRouteHtmlFetchUrl = resolvePagesErrorHtmlFetchUrl(url, navigationLocale);
-  const htmlFetchUrl = errorRouteHtmlFetchUrl ?? getPagesHtmlFetchUrl(full, navigationLocale);
+  const htmlFetchUrl =
+    errorRouteHtmlFetchUrl ?? getPagesHtmlFetchUrl(fullRouteUrl, navigationLocale);
   const shallow = options?.shallow ?? false;
   const doScroll = options?.scroll !== false;
   const hash = extractHash(resolved);
@@ -2418,18 +2523,56 @@ async function performNavigation(
     ? { allowNotFoundResponse: true, mode, scroll: scrollTarget }
     : { mode, scroll: scrollTarget };
 
+  // Next.js push→replace coercion (narrowed): when the display URL (asPath)
+  // doesn't change AND the route URL DOES change AND the locale doesn't
+  // change, coerce a programmatic push to a replace so we update the
+  // existing entry's `state.url` (the page module to render) without
+  // stacking a duplicate-URL entry. The motivating case is
+  // `<Link href="/something-else" as="/hello">` clicked while on `/hello`:
+  // address bar stays on `/hello`, but `state.url` flips from "/hello" to
+  // "/something-else", so popstate forward renders the right module.
+  //
+  // We deliberately scope this to `resolvedRoute !== resolved` rather than
+  // matching upstream's blanket coercion, so two identical consecutive
+  // pushes (same href, no `as` mask) still both emit pushState — preserving
+  // existing dedupe-and-cancel semantics across the test suite.
+  //
+  // Mirrors packages/next/src/shared/lib/router/router.ts (around L1425):
+  //   if (!this.urlIsNew(cleanedAs) && !localeChange) method = 'replaceState'
+  const currentLocale = getCurrentUrlLocale();
+  if (
+    mode === "push" &&
+    interpolatedRoute !== resolved &&
+    stripHash(full) === routerRuntimeState.lastPathnameAndSearch &&
+    navigationLocale === currentLocale
+  ) {
+    mode = "replace";
+  }
+
   // History state metadata — surfaces the active locale to popstate and the
   // Safari-replay filter. `as` is the canonical app-relative path (no
-  // basePath, no hash) so it can be compared against the runtime state's
-  // `lastPathnameAndSearch` (which is `pathname + search` only) in the popstate
-  // handler.
+  // basePath, no hash) used by the popstate handler's comparison against
+  // `lastPathnameAndSearch`; this is separate from the push→replace coercion
+  // above, which compares `stripHash(full)`. `url` is the route-pattern path the
+  // popstate handler uses to load the correct page module when `as` differs.
+  // Mirrors Next.js Router.changeState(): navState = { url, as, ... } where
+  // url and as are kept distinct.
   const navStateOptions: { locale?: string; shallow: boolean } = { shallow };
   if (navigationLocale !== undefined) navStateOptions.locale = navigationLocale;
   const resolvedNoHash = stripHash(resolved);
-  const navState = { url: resolvedNoHash, as: resolvedNoHash, options: navStateOptions };
+  const resolvedRouteNoHash = stripHash(interpolatedRoute);
+  const navState = {
+    url: resolvedRouteNoHash,
+    as: resolvedNoHash,
+    options: navStateOptions,
+  };
 
-  // Hash-only change — no page fetch needed
-  if (options?._h !== 1 && isHashOnlyChange(full)) {
+  // Hash-only change — no page fetch needed.
+  // Guard: when the route URL differs from the display URL (i.e. href and as
+  // disagree), the underlying page module changes even if the address bar
+  // didn't — so the hash-only shortcut MUST NOT skip the fetch. Mirrors
+  // Next.js where `onlyAHashChange` runs only after the route is unchanged.
+  if (options?._h !== 1 && interpolatedRoute === resolved && isHashOnlyChange(full)) {
     // Snapshot the outgoing entry's scroll before updateHistory mints a new
     // key, so a later back-popstate restores the position the user had
     // reached here rather than {x: 0, y: 0}. Upstream snapshots inside
@@ -2484,7 +2627,17 @@ async function performNavigation(
   routerEvents.emit("beforeHistoryChange", resolved, { shallow });
   updateHistory(mode, full, navState);
   if (!shallow) {
-    const result = await runNavigateClient(full, resolved, htmlFetchUrl, navigateOptions);
+    const result = await runNavigateClient(
+      full,
+      resolved,
+      htmlFetchUrl,
+      navigateOptions,
+      // When href and as differ, the data fetch must target the route URL
+      // (the module that actually renders), not the masked display URL.
+      // fullRouteUrl === full when there is no mask, so this is a no-op
+      // for the dominant case.
+      fullRouteUrl,
+    );
     if (result === "cancelled") return true;
     if (result === "failed") return false;
   } else {
@@ -2679,9 +2832,9 @@ function PagesRouterProvider({ children }: { children: ReactNode }): ReactElemen
 // (for example, a hash-only push followed by goBack).
 
 function isNextRouterState(state: unknown): state is {
-  url?: string;
-  as?: string;
-  options?: { locale?: string; shallow?: boolean };
+  url: string;
+  as: string;
+  options: TransitionOptions;
   __N: true;
   key?: string;
 } {
@@ -2689,7 +2842,14 @@ function isNextRouterState(state: unknown): state is {
     typeof state === "object" &&
     state !== null &&
     "__N" in state &&
-    (state as { __N?: unknown }).__N === true
+    (state as { __N?: unknown }).__N === true &&
+    "url" in state &&
+    typeof (state as { url?: unknown }).url === "string" &&
+    "as" in state &&
+    typeof (state as { as?: unknown }).as === "string" &&
+    "options" in state &&
+    typeof (state as { options?: unknown }).options === "object" &&
+    (state as { options?: unknown }).options !== null
   );
 }
 
@@ -2706,10 +2866,10 @@ function handlePagesRouterPopState(e: PopStateEvent): void {
   const wasFirst = routerRuntimeState.isFirstPopStateEvent;
   routerRuntimeState.isFirstPopStateEvent = false;
 
-  // History entries written by third-party code (state without `__N: true`)
-  // are not owned by the router. Mirror Next.js's `if (!state.__N) return`
-  // early-exit so a non-router pushState doesn't trigger a spurious page
-  // fetch.
+  // History entries that do not match the complete router state shape are not
+  // owned by this runtime, even if they carry `__N: true`. Mirror Next.js's
+  // foreign-state early exit so third-party or stale partial entries do not
+  // trigger a spurious page fetch.
   //
   // The `null` state case (e.g. the initial document load, scroll-restoration
   // popstate, or tests that fire popstate without state) keeps the legacy
@@ -2780,10 +2940,19 @@ function handlePagesRouterPopState(e: PopStateEvent): void {
 
   // Check beforePopState callback
   if (routerRuntimeState.beforePopStateCb !== undefined) {
+    const beforePopStateState = isNextRouterState(state)
+      ? {
+          url: state.url,
+          as: state.as,
+          options: state.options,
+        }
+      : {
+          url: appUrl,
+          as: appUrl,
+          options: { shallow: false },
+        };
     const shouldContinue = routerRuntimeState.beforePopStateCb({
-      url: appUrl,
-      as: appUrl,
-      options: { shallow: false },
+      ...beforePopStateState,
     });
     if (!shouldContinue) return;
   }
@@ -2822,7 +2991,7 @@ function handlePagesRouterPopState(e: PopStateEvent): void {
   // when computing the fetch URL so default-locale roots still go through
   // their locale-qualified HTML endpoint (parity with the push path).
   const stateLocale = isNextRouterState(state) ? state.options?.locale : undefined;
-  const effectiveLocale = stateLocale ?? window.__VINEXT_LOCALE__;
+  const effectiveLocale = typeof stateLocale === "string" ? stateLocale : window.__VINEXT_LOCALE__;
 
   const fullAppUrl = appUrl + window.location.hash;
   routerEvents.emit("routeChangeStart", fullAppUrl, { shallow: false });
@@ -2848,11 +3017,31 @@ function handlePagesRouterPopState(e: PopStateEvent): void {
     const scrollTarget = manualScrollRestoration
       ? (forcedScroll ?? readScrollPosition(state) ?? { x: 0, y: 0 })
       : readScrollPosition(state);
+    // When the restored history entry carries a `state.url` that differs
+    // from `state.as`, the entry was written by a `<Link href="/route" as="/mask">`
+    // navigation. Fetch the page module / data by `state.url` (the route),
+    // not `state.as` (the address bar) — otherwise forward navigation to
+    // such an entry would re-render the masked page instead of the routed
+    // one. Mirrors Next.js's popstate handler around router.ts:971-995,
+    // which keys page resolution off `state.url` (`href`) rather than the
+    // browser URL.
+    const stateRouteUrl = (() => {
+      if (
+        isNextRouterState(state) &&
+        typeof state.url === "string" &&
+        typeof state.as === "string" &&
+        state.url !== state.as
+      ) {
+        return normalizePathTrailingSlash(withBasePath(state.url, __basePath), __trailingSlash);
+      }
+      return browserUrl;
+    })();
     const result = await runNavigateClient(
       browserUrl,
       fullAppUrl,
-      getPagesHtmlFetchUrl(browserUrl, effectiveLocale),
+      getPagesHtmlFetchUrl(stateRouteUrl, effectiveLocale),
       { scroll: scrollTarget },
+      stateRouteUrl,
     );
     if (result === "completed") {
       routerEvents.emit("routeChangeComplete", fullAppUrl, { shallow: false });

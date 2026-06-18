@@ -48,6 +48,50 @@ describe("vinext next data client helpers", () => {
   });
 });
 
+describe("dynamic route href interpolation", () => {
+  it("preserves query and hash suffixes while interpolating", async () => {
+    const { interpolateDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(interpolateDynamicRouteHref("/blog/[slug]?preview=1#section", "/blog/post")).toEqual({
+      href: "/blog/post?preview=1#section",
+      params: ["slug"],
+      query: { preview: "1" },
+      routePathname: "/blog/[slug]",
+    });
+  });
+
+  it("treats a query marker after the hash as fragment text", async () => {
+    const { interpolateDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(interpolateDynamicRouteHref("/blog/[slug]#a?b=1", "/blog/post")).toEqual({
+      href: "/blog/post#a?b=1",
+      params: ["slug"],
+      query: {},
+      routePathname: "/blog/[slug]",
+    });
+  });
+
+  it("normalizes object-form query values for interpolation", async () => {
+    const { interpolateDynamicRouteHref } =
+      await import("../packages/vinext/src/shims/internal/interpolate-as.js");
+
+    expect(
+      interpolateDynamicRouteHref("/blog/[slug]?draft=true", "/blog/[slug]", {
+        slug: 42,
+        tag: ["one", 2],
+        missing: undefined,
+      }),
+    ).toEqual({
+      href: "/blog/42?draft=true",
+      params: ["slug"],
+      query: { slug: "42", tag: ["one", "2"] },
+      routePathname: "/blog/[slug]",
+    });
+  });
+});
+
 describe("slot BFCache entry ordering", () => {
   it("keeps the three most recent state-key entries", async () => {
     const { updateBfcacheSlotEntryOrder } = await import("../packages/vinext/src/shims/slot.js");
@@ -2913,6 +2957,69 @@ describe("window.next debug global", () => {
       );
     } finally {
       (globalThis as any).window = previousWindow;
+      globalThis.fetch = originalFetch;
+      vi.resetModules();
+    }
+  });
+
+  it("masked same-path pushes with a hash replace the current history entry", async () => {
+    const previousWindow = (globalThis as any).window;
+    const previousDocument = (globalThis as any).document;
+    const originalFetch = globalThis.fetch;
+    const pushState = vi.fn();
+    const replaceState = vi.fn();
+    const fetchSpy = vi.fn(async () => {
+      throw new Error("shallow Router.push must not fetch the page HTML");
+    });
+    const win: any = {
+      location: {
+        pathname: "/hello",
+        search: "",
+        hash: "",
+        href: "http://localhost/hello",
+        origin: "http://localhost",
+        hostname: "localhost",
+        assign: vi.fn(),
+        replace: vi.fn(),
+        reload: vi.fn(),
+      },
+      history: { state: null, pushState, replaceState },
+      addEventListener() {},
+      dispatchEvent() {},
+      scrollTo() {},
+      __NEXT_DATA__: { page: "/hello", query: {}, isFallback: false },
+    };
+    (globalThis as any).window = win;
+    (globalThis as any).document = {
+      getElementById: vi.fn(() => null),
+      getElementsByName: vi.fn(() => []),
+    };
+    globalThis.fetch = fetchSpy as any;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+
+      const result = await routerModule.default.push("/something-else", "/hello#section", {
+        shallow: true,
+      });
+
+      expect(result).toBe(true);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(pushState).not.toHaveBeenCalled();
+      expect(replaceState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          __N: true,
+          url: "/something-else",
+          as: "/hello",
+        }),
+        "",
+        "/hello#section",
+      );
+    } finally {
+      (globalThis as any).window = previousWindow;
+      if (previousDocument === undefined) delete (globalThis as any).document;
+      else (globalThis as any).document = previousDocument;
       globalThis.fetch = originalFetch;
       vi.resetModules();
     }
@@ -14842,6 +14949,69 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
+  it("Pages Router localizes masked route and display URLs to a non-default locale", async () => {
+    const previousWindow = (globalThis as any).window;
+    const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
+    const originalFetch = globalThis.fetch;
+    const { win } = createNavWindow();
+    const pageModuleUrl = path.resolve(import.meta.dirname, "fixtures/client-navigation-page.tsx");
+    win.location.pathname = "/docs/en/hello";
+    win.location.href = "http://localhost/docs/en/hello";
+    win.__VINEXT_LOCALE__ = "en";
+    win.__VINEXT_LOCALES__ = ["en", "fr"];
+    win.__VINEXT_DEFAULT_LOCALE__ = "en";
+    (globalThis as any).window = win;
+    process.env.__NEXT_ROUTER_BASEPATH = "/docs";
+
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          buildNavHtml(
+            "/something-else",
+            pageModuleUrl,
+            {},
+            {
+              locale: "fr",
+              locales: ["en", "fr"],
+              defaultLocale: "en",
+            },
+          ),
+        ),
+    );
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+
+      const result = await routerModule.default.push("/something-else", "/hello", {
+        locale: "fr",
+      });
+
+      expect(result).toBe(true);
+      expect(fetch).toHaveBeenCalledWith("/docs/fr/something-else", expect.any(Object));
+      expect(win.history.pushState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: "/fr/something-else",
+          as: "/fr/hello",
+          options: expect.objectContaining({ locale: "fr" }),
+        }),
+        "",
+        "/docs/fr/hello",
+      );
+      expect(win.location.pathname).toBe("/docs/fr/hello");
+      expect(win.__NEXT_DATA__.page).toBe("/something-else");
+      expect(win.__VINEXT_LOCALE__).toBe("fr");
+    } finally {
+      if (previousBasePath === undefined) delete process.env.__NEXT_ROUTER_BASEPATH;
+      else process.env.__NEXT_ROUTER_BASEPATH = previousBasePath;
+      vi.resetModules();
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("Pages Router maps /_error through a non-default locale while preserving the masked URL", async () => {
     const previousWindow = (globalThis as any).window;
     const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
@@ -15643,6 +15813,60 @@ describe("Pages Router concurrent navigation", () => {
       } else {
         process.env.__NEXT_SCROLL_RESTORATION = originalScrollRestorationEnv;
       }
+    }
+  });
+
+  it("beforePopState receives the stored href and as values for masked history entries", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const listeners = new Map<string, (event: any) => void>();
+    const { win } = createNavWindow();
+
+    win.addEventListener = vi.fn((type: string, handler: (event: any) => void) => {
+      listeners.set(type, handler);
+    });
+    (globalThis as any).window = win;
+    globalThis.fetch = vi.fn();
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      const popstateHandler = listeners.get("popstate");
+      expect(popstateHandler).toBeDefined();
+
+      const beforePopState = vi.fn(() => false);
+      (win as any).next.router.beforePopState(beforePopState);
+
+      win.location.pathname = "/hello";
+      win.location.href = "http://localhost/hello";
+      popstateHandler!({
+        state: {
+          __N: true,
+          url: "/something-else",
+          as: "/hello",
+          options: { shallow: true, locale: "en" },
+          key: "key-masked",
+        },
+      });
+
+      expect(beforePopState).toHaveBeenCalledWith({
+        url: "/something-else",
+        as: "/hello",
+        options: { shallow: true, locale: "en" },
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
     }
   });
 

@@ -72,6 +72,7 @@ import {
   prefetchPagesData,
   resolvePagesDataNavigationTarget,
 } from "./internal/pages-data-target.js";
+import { interpolateDynamicRouteHref } from "./internal/interpolate-as.js";
 import { markAppRouteDetectedOnPrefetch } from "./internal/app-route-detection.js";
 import { resolveHybridClientRouteOwner } from "./internal/hybrid-client-route-owner.js";
 import { getCurrentBrowserLocale } from "./client-locale.js";
@@ -757,6 +758,31 @@ function applyLocaleToHref(href: string, locale: string | false | undefined): st
   return addLocalePrefix(href, resolvedLocale, defaultLocale);
 }
 
+/**
+ * For the `<Link href="/blog/[slug]" as="/blog/test-post">` case, project the
+ * bracket-pattern href + the resolved `as` back into a concrete route URL the
+ * Pages Router can fetch (`/blog/test-post`). Returns null when:
+ *   - `href` has no bracket params (already concrete; the existing forwarding
+ *     path works as-is)
+ *   - interpolation fails because a required param could not be resolved
+ *     (caller falls back to `as`, matching pre-PR behavior)
+ *
+ * The query for interpolation is the href's own query — `as` is the matcher
+ * input rather than the source of param values. For string hrefs the search
+ * portion is parsed into the query record; for object hrefs we take
+ * `href.query` directly.
+ */
+function resolveConcreteRouteHref(href: LinkProps["href"], as: string | undefined): string | null {
+  if (typeof as !== "string") return null;
+  const hrefStr = typeof href === "string" ? href : resolveHref(href);
+  const projection = interpolateDynamicRouteHref(
+    hrefStr,
+    as,
+    typeof href === "string" ? undefined : href.query,
+  );
+  return projection?.href || null;
+}
+
 const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   {
     href,
@@ -791,8 +817,29 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
   }
 
   // If `as` is provided, use it as the actual URL (legacy Next.js pattern
-  // where href is a route pattern like "/user/[id]" and as is "/user/1")
+  // where href is a route pattern like "/user/[id]" and as is "/user/1").
+  // The rendered anchor / prefetch / locale / trailingSlash / basePath math
+  // all run on the display value below; a concrete route-pattern href is
+  // retained as `routeHrefRaw` so the Pages Router click branch can forward
+  // the (href, as) pair to `router.push/replace` and preserve upstream
+  // semantics (popstate fetches by href; same-asPath clicks coerce to
+  // replaceState). When `as` is absent, routeHrefRaw === rawResolvedHref.
+  //
+  // Dynamic-route case: when `href` is a bracket pattern like "/blog/[slug]"
+  // and `as` is the resolved display URL, the raw `href` itself is NOT
+  // server-routable — the Pages Router data endpoint and HTML fetch would
+  // both target `/_next/data/<id>/blog/[slug].json` and `/blog/[slug]`. Run
+  // it through the Next.js `interpolateAs` helper (extracts params from `as`
+  // when href and as differ, otherwise falls back to the href's own query)
+  // to get a concrete URL the router can fetch. If interpolation fails (a
+  // required param could not be resolved), fall back to `as` so behavior
+  // matches the pre-PR documented use of `as` as the navigation target.
+  // Mirrors Next.js' Router.change(): `getRouteRegex` + `interpolateAs`
+  // computes `resolvedAs` for the dynamic-route branch (packages/next/src/
+  // shared/lib/router/router.ts around L987).
   const rawResolvedHref = as ?? resolveHref(href);
+  const concreteRouteHref = resolveConcreteRouteHref(href, as);
+  const routeHrefRaw = concreteRouteHref ?? (typeof href === "string" ? href : resolveHref(href));
 
   // Mirror Next.js: emit a console.error when the href contains repeated
   // forward-slashes (e.g. "/foo//bar") or backslashes, and then normalize the
@@ -990,6 +1037,17 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     const pagesNavigateHref = resolvedHref.startsWith("?")
       ? resolvePagesLinkNavigationHref(resolvedHref, locale)
       : navigateHref;
+    // When the Link author passed both `href` (route pattern) AND `as` (mask),
+    // forward the original route-pattern href to Pages Router as the `url`
+    // argument. The router uses `url` to fetch the page module / data, while
+    // `as` drives the address bar — matching upstream Next.js Link → Router
+    // semantics. When no mask is present, leave `pagesAsForLink` undefined so
+    // existing single-arg navigation (the dominant code path) is unaffected.
+    const pagesAsForLink =
+      typeof as === "string" && typeof routeHrefRaw === "string" && as !== routeHrefRaw
+        ? pagesNavigateHref
+        : undefined;
+    const pagesHrefForLink = pagesAsForLink === undefined ? pagesNavigateHref : routeHrefRaw;
     // Resolve relative hrefs (#hash, ?query) for onNavigate and the hard-navigation fallback.
     // Pages query-only links must use the rewrite-aware target resolved above,
     // so callbacks and router-error fallback agree with the actual navigation.
@@ -1077,7 +1135,8 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
         router: pagesRouter,
         loadRouter: async () => (await import("next/router")).default,
         navigation: {
-          href: pagesNavigateHref,
+          href: pagesHrefForLink,
+          as: pagesAsForLink,
           replace,
           scroll,
           shallow,
