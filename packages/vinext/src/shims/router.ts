@@ -2562,7 +2562,7 @@ async function performNavigation(
   if (
     mode === "push" &&
     interpolatedRoute !== resolved &&
-    full === routerRuntimeState.lastPathnameAndSearch &&
+    stripHash(full) === routerRuntimeState.lastPathnameAndSearch &&
     navigationLocale === currentLocale
   ) {
     mode = "replace";

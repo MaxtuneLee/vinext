@@ -18,7 +18,7 @@
  * never appear in Pages Router patterns.
  */
 
-import { removeTrailingSlash } from "../../utils/base-path";
+import { removeTrailingSlash } from "../../utils/base-path.js";
 
 /**
  * Wire-compatible alias for Node's `querystring.ParsedUrlQuery`. Inlined here
