@@ -321,7 +321,7 @@ function installManualScrollRestoration(): void {
 type BeforePopStateCallback = (state: {
   url: string;
   as: string;
-  options: { shallow: boolean };
+  options: TransitionOptions;
 }) => boolean;
 
 export type NextRouter = {
@@ -2851,9 +2851,9 @@ function PagesRouterProvider({ children }: { children: ReactNode }): ReactElemen
 // (for example, a hash-only push followed by goBack).
 
 function isNextRouterState(state: unknown): state is {
-  url?: string;
-  as?: string;
-  options?: { locale?: string; shallow?: boolean };
+  url: string;
+  as: string;
+  options: TransitionOptions;
   __N: true;
   key?: string;
 } {
@@ -2861,7 +2861,14 @@ function isNextRouterState(state: unknown): state is {
     typeof state === "object" &&
     state !== null &&
     "__N" in state &&
-    (state as { __N?: unknown }).__N === true
+    (state as { __N?: unknown }).__N === true &&
+    "url" in state &&
+    typeof (state as { url?: unknown }).url === "string" &&
+    "as" in state &&
+    typeof (state as { as?: unknown }).as === "string" &&
+    "options" in state &&
+    typeof (state as { options?: unknown }).options === "object" &&
+    (state as { options?: unknown }).options !== null
   );
 }
 
@@ -2952,10 +2959,19 @@ function handlePagesRouterPopState(e: PopStateEvent): void {
 
   // Check beforePopState callback
   if (routerRuntimeState.beforePopStateCb !== undefined) {
+    const beforePopStateState = isNextRouterState(state)
+      ? {
+          url: state.url,
+          as: state.as,
+          options: state.options,
+        }
+      : {
+          url: appUrl,
+          as: appUrl,
+          options: { shallow: false },
+        };
     const shouldContinue = routerRuntimeState.beforePopStateCb({
-      url: appUrl,
-      as: appUrl,
-      options: { shallow: false },
+      ...beforePopStateState,
     });
     if (!shouldContinue) return;
   }
@@ -2994,7 +3010,7 @@ function handlePagesRouterPopState(e: PopStateEvent): void {
   // when computing the fetch URL so default-locale roots still go through
   // their locale-qualified HTML endpoint (parity with the push path).
   const stateLocale = isNextRouterState(state) ? state.options?.locale : undefined;
-  const effectiveLocale = stateLocale ?? window.__VINEXT_LOCALE__;
+  const effectiveLocale = typeof stateLocale === "string" ? stateLocale : window.__VINEXT_LOCALE__;
 
   const fullAppUrl = appUrl + window.location.hash;
   routerEvents.emit("routeChangeStart", fullAppUrl, { shallow: false });

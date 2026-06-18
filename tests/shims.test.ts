@@ -15637,6 +15637,60 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
+  it("beforePopState receives the stored href and as values for masked history entries", async () => {
+    const previousWindow = (globalThis as any).window;
+    const originalFetch = globalThis.fetch;
+    const listeners = new Map<string, (event: any) => void>();
+    const { win } = createNavWindow();
+
+    win.addEventListener = vi.fn((type: string, handler: (event: any) => void) => {
+      listeners.set(type, handler);
+    });
+    (globalThis as any).window = win;
+    globalThis.fetch = vi.fn();
+
+    try {
+      vi.resetModules();
+      await import("../packages/vinext/src/shims/router.js");
+      const { installPagesRouterRuntime } =
+        await import("../packages/vinext/src/shims/pages-router-runtime.js");
+      installPagesRouterRuntime();
+
+      const popstateHandler = listeners.get("popstate");
+      expect(popstateHandler).toBeDefined();
+
+      const beforePopState = vi.fn(() => false);
+      (win as any).next.router.beforePopState(beforePopState);
+
+      win.location.pathname = "/hello";
+      win.location.href = "http://localhost/hello";
+      popstateHandler!({
+        state: {
+          __N: true,
+          url: "/something-else",
+          as: "/hello",
+          options: { shallow: true, locale: "en" },
+          key: "key-masked",
+        },
+      });
+
+      expect(beforePopState).toHaveBeenCalledWith({
+        url: "/something-else",
+        as: "/hello",
+        options: { shallow: true, locale: "en" },
+      });
+      expect(globalThis.fetch).not.toHaveBeenCalled();
+    } finally {
+      vi.resetModules();
+      if (previousWindow === undefined) {
+        delete (globalThis as any).window;
+      } else {
+        (globalThis as any).window = previousWindow;
+      }
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   // A hash-only back/forward under manual scroll restoration honors only the
   // hash anchor: the target entry's `__next_scroll_<key>` snapshot is read but
   // intentionally not applied, matching Next.js where change()'s
