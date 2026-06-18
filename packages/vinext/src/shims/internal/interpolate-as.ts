@@ -25,7 +25,7 @@ import type { UrlQuery } from "../../utils/query.js";
  * Wire-compatible alias for Node's `querystring.ParsedUrlQuery`. Inlined here
  * so this module has no dependency on the `querystring` types package.
  */
-export type ParsedUrlQuery = { [key: string]: string | string[] | undefined };
+type ParsedUrlQuery = { [key: string]: string | string[] | undefined };
 
 export type DynamicRouteHrefProjection = {
   href: string;
@@ -203,7 +203,7 @@ function getRouteMatcher({ re, groups }: RouteRegex) {
  * (in dev) on the empty-string case; this helper deliberately stays silent —
  * matching Next.js' behavior, where `<Link>` itself owns the dev warning.
  */
-export function interpolateAs(
+function interpolateAs(
   route: string,
   asPathname: string,
   query: ParsedUrlQuery,
