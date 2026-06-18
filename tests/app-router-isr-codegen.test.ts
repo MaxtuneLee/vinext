@@ -38,6 +38,16 @@ describe("generateRscEntry ISR code generation", () => {
     expect(code).toContain("export default createAppRscHandler({");
   });
 
+  it("configures the cache through the lightweight handler runtime", () => {
+    const code = generateRscEntry("/tmp/test/app", minimalRoutes);
+    expect(code).toContain(
+      'configureMemoryCacheHandler as __configureMemoryCacheHandler } from "vinext/shims/cache-handler"',
+    );
+    expect(code).not.toContain(
+      'configureMemoryCacheHandler as __configureMemoryCacheHandler } from "next/cache"',
+    );
+  });
+
   it("generated code stores root layout params separately from leaf params", () => {
     const routes = [
       {
@@ -181,9 +191,12 @@ describe("generateRscEntry ISR code generation", () => {
   it("generated code exposes prerender cache seeding from the RSC module graph", () => {
     const code = generateRscEntry("/tmp/test/app", minimalRoutes);
 
-    expect(code).toContain("seedMemoryCacheFromPrerender as __seedMemoryCacheFromPrerender");
+    expect(code).toMatch(/await import\("[^"]*seed-cache\.js"\)/);
+    expect(code).not.toMatch(
+      /import \{\s*seedMemoryCacheFromPrerender as __seedMemoryCacheFromPrerender/,
+    );
     expect(code).toContain("isrSetPrerenderedAppPage as __isrSetPrerenderedAppPage");
-    expect(code).toContain("export function seedMemoryCacheFromPrerender(serverDir)");
+    expect(code).toContain("export async function seedMemoryCacheFromPrerender(serverDir)");
     expect(code).toContain("buildAppPageHtmlKey(pathname)");
     expect(code).toContain("return __isrHtmlKey(pathname)");
     expect(code).toContain("buildAppPageRscKey(pathname)");
