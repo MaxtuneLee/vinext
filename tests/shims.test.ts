@@ -14940,6 +14940,69 @@ describe("Pages Router concurrent navigation", () => {
     }
   });
 
+  it("Pages Router localizes masked route and display URLs to a non-default locale", async () => {
+    const previousWindow = (globalThis as any).window;
+    const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
+    const originalFetch = globalThis.fetch;
+    const { win } = createNavWindow();
+    const pageModuleUrl = path.resolve(import.meta.dirname, "fixtures/client-navigation-page.tsx");
+    win.location.pathname = "/docs/en/hello";
+    win.location.href = "http://localhost/docs/en/hello";
+    win.__VINEXT_LOCALE__ = "en";
+    win.__VINEXT_LOCALES__ = ["en", "fr"];
+    win.__VINEXT_DEFAULT_LOCALE__ = "en";
+    (globalThis as any).window = win;
+    process.env.__NEXT_ROUTER_BASEPATH = "/docs";
+
+    const fetch = vi.fn(
+      async () =>
+        new Response(
+          buildNavHtml(
+            "/something-else",
+            pageModuleUrl,
+            {},
+            {
+              locale: "fr",
+              locales: ["en", "fr"],
+              defaultLocale: "en",
+            },
+          ),
+        ),
+    );
+    globalThis.fetch = fetch;
+
+    try {
+      vi.resetModules();
+      const routerModule = await import("../packages/vinext/src/shims/router.js");
+
+      const result = await routerModule.default.push("/something-else", "/hello", {
+        locale: "fr",
+      });
+
+      expect(result).toBe(true);
+      expect(fetch).toHaveBeenCalledWith("/docs/fr/something-else", expect.any(Object));
+      expect(win.history.pushState).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: "/fr/something-else",
+          as: "/fr/hello",
+          options: expect.objectContaining({ locale: "fr" }),
+        }),
+        "",
+        "/docs/fr/hello",
+      );
+      expect(win.location.pathname).toBe("/docs/fr/hello");
+      expect(win.__NEXT_DATA__.page).toBe("/something-else");
+      expect(win.__VINEXT_LOCALE__).toBe("fr");
+    } finally {
+      if (previousBasePath === undefined) delete process.env.__NEXT_ROUTER_BASEPATH;
+      else process.env.__NEXT_ROUTER_BASEPATH = previousBasePath;
+      vi.resetModules();
+      if (previousWindow === undefined) delete (globalThis as any).window;
+      else (globalThis as any).window = previousWindow;
+      globalThis.fetch = originalFetch;
+    }
+  });
+
   it("Pages Router maps /_error through a non-default locale while preserving the masked URL", async () => {
     const previousWindow = (globalThis as any).window;
     const previousBasePath = process.env.__NEXT_ROUTER_BASEPATH;
