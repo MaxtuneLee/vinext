@@ -4130,6 +4130,22 @@ describe("production server compression", () => {
     expect(writtenHeaders.Vary).toBeUndefined();
   });
 
+  it("sendCompressed replaces an empty Vary header", async () => {
+    const { sendCompressed } = await import("../packages/vinext/src/server/prod-server.js");
+    const req = { headers: { "accept-encoding": "gzip" } };
+    let writtenHeaders: Record<string, string> = {};
+    const res = {
+      writeHead: (_status: number, headers: Record<string, string>) => {
+        writtenHeaders = headers;
+      },
+      end: () => {},
+    };
+
+    sendCompressed(req as any, res as any, "tiny", "text/plain", 200, { Vary: "" }, true);
+
+    expect(writtenHeaders.Vary).toBe("Accept-Encoding");
+  });
+
   it("sendCompressed does not compress small bodies", async () => {
     const { sendCompressed } = await import("../packages/vinext/src/server/prod-server.js");
 

@@ -372,6 +372,10 @@ function mergeVaryHeader(
 
   const rawVary = merged[existingKey];
   const existingVary = Array.isArray(rawVary) ? rawVary.join(", ") : rawVary;
+  if (existingVary.trim().length === 0) {
+    merged[existingKey] = value;
+    return merged;
+  }
   const values = existingVary.split(",").map((entry) => entry.trim().toLowerCase());
   if (!values.includes("*") && !values.includes(value.toLowerCase())) {
     merged[existingKey] = `${existingVary}, ${value}`;
