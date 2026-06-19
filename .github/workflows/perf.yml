@@ -235,11 +235,13 @@ jobs:
             for relative_path in "${project_roots[@]}"; do
               local path="$root/$relative_path"
               sudo chmod +t "$path"
-              sudo setfacl -m u:"$user":wx "$path"
+              sudo setfacl -m u:"$user":rwx "$path"
+              sudo setfacl -m d:u:"$user":rwx,d:u:"$USER":rwx "$path"
             done
             local paths=(
               packages/vinext/dist
               packages/cloudflare/dist
+              node_modules/.vite/task-cache
               benchmarks/vinext/dist
               benchmarks/vinext/.vite
               benchmarks/vinext/node_modules/.vite
@@ -359,6 +361,7 @@ jobs:
             for path in \
               "$root/packages/vinext/dist" \
               "$root/packages/cloudflare/dist" \
+              "$root/node_modules/.vite/task-cache" \
               "$root/benchmarks/nextjs/node_modules"; do
               sudo chown -R "$USER":"$USER" "$path"
               sudo setfacl -R -x u:"$user" "$path"
