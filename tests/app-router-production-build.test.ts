@@ -58,6 +58,24 @@ describe("App Router Production build", () => {
     // directory.
     const clientAssets = fs.readdirSync(path.join(outDir, "client", "_next", "static", "chunks"));
     expect(clientAssets.some((f: string) => f.endsWith(".js"))).toBe(true);
+    const clientJs = readAllJs(path.join(outDir, "client"));
+
+    // Ported from Next.js:
+    // test/production/app-dir/browser-chunks/browser-chunks.test.ts
+    // https://github.com/vercel/next.js/blob/canary/test/production/app-dir/browser-chunks/browser-chunks.test.ts
+    //
+    // Dev overlay and HMR plumbing must not create a production client chunk
+    // edge. Keep this list focused on symbols/module ids that only belong to
+    // vinext's App Router dev overlay path.
+    for (const devOnlyNeedle of [
+      "dev-error-overlay",
+      "vinext-dev-error-overlay",
+      "installDevErrorOverlay",
+      "installViteHmrErrorHandler",
+      "rsc:update",
+    ]) {
+      expect(clientJs).not.toContain(devOnlyNeedle);
+    }
 
     // Ported from the client-reference chunk ownership covered by Next.js:
     // test/e2e/app-dir/client-reference-chunking/client-reference-chunking.test.ts
