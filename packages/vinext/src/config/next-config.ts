@@ -383,6 +383,8 @@ export type ResolvedNextConfig = {
   optimizePackageImports: string[];
   /** Packages explicitly requested for server/client transpilation. */
   transpilePackages: string[];
+  /** Packages treated as application code by Turbopack's foreign-code condition. */
+  turbopackTranspilePackages: string[];
   /** Inline app CSS into production HTML (from experimental.inlineCss). */
   inlineCss: boolean;
   /** Parsed body size limit for server actions in bytes (from experimental.serverActions.bodySizeLimit). Defaults to 1MB. */
@@ -542,6 +544,7 @@ const CONFIG_FILES = [
   "next.config.cjs",
 ];
 const DEFAULT_EXPIRE_TIME = 31_536_000;
+const DEFAULT_TRANSPILED_PACKAGES = ["geist"];
 
 /**
  * Default cap for the App Router preload `Link` header length, matching the
@@ -1344,6 +1347,7 @@ export async function resolveNextConfig(
       serverActionsAllowedOrigins: [],
       optimizePackageImports: [],
       transpilePackages: [],
+      turbopackTranspilePackages: [...DEFAULT_TRANSPILED_PACKAGES],
       inlineCss: false,
       serverActionsBodySizeLimit: 1 * 1024 * 1024,
       serverActionsBodySizeLimitLabel: "1 MB",
@@ -1520,6 +1524,7 @@ export async function resolveNextConfig(
   );
   const serverExternalPackages = topLevelServerExternalPackages ?? legacyServerComponentsExternal;
   const transpilePackages = readStringArray(config.transpilePackages);
+  const turbopackTranspilePackages = [...transpilePackages, ...DEFAULT_TRANSPILED_PACKAGES];
 
   // Warn about unsupported experimental.swcEnvOptions. vinext uses Vite for
   // transforms, not SWC, so automatic polyfill injection is not applicable.
@@ -1666,6 +1671,7 @@ export async function resolveNextConfig(
     serverActionsAllowedOrigins,
     optimizePackageImports,
     transpilePackages,
+    turbopackTranspilePackages,
     inlineCss,
     serverActionsBodySizeLimit,
     serverActionsBodySizeLimitLabel,

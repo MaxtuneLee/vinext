@@ -1446,6 +1446,52 @@ describe("resolveNextConfig serverExternalPackages", () => {
   });
 });
 
+describe("resolveNextConfig transpilePackages", () => {
+  it("keeps Next.js defaults separate from configured transpile packages", async () => {
+    const resolved = await resolveNextConfig(null);
+    expect(resolved.transpilePackages).toEqual([]);
+    expect(resolved.turbopackTranspilePackages).toEqual(["geist"]);
+  });
+
+  it("includes configured packages before Turbopack defaults", async () => {
+    const resolved = await resolveNextConfig({
+      transpilePackages: ["custom-package", "@scope/pkg"],
+    });
+    expect(resolved.transpilePackages).toEqual(["custom-package", "@scope/pkg"]);
+    expect(resolved.turbopackTranspilePackages).toEqual(["custom-package", "@scope/pkg", "geist"]);
+  });
+
+  it("preserves Next.js duplicate package semantics", async () => {
+    const resolved = await resolveNextConfig({
+      transpilePackages: ["geist", "custom-package", "custom-package"],
+    });
+    expect(resolved.transpilePackages).toEqual(["geist", "custom-package", "custom-package"]);
+    expect(resolved.turbopackTranspilePackages).toEqual([
+      "geist",
+      "custom-package",
+      "custom-package",
+      "geist",
+    ]);
+  });
+
+  it("does not treat optimized packages as Turbopack-transpiled packages", async () => {
+    const resolved = await resolveNextConfig({
+      transpilePackages: ["custom-package"],
+      experimental: {
+        optimizePackageImports: ["optimized-package", "geist", "custom-package"],
+      },
+    });
+
+    expect(resolved.optimizePackageImports).toEqual([
+      "optimized-package",
+      "geist",
+      "custom-package",
+    ]);
+    expect(resolved.transpilePackages).toEqual(["custom-package"]);
+    expect(resolved.turbopackTranspilePackages).toEqual(["custom-package", "geist"]);
+  });
+});
+
 describe("resolveNextConfig serverActionsBodySizeLimit", () => {
   it("defaults to 1MB when no config is provided", async () => {
     const resolved = await resolveNextConfig(null);
@@ -1933,6 +1979,7 @@ describe("detectNextIntlConfig", () => {
       serverActionsAllowedOrigins: [],
       optimizePackageImports: [],
       transpilePackages: [],
+      turbopackTranspilePackages: ["geist"],
       inlineCss: false,
       serverActionsBodySizeLimit: 1 * 1024 * 1024,
       serverActionsBodySizeLimitLabel: "1 MB",
