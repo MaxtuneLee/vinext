@@ -124,6 +124,8 @@ export type PrerenderRouteResult =
       path?: string;
       /** Which router produced this route. Used by cache seeding. */
       router: "app" | "pages";
+      /** Response headers that must be replayed with the prerendered artifact. */
+      headers?: Record<string, string>;
       /** Set to true when this is a PPR fallback shell. */
       fallback?: boolean;
     }
@@ -1356,10 +1358,12 @@ export async function prerenderApp({
           async () => {
             const response = await rscHandler(htmlRequest);
             const cacheControl = response.headers.get("cache-control") ?? "";
+            const linkHeader = response.headers.get("link");
             if (!response.ok || (isSpeculative && cacheControl.includes("no-store"))) {
               await response.body?.cancel();
               return {
                 cacheControl,
+                linkHeader,
                 html: null,
                 ok: response.ok,
                 requestCacheLife: null,
@@ -1370,6 +1374,7 @@ export async function prerenderApp({
             const html = await response.text();
             return {
               cacheControl,
+              linkHeader,
               html,
               ok: true,
               requestCacheLife: _consumeRequestScopedCacheLife(),
@@ -1478,6 +1483,7 @@ export async function prerenderApp({
             ? { expire: renderedCacheControl.expire }
             : {}),
           router: "app",
+          ...(htmlRender.linkHeader ? { headers: { link: htmlRender.linkHeader } } : {}),
           ...(urlPath !== routePattern ? { path: urlPath } : {}),
           ...(isFallback ? { fallback: true } : {}),
         };
@@ -1631,6 +1637,7 @@ export function writePrerenderIndex(
         revalidate: r.revalidate,
         ...(typeof r.revalidate === "number" ? { expire: r.expire } : {}),
         router: r.router,
+        ...(r.headers ? { headers: r.headers } : {}),
         ...(r.path ? { path: r.path } : {}),
         ...(r.fallback ? { fallback: true } : {}),
       };

@@ -60,6 +60,7 @@ type AppPageCacheRenderResult = {
   cacheControl?: CacheControlMetadata;
   html: string;
   htmlRenderObservation?: RenderObservation;
+  linkHeader?: string;
   rscData: ArrayBuffer;
   rscRenderObservation?: RenderObservation;
   tags: string[];
@@ -153,6 +154,7 @@ function buildAppPageCachedHeaders(options: {
   cacheControl: string;
   cacheState: BuildAppPageCachedResponseOptions["cacheState"];
   contentType: string;
+  linkHeader?: string | string[];
   isEdgeRuntime?: boolean;
   middlewareHeaders?: Headers | null;
   mountedSlotsHeader?: string | null;
@@ -166,6 +168,14 @@ function buildAppPageCachedHeaders(options: {
   applyCdnResponseHeaders(headers, { cacheControl: options.cacheControl });
   setCacheStateHeaders(headers, options.cacheState);
   applyEdgeRuntimeHeader(headers, options.isEdgeRuntime);
+
+  if (options.linkHeader) {
+    if (Array.isArray(options.linkHeader)) {
+      for (const value of options.linkHeader) headers.append("Link", value);
+    } else {
+      headers.set("Link", options.linkHeader);
+    }
+  }
 
   if (options.mountedSlotsHeader) {
     headers.set(VINEXT_MOUNTED_SLOTS_HEADER, options.mountedSlotsHeader);
@@ -230,6 +240,7 @@ export function buildAppPageCachedResponse(
     cacheState: options.cacheState,
     contentType: "text/html; charset=utf-8",
     isEdgeRuntime: options.isEdgeRuntime,
+    linkHeader: cachedValue.headers?.link,
     middlewareHeaders: options.middlewareHeaders,
   });
 
@@ -422,6 +433,7 @@ export async function readAppPageCacheResponse(
                 undefined,
                 200,
                 revalidatedPage.htmlRenderObservation,
+                revalidatedPage.linkHeader ? { link: revalidatedPage.linkHeader } : undefined,
               ),
               revalidateSeconds,
               revalidatedPage.tags,
