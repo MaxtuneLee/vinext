@@ -65,7 +65,6 @@ async function buildAndServeFixture(): Promise<ProductionApp> {
   };
 }
 
-// One shared production app for all tests in this file
 let app: ProductionApp;
 
 test.beforeAll(async () => {
@@ -94,7 +93,6 @@ for (const withSlash of [true, false]) {
     expect(initialGeneratedAt).toBeTruthy();
     expect(initialGeneratedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
 
-    // In production mode: verify the page is stable across consecutive refreshes
     await page.reload();
     await waitForAppRouterHydration(page);
     const refreshedGeneratedAt = await page
