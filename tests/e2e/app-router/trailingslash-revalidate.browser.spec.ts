@@ -9,10 +9,7 @@ import {
 } from "../production-server";
 import { waitForAppRouterHydration } from "../helpers";
 
-const FIXTURE_DIR = path.resolve(
-  process.cwd(),
-  "tests/fixtures/app-trailing-slash-isr",
-);
+const FIXTURE_DIR = path.resolve(process.cwd(), "tests/fixtures/app-trailing-slash-isr");
 
 type ProductionApp = {
   baseUrl: string;
@@ -21,10 +18,7 @@ type ProductionApp = {
 };
 
 async function linkFixtureNodeModules(fixtureRoot: string): Promise<void> {
-  const sourceNodeModules = path.resolve(
-    process.cwd(),
-    "tests/fixtures/app-basic/node_modules",
-  );
+  const sourceNodeModules = path.resolve(process.cwd(), "tests/fixtures/app-basic/node_modules");
   const targetNodeModules = path.join(fixtureRoot, "node_modules");
   await fs.mkdir(targetNodeModules, { recursive: true });
   for (const entry of await fs.readdir(sourceNodeModules, {
@@ -40,14 +34,11 @@ async function linkFixtureNodeModules(fixtureRoot: string): Promise<void> {
 }
 
 async function buildAndServeFixture(): Promise<ProductionApp> {
-  const fixtureRoot = await fs.mkdtemp(
-    path.join(os.tmpdir(), "vinext-ts-revalidate-"),
-  );
+  const fixtureRoot = await fs.mkdtemp(path.join(os.tmpdir(), "vinext-ts-revalidate-"));
   await fs.cp(FIXTURE_DIR, fixtureRoot, { recursive: true });
   await linkFixtureNodeModules(fixtureRoot);
 
-  const vinext = (await import("../../../packages/vinext/src/index.js"))
-    .default;
+  const vinext = (await import("../../../packages/vinext/src/index.js")).default;
   const { createBuilder } = await import("vite");
   const builder = await createBuilder({
     root: fixtureRoot,
@@ -87,35 +78,25 @@ for (const withSlash of [true, false]) {
     await page.goto(`${app.baseUrl}/en`);
     await waitForAppRouterHydration(page);
 
-    const initialGeneratedAt = await page
-      .locator("#generated-at")
-      .textContent();
+    const initialGeneratedAt = await page.locator("#generated-at").textContent();
     expect(initialGeneratedAt).toBeTruthy();
     expect(initialGeneratedAt).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
 
     await page.reload();
     await waitForAppRouterHydration(page);
-    const refreshedGeneratedAt = await page
-      .locator("#generated-at")
-      .textContent();
+    const refreshedGeneratedAt = await page.locator("#generated-at").textContent();
 
     await expect(async () => {
       await page.reload();
       await waitForAppRouterHydration(page);
-      const refreshedAgainGeneratedAt = await page
-        .locator("#generated-at")
-        .textContent();
+      const refreshedAgainGeneratedAt = await page.locator("#generated-at").textContent();
       expect(refreshedAgainGeneratedAt).toBe(refreshedGeneratedAt);
     }).toPass({ timeout: 10_000 });
 
-    const buttonId = withSlash
-      ? "revalidate-button-with-slash"
-      : "revalidate-button-no-slash";
+    const buttonId = withSlash ? "revalidate-button-with-slash" : "revalidate-button-no-slash";
     await page.locator(`#${buttonId}`).click();
 
-    await expect(page.locator("#revalidate-result")).toContainText(
-      "Revalidated",
-    );
+    await expect(page.locator("#revalidate-result")).toContainText("Revalidated");
 
     await expect(async () => {
       await page.reload();

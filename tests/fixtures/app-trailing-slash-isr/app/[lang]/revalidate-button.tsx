@@ -25,10 +25,18 @@ export function RevalidateButton({ lang }: { lang: string }) {
 
   return (
     <div>
-      <button onClick={() => handleRevalidate(true)} disabled={isPending} id="revalidate-button-with-slash">
+      <button
+        onClick={() => handleRevalidate(true)}
+        disabled={isPending}
+        id="revalidate-button-with-slash"
+      >
         {isPending ? "Revalidating..." : `Revalidate /${lang}/`}
       </button>
-      <button onClick={() => handleRevalidate(false)} disabled={isPending} id="revalidate-button-no-slash">
+      <button
+        onClick={() => handleRevalidate(false)}
+        disabled={isPending}
+        id="revalidate-button-no-slash"
+      >
         {isPending ? "Revalidating..." : `Revalidate /${lang} (no slash)`}
       </button>
       {result && <pre id="revalidate-result">{result}</pre>}
