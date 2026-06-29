@@ -98,6 +98,8 @@ export type InitOptions = {
   force?: boolean;
   /** Deployment target selected by the user */
   platform?: InitPlatform;
+  /** Configure build-time pre-rendering for all discovered static routes */
+  prerender?: boolean;
   /** Cloudflare cache and image choices. */
   cloudflare?: CloudflareInitOptions;
   /** @internal — override exec for testing (avoids ESM spy issues) */
@@ -134,12 +136,13 @@ type InitResult = {
 
 // ─── Vite Config Generation (minimal, non-Cloudflare) ────────────────────────
 
-export function generateViteConfig(_isAppRouter: boolean): string {
+export function generateViteConfig(_isAppRouter: boolean, prerender = false): string {
+  const vinextCall = prerender ? `vinext({ prerender: { routes: "*" } })` : "vinext()";
   return `import vinext from "vinext";
 import { defineConfig } from "vite";
 
 export default defineConfig({
-  plugins: [vinext()],
+  plugins: [${vinextCall}],
 });
 `;
 }
@@ -312,6 +315,7 @@ type PlatformSetupContext = {
   existingViteConfigPath?: string;
   viteConfigExists: boolean;
   force: boolean;
+  prerender?: boolean;
   today?: string;
 };
 
@@ -334,7 +338,7 @@ function setupNodePlatform(context: PlatformSetupContext): PlatformSetupResult {
 
   fs.writeFileSync(
     context.existingViteConfigPath ?? path.join(context.root, "vite.config.ts"),
-    generateViteConfig(context.isAppRouter),
+    generateViteConfig(context.isAppRouter, context.prerender),
     "utf-8",
   );
   return {
@@ -423,6 +427,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
         root,
         isAppRouter: isApp,
         existingViteConfigPath,
+        prerender: options.prerender,
         today: options._today,
       },
       options.cloudflare!,
@@ -467,6 +472,7 @@ export async function init(options: InitOptions): Promise<InitResult> {
     existingViteConfigPath,
     viteConfigExists,
     force: options.force ?? false,
+    prerender: options.prerender,
     today: options._today,
   };
   const platformSetup =

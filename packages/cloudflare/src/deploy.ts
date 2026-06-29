@@ -18,6 +18,11 @@ import { runPrerender } from "vinext/internal/build/run-prerender";
 import { loadDotenv } from "vinext/internal/config/dotenv";
 import { loadNextConfig, resolveNextConfig } from "vinext/internal/config/next-config";
 import {
+  formatVinextPrerenderLabel,
+  loadVinextPrerenderConfigFromViteConfig,
+  resolveVinextPrerenderDecision,
+} from "vinext/internal/config/prerender";
+import {
   detectProject,
   findInNodeModules,
   formatMissingCloudflarePluginError,
@@ -62,6 +67,8 @@ export type DeployOptions = {
   /** TPR: analytics lookback window in hours (default: 24) */
   tprWindow?: number;
 };
+
+type ProjectViteApi = Pick<typeof import("vite"), "createBuilder" | "loadConfigFromFile">;
 
 function parsePositiveIntegerArg(raw: string, flag: string): number {
   if (raw === "") {
@@ -159,23 +166,25 @@ export async function withCloudflareEnv<T>(
   }
 }
 
-async function runBuild(info: ProjectInfo, env: string | undefined): Promise<void> {
-  console.log("\n  Building for Cloudflare Workers...\n");
-
+async function loadProjectViteApi(root: string): Promise<ProjectViteApi> {
   // Resolve Vite from the project root so that symlinked vinext installs
   // (bun link / npm link) use the project's Vite, not the monorepo copy.
   // This mirrors the loadVite() pattern in cli.ts.
   let vitePath: string;
   try {
-    const req = createRequire(path.join(info.root, "package.json"));
+    const req = createRequire(path.join(root, "package.json"));
     vitePath = req.resolve("vite");
   } catch {
     vitePath = "vite";
   }
   const viteUrl = vitePath === "vite" ? vitePath : pathToFileURL(vitePath).href;
-  const { createBuilder } = (await import(/* @vite-ignore */ viteUrl)) as {
-    createBuilder: typeof import("vite").createBuilder;
-  };
+  return (await import(/* @vite-ignore */ viteUrl)) as ProjectViteApi;
+}
+
+async function runBuild(info: ProjectInfo, env: string | undefined): Promise<void> {
+  console.log("\n  Building for Cloudflare Workers...\n");
+
+  const { createBuilder } = await loadProjectViteApi(info.root);
 
   // Use Vite's JS API for the build. The Vite config prepared by `vinext init`
   // has the cloudflare() plugin which handles the Worker output format.
@@ -378,26 +387,36 @@ export async function deploy(options: DeployOptions): Promise<void> {
   }
 
   // Step 5: Build
+  const buildEnv = deployEnv === "production" && !options.env ? undefined : deployEnv;
   if (!options.skipBuild) {
-    await runBuild(info, deployEnv === "production" && !options.env ? undefined : deployEnv);
+    await runBuild(info, buildEnv);
   } else {
     console.log("\n  Skipping build (--skip-build)");
   }
 
   // Step 6a: prerender — render every discovered route into dist.
-  // Triggered by --prerender-all, or automatically when next.config.js
-  // sets `output: 'export'` (every route must be statically exportable).
+  // Triggered by --prerender-all, vinext({ prerender: true }), or automatically
+  // when next.config.js sets `output: 'export'` (every route must be statically
+  // exportable). The CLI flag wins when more than one trigger is present.
   {
     const rawNextConfig = await loadNextConfig(info.root);
     const nextConfig = await resolveNextConfig(rawNextConfig, info.root);
-    const isStaticExport = nextConfig.output === "export";
 
-    if (options.prerenderAll || isStaticExport) {
-      const label =
-        isStaticExport && !options.prerenderAll
-          ? "Pre-rendering all routes (output: 'export')..."
-          : "Pre-rendering all routes...";
-      console.log(`\n  ${label}`);
+    const shouldLoadVinextPrerenderConfig = !options.prerenderAll && nextConfig.output !== "export";
+    const vinextPrerenderConfig = shouldLoadVinextPrerenderConfig
+      ? await withCloudflareEnv(buildEnv, async () => {
+          const vite = await loadProjectViteApi(info.root);
+          return loadVinextPrerenderConfigFromViteConfig(vite, info.root);
+        })
+      : null;
+    const prerenderDecision = resolveVinextPrerenderDecision({
+      prerenderAllFlag: options.prerenderAll,
+      vinextPrerenderConfig,
+      nextOutput: nextConfig.output,
+    });
+
+    if (prerenderDecision) {
+      console.log(`\n  ${formatVinextPrerenderLabel(prerenderDecision)}`);
       if (nextConfig.enablePrerenderSourceMaps) {
         process.setSourceMapsEnabled(true);
         Error.stackTraceLimit = Math.max(Error.stackTraceLimit, 50);
