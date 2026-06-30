@@ -17,7 +17,11 @@ describe("resolveAppPageSegmentConfig", () => {
     expect(
       resolveAppPageSegmentConfig({
         layouts: [
-          { revalidate: 120, dynamicParams: false, fetchCache: "default-cache" },
+          {
+            revalidate: 120,
+            dynamicParams: false,
+            fetchCache: "default-cache",
+          },
           { dynamic: "error", revalidate: 60 },
         ],
         page: { dynamic: "force-static", revalidate: 300 },
@@ -469,6 +473,80 @@ describe("resolveAppPageSegmentConfig", () => {
     ).toBe("edge");
 
     expect(resolveAppPageSegmentConfig({ page: {} }).runtime).toBeUndefined();
+  });
+
+  describe("unstable_prefetch", () => {
+    it("captures 'runtime' on the page segment", () => {
+      expect(resolveAppPageSegmentConfig({ page: { unstable_prefetch: "runtime" } })).toEqual({
+        revalidateSeconds: null,
+        prefetchConfig: "runtime",
+      });
+    });
+
+    it("captures 'static' on the page segment", () => {
+      expect(resolveAppPageSegmentConfig({ page: { unstable_prefetch: "static" } })).toEqual({
+        revalidateSeconds: null,
+        prefetchConfig: "static",
+      });
+    });
+
+    it("returns undefined prefetchConfig when not set", () => {
+      expect(resolveAppPageSegmentConfig({ page: {} }).prefetchConfig).toBeUndefined();
+    });
+
+    it("ignores unknown prefetch values", () => {
+      expect(
+        resolveAppPageSegmentConfig({
+          page: { unstable_prefetch: "nonsense" },
+        }).prefetchConfig,
+      ).toBeUndefined();
+    });
+
+    it("lets the page segment override the layout (child wins)", () => {
+      expect(
+        resolveAppPageSegmentConfig({
+          layouts: [{ unstable_prefetch: "static" }],
+          page: { unstable_prefetch: "runtime" },
+        }).prefetchConfig,
+      ).toBe("runtime");
+
+      expect(
+        resolveAppPageSegmentConfig({
+          layouts: [{ unstable_prefetch: "runtime" }],
+          page: { unstable_prefetch: "static" },
+        }).prefetchConfig,
+      ).toBe("static");
+    });
+
+    it("coexists with other segment config fields without interference", () => {
+      expect(
+        resolveAppPageSegmentConfig({
+          layouts: [{ dynamic: "force-static", revalidate: 120 }],
+          page: { unstable_prefetch: "runtime", revalidate: 60 },
+        }),
+      ).toEqual({
+        dynamicConfig: "force-static",
+        prefetchConfig: "runtime",
+        revalidateSeconds: 60,
+      });
+    });
+
+    it("applies main-chain priority for parallel segments", () => {
+      expect(
+        resolveAppPageSegmentConfig({
+          page: { unstable_prefetch: "static" },
+          parallelSegments: [{ unstable_prefetch: "runtime" }],
+        }).prefetchConfig,
+      ).toBe("static");
+
+      expect(
+        resolveAppPageSegmentConfig({
+          parallelSegments: [{ unstable_prefetch: "runtime" }],
+        }).prefetchConfig,
+      ).toBe("runtime");
+    });
+
+    // TODO: extend with 'partial' / 'unstable_eager' when #1819 lands
   });
 });
 

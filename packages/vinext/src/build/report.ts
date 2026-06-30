@@ -639,6 +639,70 @@ export function classifyLayoutSegmentConfig(code: string): LayoutBuildClassifica
   return { kind: "absent" };
 }
 
+// ─── Prefetch segment config validation ──────────────────────────────────────
+
+function hasUseClientDirective(program: Program): boolean {
+  const first = program.body[0];
+  if (first?.type !== "ExpressionStatement") return false;
+  const expr = first.expression;
+  // oxc represents "use client" as a Literal ExpressionStatement with directive set
+  return expr.type === "Literal" && (expr as { value: unknown }).value === "use client";
+}
+
+/**
+ * Pure validation core — returns warning strings for any violations.
+ * Accepts an already-parsed program so callers can test without file I/O.
+ *
+ * Mirrors upstream get-page-static-info.ts checks:
+ *   1. unstable_prefetch: 'runtime' requires cacheComponents: true
+ *   2. unstable_prefetch must not appear in a "use client" module
+ */
+export function validatePrefetchProgram(
+  program: Program,
+  filePath: string,
+  options: { cacheComponents: boolean },
+): string[] {
+  const prefetchValue = extractExportConstStringFromProgram(program, "unstable_prefetch");
+  if (!prefetchValue) return [];
+
+  const warnings: string[] = [];
+
+  if (hasUseClientDirective(program)) {
+    warnings.push(
+      `[vinext] ${filePath}: \`unstable_prefetch\` cannot be used in a "use client" module.`,
+    );
+  }
+
+  if (prefetchValue === "runtime" && !options.cacheComponents) {
+    warnings.push(
+      `[vinext] ${filePath}: \`unstable_prefetch: 'runtime'\` requires \`experimental.cacheComponents: true\`.`,
+    );
+  }
+
+  return warnings;
+}
+
+/**
+ * File-reading wrapper around validatePrefetchProgram.
+ * Called from prerender.ts once per route entry file during the build.
+ */
+export function validateAppSegmentPrefetchConfig(
+  filePath: string,
+  options: { cacheComponents: boolean },
+): void {
+  let code: string;
+  try {
+    code = fs.readFileSync(filePath, "utf8");
+  } catch {
+    return;
+  }
+  const program = parseRouteModule(code);
+  if (!program) return;
+  for (const warning of validatePrefetchProgram(program, filePath, options)) {
+    console.warn(warning);
+  }
+}
+
 // ─── Route classification ─────────────────────────────────────────────────────
 
 /**

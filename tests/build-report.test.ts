@@ -9,6 +9,7 @@ import { describe, it, expect, afterEach } from "vite-plus/test";
 import path from "node:path";
 import os from "node:os";
 import fs from "node:fs/promises";
+import { parseSync } from "vite";
 import {
   hasExportedName,
   hasNamedExport,
@@ -21,6 +22,7 @@ import {
   buildReportRows,
   formatBuildReport,
   printBuildReport,
+  validatePrefetchProgram,
 } from "../packages/vinext/src/build/report.js";
 import { appRouter, invalidateAppRouteCache } from "../packages/vinext/src/routing/app-router.js";
 import { invalidateRouteCache } from "../packages/vinext/src/routing/pages-router.js";
@@ -893,5 +895,70 @@ describe("classifyLayoutSegmentConfig", () => {
     expect(classifyLayoutSegmentConfig("export const revalidate = 60;")).toEqual({
       kind: "absent",
     });
+  });
+});
+
+// ─── validatePrefetchProgram ──────────────────────────────────────────────────
+
+function parse(code: string) {
+  return parseSync("page.tsx", code, { astType: "ts", lang: "tsx", sourceType: "module" }).program;
+}
+
+describe("validatePrefetchProgram", () => {
+  it("returns a cacheComponents warning for 'runtime' without cacheComponents", () => {
+    const warnings = validatePrefetchProgram(
+      parse("export const unstable_prefetch = 'runtime';"),
+      "app/page.tsx",
+      { cacheComponents: false },
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain("cacheComponents");
+  });
+
+  it("returns no warnings for 'runtime' when cacheComponents is enabled", () => {
+    expect(
+      validatePrefetchProgram(
+        parse("export const unstable_prefetch = 'runtime';"),
+        "app/page.tsx",
+        { cacheComponents: true },
+      ),
+    ).toEqual([]);
+  });
+
+  it("returns a use-client warning when unstable_prefetch appears in a 'use client' module", () => {
+    const warnings = validatePrefetchProgram(
+      parse(`"use client";\nexport const unstable_prefetch = 'runtime';`),
+      "app/page.tsx",
+      { cacheComponents: true },
+    );
+    expect(warnings).toHaveLength(1);
+    expect(warnings[0]).toContain('"use client"');
+  });
+
+  it("returns both warnings when 'use client' and missing cacheComponents combine", () => {
+    const warnings = validatePrefetchProgram(
+      parse(`"use client";\nexport const unstable_prefetch = 'runtime';`),
+      "app/page.tsx",
+      { cacheComponents: false },
+    );
+    expect(warnings).toHaveLength(2);
+    expect(warnings.some((w) => w.includes('"use client"'))).toBe(true);
+    expect(warnings.some((w) => w.includes("cacheComponents"))).toBe(true);
+  });
+
+  it("returns no warnings for 'static' regardless of cacheComponents", () => {
+    expect(
+      validatePrefetchProgram(parse("export const unstable_prefetch = 'static';"), "app/page.tsx", {
+        cacheComponents: false,
+      }),
+    ).toEqual([]);
+  });
+
+  it("returns empty array when unstable_prefetch is absent", () => {
+    expect(
+      validatePrefetchProgram(parse("export const dynamic = 'force-static';"), "app/page.tsx", {
+        cacheComponents: false,
+      }),
+    ).toEqual([]);
   });
 });

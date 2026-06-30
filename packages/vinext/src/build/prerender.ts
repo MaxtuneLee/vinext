@@ -25,7 +25,12 @@ import type { AppRoute } from "../routing/app-router.js";
 import type { ResolvedNextConfig } from "../config/next-config.js";
 import { buildPregeneratedConcretePathTable } from "../server/prerender-manifest.js";
 import { BLOCKED_PAGES } from "vinext/shims/constants";
-import { classifyPagesRoute, classifyAppRoute, getAppRouteRenderEntryPath } from "./report.js";
+import {
+  classifyPagesRoute,
+  classifyAppRoute,
+  getAppRouteRenderEntryPath,
+  validateAppSegmentPrefetchConfig,
+} from "./report.js";
 import {
   concatUint8Arrays,
   decodeRscEmbeddedChunk,
@@ -1197,6 +1202,10 @@ export async function prerenderApp({
       }
 
       if (!renderEntryPath) continue;
+
+      validateAppSegmentPrefetchConfig(renderEntryPath, {
+        cacheComponents: config.cacheComponents === true,
+      });
 
       // Use static analysis classification, but note its limitations for dynamic URLs:
       // classifyAppRoute() returns 'ssr' for dynamic URLs with no explicit config,

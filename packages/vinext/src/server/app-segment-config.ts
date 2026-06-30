@@ -11,6 +11,7 @@ type AppRouteSegmentConfigModule = {
   revalidate?: unknown;
   runtime?: unknown;
   unstable_dynamicStaleTime?: unknown;
+  unstable_prefetch?: unknown;
 };
 
 type EffectiveAppPageSegmentConfig = {
@@ -20,6 +21,7 @@ type EffectiveAppPageSegmentConfig = {
   fetchCache?: FetchCacheMode;
   revalidateSeconds: number | null;
   runtime?: "edge" | "experimental-edge" | "nodejs";
+  prefetchConfig?: RouteSegmentPrefetch; // no-op until #1819; string enum so 'partial'/'unstable_eager' can extend
 };
 
 type ParallelAppPageSegmentConfigBranch = {
@@ -61,6 +63,13 @@ function isRouteSegmentFetchCache(value: unknown): value is FetchCacheMode {
 
 function isRouteSegmentRuntime(value: unknown): value is EffectiveAppPageSegmentConfig["runtime"] {
   return value === "edge" || value === "experimental-edge" || value === "nodejs";
+}
+
+const PREFETCH_VALUES = new Set<unknown>(["static", "runtime"]);
+type RouteSegmentPrefetch = "static" | "runtime";
+
+function isRouteSegmentPrefetch(value: unknown): value is RouteSegmentPrefetch {
+  return PREFETCH_VALUES.has(value);
 }
 
 function resolveRevalidateSeconds(current: number | null, value: unknown): number | null {
@@ -282,6 +291,10 @@ export function resolveAppPageSegmentConfig(
       config.revalidateSeconds,
       segment.revalidate,
     );
+
+    if (isRouteSegmentPrefetch(segment.unstable_prefetch)) {
+      config.prefetchConfig = segment.unstable_prefetch;
+    }
   }
 
   for (const segment of parallelSegments) {
@@ -332,6 +345,10 @@ export function resolveAppPageSegmentConfig(
       config.revalidateSeconds,
       segment.revalidate,
     );
+
+    if (config.prefetchConfig === undefined && isRouteSegmentPrefetch(segment.unstable_prefetch)) {
+      config.prefetchConfig = segment.unstable_prefetch;
+    }
   }
 
   for (const segment of [options.page, ...(options.parallelPages ?? [])]) {
