@@ -610,7 +610,11 @@ export function classifyLayoutSegmentConfig(code: string): LayoutBuildClassifica
   if (dynamicValue === "force-dynamic") {
     return {
       kind: "dynamic",
-      reason: { layer: "segment-config", key: "dynamic", value: "force-dynamic" },
+      reason: {
+        layer: "segment-config",
+        key: "dynamic",
+        value: "force-dynamic",
+      },
     };
   }
   if (dynamicValue === "force-static" || dynamicValue === "error") {
@@ -650,8 +654,7 @@ function hasUseClientDirective(program: Program): boolean {
 }
 
 /**
- * Pure validation core — returns warning strings for any violations.
- * Accepts an already-parsed program so callers can test without file I/O.
+ * Validates the `unstable_prefetch` export in a route module.
  *
  * Mirrors upstream get-page-static-info.ts checks:
  *   1. unstable_prefetch: 'runtime' requires cacheComponents: true
@@ -968,7 +971,10 @@ export async function printBuildReport(options: {
     // Dynamic import to avoid loading routing code unless needed
     const { appRouter } = await import("../routing/app-router.js");
     const routes = await appRouter(appDir, options.pageExtensions);
-    const rows = buildReportRows({ appRoutes: routes, prerenderResult: options.prerenderResult });
+    const rows = buildReportRows({
+      appRoutes: routes,
+      prerenderResult: options.prerenderResult,
+    });
     if (rows.length > 0) {
       console.log("\n" + formatBuildReport(rows, "app"));
     }
