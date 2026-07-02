@@ -20,6 +20,7 @@
 
 import { NEXTJS_DEPLOYMENT_ID_HEADER } from "./headers.js";
 import { addBasePathToPathname, hasBasePath, stripBasePath } from "../utils/base-path.js";
+import { MIDDLEWARE_SKIP_HEADER } from "../utils/protocol-headers.js";
 
 const NEXT_DATA_PREFIX = "/_next/data/";
 const NEXT_DATA_SUFFIX = ".json";
@@ -153,6 +154,17 @@ export function buildNextDataNotFoundResponse(): Response {
     headers[NEXTJS_DEPLOYMENT_ID_HEADER] = deploymentId;
   }
   return new Response("{}", { status: 404, headers });
+}
+
+export function buildMiddlewarePrefetchSkipResponse(matchedPathname: string): Response {
+  return new Response("{}", {
+    headers: {
+      "Content-Type": "application/json",
+      "x-matched-path": matchedPathname,
+      [MIDDLEWARE_SKIP_HEADER]: "1",
+      "Cache-Control": "private, no-cache, no-store, max-age=0, must-revalidate",
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------

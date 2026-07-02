@@ -64,7 +64,7 @@ import {
   collectRouteClassificationManifest,
   type RouteClassificationManifest,
 } from "./build/route-classification-manifest.js";
-import { extractMiddlewareMatcherConfig } from "./build/report.js";
+import { extractMiddlewareMatcherConfig, hasExportedName } from "./build/report.js";
 import { planRouteClassificationInjection } from "./build/route-classification-injector.js";
 import { normalizePathnameForRouteMatchStrict } from "./routing/utils.js";
 import {
@@ -4721,6 +4721,27 @@ export const loadServerActionClient = ${
                 nextConfig?.pageExtensions,
                 fileMatcher,
               );
+              const devPageRouteDataKinds = new Map<string, "static" | "server" | "none">();
+              const classifyDevPageRoute = (
+                route: (typeof devPageRoutes)[number],
+              ): "static" | "server" | "none" => {
+                const cached = devPageRouteDataKinds.get(route.filePath);
+                if (cached) return cached;
+
+                let dataKind: "static" | "server" | "none" = "none";
+                try {
+                  const source = fs.readFileSync(route.filePath, "utf8");
+                  dataKind = hasExportedName(source, "getStaticProps")
+                    ? "static"
+                    : hasExportedName(source, "getServerSideProps")
+                      ? "server"
+                      : "none";
+                } catch {
+                  // Dev can race with an editor deleting/renaming a page file.
+                }
+                devPageRouteDataKinds.set(route.filePath, dataKind);
+                return dataKind;
+              };
 
               const pipelineDeps: PagesPipelineDeps = {
                 basePath: bp,
@@ -4753,7 +4774,13 @@ export const loadServerActionClient = ${
                     : resolvedPathname;
                   const m = matchRoute(routeUrl, devPageRoutes);
                   return m
-                    ? { route: { isDynamic: m.route.isDynamic, pattern: m.route.pattern } }
+                    ? {
+                        route: {
+                          dataKind: classifyDevPageRoute(m.route),
+                          isDynamic: m.route.isDynamic,
+                          pattern: m.route.pattern,
+                        },
+                      }
                     : null;
                 },
                 // Dev adapter: forward body from the Node req when proxying

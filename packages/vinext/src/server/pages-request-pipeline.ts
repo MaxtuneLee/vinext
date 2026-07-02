@@ -29,6 +29,7 @@ import {
   proxyExternalRequest,
   sanitizeDestination,
 } from "../config/config-matchers.js";
+import { buildMiddlewarePrefetchSkipResponse } from "./pages-data-route.js";
 import {
   applyConfigHeadersToHeaderRecord,
   cloneRequestWithUrl,
@@ -49,6 +50,10 @@ export type PagesRenderOptions = {
 };
 
 export type FilesystemRoutePhase = "direct" | "beforeFiles" | "afterFiles" | "fallback";
+
+type PageRouteMatch = {
+  route: { isDynamic: boolean; pattern?: string; dataKind?: "static" | "server" | "none" };
+};
 
 export async function fetchWorkerFilesystemRoute(
   request: Request,
@@ -110,12 +115,7 @@ export type PagesPipelineDeps = {
   rawSearch?: string;
 
   // Route + render/api callbacks (optional — if absent, emit intent instead of Response)
-  matchPageRoute?:
-    | ((
-        pathname: string,
-        request: Request,
-      ) => { route: { isDynamic: boolean; pattern?: string } } | null)
-    | null;
+  matchPageRoute?: ((pathname: string, request: Request) => PageRouteMatch | null) | null;
   runMiddleware?:
     | ((
         request: Request,
@@ -433,6 +433,31 @@ export async function runPagesRequest(
     }
     return matchResolvedPathname(matchedPathname);
   };
+  const buildMiddlewarePrefetchSkipResult = (
+    match: PageRouteMatch | null,
+  ): PagesPipelineResult | null => {
+    if (!match) return null;
+
+    const dataKind = match.route.dataKind;
+    if (
+      dataKind !== "server" ||
+      !isDataRequest ||
+      !deps.hasMiddleware ||
+      request.headers.get("x-middleware-prefetch") !== "1"
+    ) {
+      return null;
+    }
+
+    return {
+      type: "response",
+      response: mergeHeaders(
+        buildMiddlewarePrefetchSkipResponse(matchedPathnameForRoute(match.route.pattern)),
+        middlewareHeaders,
+        undefined,
+      ),
+      defaultContentType: "application/json",
+    };
+  };
 
   // Step 7: Config headers staging
   if (configHeaders.length) {
@@ -632,6 +657,8 @@ export async function runPagesRequest(
         if (renderPageMatch) break;
       }
     }
+    const prefetchSkipResult = buildMiddlewarePrefetchSkipResult(renderPageMatch);
+    if (prefetchSkipResult) return prefetchSkipResult;
     if (isOutsideBasePathUnclaimed()) return outOfBasePathNotFound();
     // A data request must not defer-render the error page or run fallback rewrites.
     // All adapters normalize real `/_next/data/` URLs before this point.
@@ -771,6 +798,8 @@ export async function runPagesRequest(
       if (devPageMatch) break;
     }
   }
+  const prefetchSkipResult = buildMiddlewarePrefetchSkipResult(devPageMatch);
+  if (prefetchSkipResult) return prefetchSkipResult;
   if (isOutsideBasePathUnclaimed()) return outOfBasePathNotFound();
   refreshDataRewriteHeader();
 

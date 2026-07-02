@@ -414,6 +414,7 @@ function prefetchUrl(
   mode: LinkPrefetchMode,
   priority: "low" | "high" = "low",
   pagesRouteHref?: string,
+  locale?: string | false,
 ): void {
   if (typeof window === "undefined") return;
 
@@ -789,7 +790,7 @@ function prefetchUrl(
         // The decision helper + prefetch action live in shims/internal/ so
         // this file does not pull in the router shim at module init time,
         // which would create a circular import and grow the SSR module graph.
-        const dataTarget = resolvePagesDataNavigationTarget(fullRouteHref, __basePath);
+        const dataTarget = resolvePagesDataNavigationTarget(fullRouteHref, __basePath, { locale });
         if (dataTarget) {
           const middlewareDataHref =
             fullRouteHref === fullHref
@@ -871,6 +872,7 @@ let sharedObserver: IntersectionObserver | null = null;
 type LinkPrefetchInstance = {
   href: string;
   isVisible: boolean;
+  locale?: string | false;
   mode: LinkPrefetchMode;
   pagesRouteHref?: string;
   queuedViewportPrefetch: boolean;
@@ -911,7 +913,7 @@ function setVisibleLinkPrefetch(instance: LinkPrefetchInstance, isVisible: boole
     if (instance.routerMode === "app") {
       scheduleVisibleAppPrefetch(instance);
     } else {
-      prefetchUrl(instance.href, instance.mode, "low", instance.pagesRouteHref);
+      prefetchUrl(instance.href, instance.mode, "low", instance.pagesRouteHref, instance.locale);
     }
     instance.viewportPrefetched = true;
   } else {
@@ -1234,6 +1236,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     const instance: LinkPrefetchInstance = {
       href: hrefToPrefetch,
       isVisible: false,
+      locale,
       mode: prefetchMode,
       pagesRouteHref:
         normalizedRouteHref === normalizedHref
@@ -1256,7 +1259,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       visibleLinkPrefetches.delete(instance);
       instance.isVisible = false;
     };
-  }, [shouldViewportPrefetch, prefetchMode, normalizedHref, normalizedRouteHref]);
+  }, [shouldViewportPrefetch, prefetchMode, normalizedHref, normalizedRouteHref, locale]);
 
   const prefetchOnIntent = useCallback(() => {
     if (
@@ -1282,6 +1285,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
       intentMode,
       "high",
       normalizedRouteHref === normalizedHref ? undefined : normalizedRouteHref,
+      locale,
     );
   }, [
     prefetchProp,
@@ -1289,6 +1293,7 @@ const Link = forwardRef<HTMLAnchorElement, LinkProps>(function Link(
     prefetchMode,
     normalizedHref,
     normalizedRouteHref,
+    locale,
     unstable_dynamicOnHover,
   ]);
 
