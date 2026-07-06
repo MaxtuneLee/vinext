@@ -1270,6 +1270,7 @@ type NitroSetupContext = {
   options: {
     dev?: boolean;
     routeRules?: Record<string, NitroRouteRuleConfig>;
+    traceDeps?: string[];
   };
   logger?: {
     warn?: (message: string) => void;
@@ -1301,6 +1302,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
   let hasCloudflarePlugin = false;
   let warnedInlineNextConfigOverride = false;
   let hasNitroPlugin = false;
+  let nitroTraceDepsFromServerExternals: string[] = [];
   let isServeCommand = false;
   let pagesOptimizeEntries: string[] = [];
   const pagesClientAssetsOutputDirs = new Set<string>();
@@ -2399,6 +2401,7 @@ export default function vinext(options: VinextOptions = {}): PluginOption[] {
           nextConfig?.serverExternalPackages,
           serverTranspilePackages,
         );
+        nitroTraceDepsFromServerExternals = nextServerExternal;
         // Detect if this is a multi-environment build (App Router or Cloudflare).
         // In multi-env builds, manualChunks must only be set per-environment
         // (on the client env), not globally — otherwise it leaks into RSC/SSR
@@ -6087,9 +6090,19 @@ export const loadServerActionClient = ${
       name: "vinext:nitro-route-rules",
       nitro: {
         setup: async (nitro: NitroSetupContext) => {
-          if (nitro.options.dev) return;
           if (!nextConfig) return;
           if (!hasAppDir && !hasPagesDir) return;
+
+          if (nitroTraceDepsFromServerExternals.length > 0) {
+            nitro.options.traceDeps = [
+              ...new Set([
+                ...(nitro.options.traceDeps ?? []),
+                ...nitroTraceDepsFromServerExternals,
+              ]),
+            ];
+          }
+
+          if (nitro.options.dev) return;
 
           const { collectNitroRouteRules, mergeNitroRouteRules } =
             await import("./build/nitro-route-rules.js");
