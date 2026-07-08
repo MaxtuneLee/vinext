@@ -25,6 +25,7 @@ import { parseSync } from "vite";
 import type { ESTree } from "vite";
 import type { Route } from "../routing/pages-router.js";
 import type { AppRoute } from "../routing/app-router.js";
+import { PREFETCH_VALUES } from "../server/app-segment-config.js";
 import { findDir } from "../utils/project.js";
 import type { LayoutBuildClassification } from "./layout-classification-types.js";
 import type { PrerenderResult } from "./prerender.js";
@@ -84,6 +85,41 @@ export function getAppRouteRenderEntryPath(route: AppRouteRenderEntry): string |
   }
 
   return null;
+}
+
+/**
+ * Enumerates the config-bearing module paths of a route (the same modules the
+ * runtime segment-config resolver reads), for build-time validation.
+ * Deduped, insertion order.
+ */
+export function collectAppRouteConfigModulePaths(
+  route: Pick<AppRoute, "pagePath" | "layouts" | "parallelSlots"> &
+    Partial<Pick<AppRoute, "siblingIntercepts">>,
+): string[] {
+  const paths = new Set<string>();
+  for (const p of [route.pagePath, ...route.layouts]) {
+    if (p != null) paths.add(p);
+  }
+  for (const slot of route.parallelSlots) {
+    for (const p of [
+      slot.layoutPath,
+      ...(slot.configLayoutPaths ?? []),
+      slot.pagePath,
+      slot.defaultPath,
+    ]) {
+      if (p != null) paths.add(p);
+    }
+    // Intercepting pages/layouts are rendered app entries too.
+    for (const intercept of slot.interceptingRoutes ?? []) {
+      for (const p of [intercept.pagePath, ...(intercept.layoutPaths ?? [])]) {
+        if (p != null) paths.add(p);
+      }
+    }
+  }
+  for (const intercept of route.siblingIntercepts ?? []) {
+    if (intercept.pagePath != null) paths.add(intercept.pagePath);
+  }
+  return [...paths];
 }
 
 // ─── Static export analysis ──────────────────────────────────────────────────
@@ -646,48 +682,72 @@ export function classifyLayoutSegmentConfig(code: string): LayoutBuildClassifica
 // ─── Prefetch segment config validation ──────────────────────────────────────
 
 function hasUseClientDirective(program: Program): boolean {
-  const first = program.body[0];
-  if (first?.type !== "ExpressionStatement") return false;
-  const expr = first.expression;
-  // oxc represents "use client" as a Literal ExpressionStatement with directive set
-  return expr.type === "Literal" && (expr as { value: unknown }).value === "use client";
+  // Scan the directive prologue: the leading run of string-literal
+  // ExpressionStatements (e.g. `"use strict"; "use client";`).
+  for (const node of program.body) {
+    if (node.type !== "ExpressionStatement") return false;
+    const expr = node.expression;
+    // oxc represents directives as Literal ExpressionStatements
+    if (expr.type !== "Literal" || typeof (expr as { value: unknown }).value !== "string") {
+      return false;
+    }
+    if ((expr as { value: unknown }).value === "use client") return true;
+  }
+  return false;
 }
 
+const PREFETCH_VALUE_LIST =
+  'Must be "auto", "partial", "unstable_eager", "force-disabled", or "allow-runtime".';
+
 /**
- * Validates the `unstable_prefetch` export in a route module.
+ * Validates the `prefetch` export in a route module.
  *
- * Mirrors upstream get-page-static-info.ts checks:
- *   1. unstable_prefetch: 'runtime' requires cacheComponents: true
- *   2. unstable_prefetch must not appear in a "use client" module
+ * Mirrors upstream get-page-static-info.ts (any `prefetch` export throws in a
+ * "use client" module and requires cacheComponents) plus the value-set check
+ * that upstream performs via zod in parseAppSegmentConfig.
+ *
+ * Throws on the first violation, in order: invalid value, "use client",
+ * missing cacheComponents.
  */
 export function validatePrefetchProgram(
   program: Program,
   filePath: string,
   options: { cacheComponents: boolean },
-): string[] {
-  const prefetchValue = extractExportConstStringFromProgram(program, "unstable_prefetch");
-  if (!prefetchValue) return [];
+): void {
+  // Mirror upstream: checks fire only for a statically extractable
+  // `export const prefetch` — specifier/re-export/type-only/`export let`
+  // forms are not analyzed and pass silently.
+  const initializer = findExportedConstInitializerInProgram(program, "prefetch");
+  if (initializer === null) return;
 
-  const warnings: string[] = [];
+  const prefetchValue = extractStringFromConstInitializer(initializer);
+  if (prefetchValue === null) {
+    throw new Error(`[vinext] Invalid \`prefetch\` value in "${filePath}". ${PREFETCH_VALUE_LIST}`);
+  }
+  if (!PREFETCH_VALUES.has(prefetchValue)) {
+    throw new Error(
+      `[vinext] Invalid \`prefetch\` value "${prefetchValue}" in "${filePath}". ${PREFETCH_VALUE_LIST}`,
+    );
+  }
 
   if (hasUseClientDirective(program)) {
-    warnings.push(
-      `[vinext] ${filePath}: \`unstable_prefetch\` cannot be used in a "use client" module.`,
+    throw new Error(
+      `[vinext] "${filePath}": \`prefetch\` is a route segment config that can only be used in a Server Component module. Remove the "use client" directive to use it.`,
     );
   }
 
-  if (prefetchValue === "runtime" && !options.cacheComponents) {
-    warnings.push(
-      `[vinext] ${filePath}: \`unstable_prefetch: 'runtime'\` requires \`experimental.cacheComponents: true\`.`,
+  if (!options.cacheComponents) {
+    throw new Error(
+      `[vinext] "${filePath}": \`export const prefetch\` requires \`cacheComponents: true\` in your next.config.`,
     );
   }
-
-  return warnings;
 }
 
 /**
  * File-reading wrapper around validatePrefetchProgram.
- * Called from prerender.ts once per route entry file during the build.
+ * Called from prerender.ts once per config-bearing module path (page + layouts
+ * + parallel slot modules), deduped by the caller. Silently returns when the
+ * file cannot be read or parsed; validation errors propagate.
  */
 export function validateAppSegmentPrefetchConfig(
   filePath: string,
@@ -701,9 +761,7 @@ export function validateAppSegmentPrefetchConfig(
   }
   const program = parseRouteModule(code);
   if (!program) return;
-  for (const warning of validatePrefetchProgram(program, filePath, options)) {
-    console.warn(warning);
-  }
+  validatePrefetchProgram(program, filePath, options);
 }
 
 // ─── Route classification ─────────────────────────────────────────────────────

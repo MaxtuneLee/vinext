@@ -8,10 +8,10 @@ type AppRouteSegmentConfigModule = {
   dynamicParams?: unknown;
   fetchCache?: unknown;
   generateStaticParams?: unknown;
+  prefetch?: unknown;
   revalidate?: unknown;
   runtime?: unknown;
   unstable_dynamicStaleTime?: unknown;
-  unstable_prefetch?: unknown;
 };
 
 type EffectiveAppPageSegmentConfig = {
@@ -21,7 +21,7 @@ type EffectiveAppPageSegmentConfig = {
   fetchCache?: FetchCacheMode;
   revalidateSeconds: number | null;
   runtime?: "edge" | "experimental-edge" | "nodejs";
-  prefetchConfig?: RouteSegmentPrefetch; // no-op until #1819; string enum so 'partial'/'unstable_eager' can extend
+  prefetchConfig?: RouteSegmentPrefetch; // unconsumed no-op until #1819; 'auto' is the default
 };
 
 type ParallelAppPageSegmentConfigBranch = {
@@ -65,8 +65,18 @@ function isRouteSegmentRuntime(value: unknown): value is EffectiveAppPageSegment
   return value === "edge" || value === "experimental-edge" || value === "nodejs";
 }
 
-const PREFETCH_VALUES = new Set<unknown>(["static", "runtime"]);
-type RouteSegmentPrefetch = "static" | "runtime";
+const PREFETCH_VALUE_LIST = [
+  "auto",
+  "partial",
+  "unstable_eager",
+  "force-disabled",
+  "allow-runtime",
+] as const;
+type RouteSegmentPrefetch = (typeof PREFETCH_VALUE_LIST)[number];
+// ReadonlySet<unknown> (not RouteSegmentPrefetch) so `.has()` accepts the
+// untyped module exports probed by the guard, like DYNAMIC_VALUES above.
+// Also the single source for build-time validation (build/report.ts).
+export const PREFETCH_VALUES: ReadonlySet<unknown> = new Set(PREFETCH_VALUE_LIST);
 
 function isRouteSegmentPrefetch(value: unknown): value is RouteSegmentPrefetch {
   return PREFETCH_VALUES.has(value);
@@ -292,8 +302,8 @@ export function resolveAppPageSegmentConfig(
       segment.revalidate,
     );
 
-    if (isRouteSegmentPrefetch(segment.unstable_prefetch)) {
-      config.prefetchConfig = segment.unstable_prefetch;
+    if (isRouteSegmentPrefetch(segment.prefetch)) {
+      config.prefetchConfig = segment.prefetch;
     }
   }
 
@@ -346,8 +356,8 @@ export function resolveAppPageSegmentConfig(
       segment.revalidate,
     );
 
-    if (config.prefetchConfig === undefined && isRouteSegmentPrefetch(segment.unstable_prefetch)) {
-      config.prefetchConfig = segment.unstable_prefetch;
+    if (config.prefetchConfig === undefined && isRouteSegmentPrefetch(segment.prefetch)) {
+      config.prefetchConfig = segment.prefetch;
     }
   }
 

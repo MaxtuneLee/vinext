@@ -475,58 +475,68 @@ describe("resolveAppPageSegmentConfig", () => {
     expect(resolveAppPageSegmentConfig({ page: {} }).runtime).toBeUndefined();
   });
 
-  describe("unstable_prefetch", () => {
-    it("captures 'runtime' on the page segment", () => {
-      expect(resolveAppPageSegmentConfig({ page: { unstable_prefetch: "runtime" } })).toEqual({
+  describe("prefetch", () => {
+    it("captures 'partial' on the page segment", () => {
+      expect(resolveAppPageSegmentConfig({ page: { prefetch: "partial" } })).toEqual({
         revalidateSeconds: null,
-        prefetchConfig: "runtime",
+        prefetchConfig: "partial",
       });
     });
 
-    it("captures 'static' on the page segment", () => {
-      expect(resolveAppPageSegmentConfig({ page: { unstable_prefetch: "static" } })).toEqual({
+    it("captures 'allow-runtime' on the page segment", () => {
+      expect(resolveAppPageSegmentConfig({ page: { prefetch: "allow-runtime" } })).toEqual({
         revalidateSeconds: null,
-        prefetchConfig: "static",
+        prefetchConfig: "allow-runtime",
       });
+    });
+
+    it("captures 'auto' (the default no-op value) on the page segment", () => {
+      expect(resolveAppPageSegmentConfig({ page: { prefetch: "auto" } }).prefetchConfig).toBe(
+        "auto",
+      );
     });
 
     it("returns undefined prefetchConfig when not set", () => {
       expect(resolveAppPageSegmentConfig({ page: {} }).prefetchConfig).toBeUndefined();
     });
 
-    it("ignores unknown prefetch values", () => {
+    it("ignores unknown and removed legacy prefetch values", () => {
       expect(
-        resolveAppPageSegmentConfig({
-          page: { unstable_prefetch: "nonsense" },
-        }).prefetchConfig,
+        resolveAppPageSegmentConfig({ page: { prefetch: "nonsense" } }).prefetchConfig,
+      ).toBeUndefined();
+      expect(
+        resolveAppPageSegmentConfig({ page: { prefetch: "static" } }).prefetchConfig,
+      ).toBeUndefined();
+      expect(
+        resolveAppPageSegmentConfig({ page: { prefetch: "runtime" } }).prefetchConfig,
       ).toBeUndefined();
     });
 
     it("lets the page segment override the layout (child wins)", () => {
       expect(
         resolveAppPageSegmentConfig({
-          layouts: [{ unstable_prefetch: "static" }],
-          page: { unstable_prefetch: "runtime" },
+          layouts: [{ prefetch: "partial" }],
+          page: { prefetch: "unstable_eager" },
         }).prefetchConfig,
-      ).toBe("runtime");
+      ).toBe("unstable_eager");
 
       expect(
         resolveAppPageSegmentConfig({
-          layouts: [{ unstable_prefetch: "runtime" }],
-          page: { unstable_prefetch: "static" },
+          layouts: [{ prefetch: "unstable_eager" }],
+          page: { prefetch: "force-disabled" },
         }).prefetchConfig,
-      ).toBe("static");
+      ).toBe("force-disabled");
     });
 
     it("coexists with other segment config fields without interference", () => {
       expect(
         resolveAppPageSegmentConfig({
           layouts: [{ dynamic: "force-static", revalidate: 120 }],
-          page: { unstable_prefetch: "runtime", revalidate: 60 },
+          page: { prefetch: "allow-runtime", revalidate: 60 },
         }),
       ).toEqual({
         dynamicConfig: "force-static",
-        prefetchConfig: "runtime",
+        prefetchConfig: "allow-runtime",
         revalidateSeconds: 60,
       });
     });
@@ -534,19 +544,17 @@ describe("resolveAppPageSegmentConfig", () => {
     it("applies main-chain priority for parallel segments", () => {
       expect(
         resolveAppPageSegmentConfig({
-          page: { unstable_prefetch: "static" },
-          parallelSegments: [{ unstable_prefetch: "runtime" }],
+          page: { prefetch: "partial" },
+          parallelSegments: [{ prefetch: "force-disabled" }],
         }).prefetchConfig,
-      ).toBe("static");
+      ).toBe("partial");
 
       expect(
         resolveAppPageSegmentConfig({
-          parallelSegments: [{ unstable_prefetch: "runtime" }],
+          parallelSegments: [{ prefetch: "force-disabled" }],
         }).prefetchConfig,
-      ).toBe("runtime");
+      ).toBe("force-disabled");
     });
-
-    // TODO: extend with 'partial' / 'unstable_eager' when #1819 lands
   });
 });
 
