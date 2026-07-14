@@ -6997,6 +6997,72 @@ describe("replyToCacheKey deterministic hashing", () => {
   });
 });
 
+describe("buildUseCacheKey logical handler keys", () => {
+  // Dynamic imports match this file's convention: shims are loaded inside each
+  // test to exercise per-test module state/loading boundaries.
+  it("builds keys from the function scope and serialized arguments", async () => {
+    const { buildUseCacheKey } = await import("../packages/vinext/src/shims/cache-runtime.js");
+    expect(buildUseCacheKey("mod#Comp", undefined)).toBe("use-cache:mod#Comp");
+    expect(buildUseCacheKey("mod#Comp", "dep-v1", '["a"]')).toBe(
+      'use-cache:build:dep-v1:mod#Comp:["a"]',
+    );
+  });
+
+  it("preserves long arguments verbatim for the selected cache handler", async () => {
+    const { buildUseCacheKey } = await import("../packages/vinext/src/shims/cache-runtime.js");
+    const longArgs = JSON.stringify([{ slug: "a".repeat(600) }]);
+    const key = buildUseCacheKey("mod#CachedRoute", "deploy-usecache-v1", longArgs);
+
+    expect(key).toBe(`use-cache:build:deploy-usecache-v1:mod#CachedRoute:${longArgs}`);
+    expect(key).not.toContain(":__hash:");
+  });
+});
+
+describe('"use cache" runtime — handler resilience', () => {
+  it("falls through to fresh execution when handler.get throws, preserving the function's notFound digest", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const { setCacheHandler, getCacheHandler, MemoryCacheHandler } =
+      await import("../packages/vinext/src/shims/cache.js");
+
+    // A cache backend failure must NOT surface as the render result — it must
+    // fall through so the function runs and its own thrown control-flow signal
+    // (e.g. notFound()'s digest) reaches the boundary classifier as a 404.
+    class GetThrowingHandler extends MemoryCacheHandler {
+      async get(_key?: string, _ctx?: Record<string, unknown>): Promise<never> {
+        throw new Error("cache backend unavailable");
+      }
+    }
+
+    const original = getCacheHandler();
+    setCacheHandler(new GetThrowingHandler());
+    // The get-failure path logs a diagnostic; silence it for this expected case.
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      let calls = 0;
+      const cached = registerCachedFunction(async () => {
+        calls++;
+        return { ok: true };
+      }, "test:get-throws");
+      expect(await cached()).toEqual({ ok: true });
+      expect(calls).toBe(1);
+
+      const notFoundError = Object.assign(new Error("NEXT_HTTP_ERROR_FALLBACK;404"), {
+        digest: "NEXT_HTTP_ERROR_FALLBACK;404",
+      });
+      const cachedNotFound = registerCachedFunction(async () => {
+        throw notFoundError;
+      }, "test:get-throws-notfound");
+      await expect(cachedNotFound()).rejects.toMatchObject({
+        digest: "NEXT_HTTP_ERROR_FALLBACK;404",
+      });
+    } finally {
+      errorSpy.mockRestore();
+      setCacheHandler(original);
+    }
+  });
+});
+
 describe("middleware runner", () => {
   it("findMiddlewareFile finds middleware.ts at project root", async () => {
     const { findMiddlewareFile } = await import("../packages/vinext/src/server/middleware.js");
