@@ -35,12 +35,14 @@ import {
   getPrefetchCache,
   hasPrefetchCacheEntryForNavigation,
   invalidatePrefetchCache,
+  preloadHybridClientRouteOwner,
   seedPrefetchResponseSnapshot,
   decodeRedirectError,
   isRedirectError,
   pushHistoryStateWithoutNotify,
   replaceClientParamsWithoutNotify,
   replaceHistoryStateWithoutNotify,
+  resolveLoadedHybridClientRewriteHref,
   resolvePrefetchCacheEntryMountedSlotsHeader,
   restoreRscResponse,
   saveScrollPosition,
@@ -68,7 +70,6 @@ import {
   consumeAppRouterScrollIntent,
   type AppRouterScrollIntent,
 } from "vinext/shims/app-router-scroll-state";
-import { resolveHybridClientRewriteHref } from "vinext/shims/internal/hybrid-client-route-owner";
 import { installWindowNext, setWindowNextInternalSourcePage } from "../client/window-next.js";
 import {
   chunksToReadableStream,
@@ -177,6 +178,7 @@ import {
   VINEXT_CLIENT_REUSE_MANIFEST_HEADER,
   VINEXT_PARAMS_HEADER,
   VINEXT_RSC_REDIRECT_HEADER,
+  VINEXT_RSC_REDIRECT_TYPE_HEADER,
 } from "./headers.js";
 import { removeStylesheetLinksCoveredByInlineCss } from "./app-inline-css-client.js";
 import {
@@ -185,6 +187,8 @@ import {
   type VisitedResponseCacheCandidateFacts,
 } from "./navigation-planner.js";
 import { hasServerActions, loadServerActionClient } from "virtual:vinext-app-capabilities";
+
+const HAS_CLIENT_REWRITES = process.env.__VINEXT_HAS_CLIENT_REWRITES !== "false";
 
 type SearchParamInput = ConstructorParameters<typeof URLSearchParams>[0];
 type DevErrorOverlayModule = typeof import("../client/dev-error-overlay.js");
@@ -1478,6 +1482,7 @@ async function main(): Promise<void> {
 
   if (hasServerActions) registerServerActionCallback();
   installAppNavigationFailureListeners();
+  if (HAS_CLIENT_REWRITES) await preloadHybridClientRouteOwner();
 
   let devErrorOverlay: DevErrorOverlayModule | null = null;
   if (import.meta.env.DEV) {
@@ -1668,9 +1673,12 @@ function bootstrapHydration(
       navigationKind === "traverse"
         ? (traversalIntent ?? historyController.resolveTraversalIntent(window.history.state))
         : null;
-    const performHardNavigationForScrollIntent = (targetHref: string): boolean => {
+    const performHardNavigationForScrollIntent = (
+      targetHref: string,
+      mode?: "assign" | "replace",
+    ): boolean => {
       consumeAppRouterScrollIntent(scrollIntent ?? null);
-      const didNavigate = browserNavigationController.performHardNavigation(targetHref);
+      const didNavigate = browserNavigationController.performHardNavigation(targetHref, mode);
       if (!didNavigate) {
         clearAppNavigationFailureTarget(targetHref);
       }
@@ -1768,8 +1776,8 @@ function bootstrapHydration(
         });
         const rscUrl = await createRscRequestUrl(url.pathname + url.search, requestHeaders);
         const rewrittenNavigationHref =
-          navigationKind === "navigate"
-            ? resolveHybridClientRewriteHref(currentHref, __basePath)
+          navigationKind === "navigate" && HAS_CLIENT_REWRITES
+            ? resolveLoadedHybridClientRewriteHref(currentHref, __basePath)
             : null;
         const additionalPrefetchRscUrls =
           rewrittenNavigationHref && rewrittenNavigationHref !== currentHref
@@ -2046,6 +2054,11 @@ function bootstrapHydration(
 
         const navContentType = navResponse.headers.get("content-type") ?? "";
         const streamedRedirectTarget = navResponse.headers.get(VINEXT_RSC_REDIRECT_HEADER);
+        const streamedRedirectTypeHeader = navResponse.headers.get(VINEXT_RSC_REDIRECT_TYPE_HEADER);
+        const streamedRedirectType =
+          streamedRedirectTypeHeader === "push" || streamedRedirectTypeHeader === "replace"
+            ? streamedRedirectTypeHeader
+            : null;
         if (blockDangerousStreamedRscRedirect(navResponse, streamedRedirectTarget)) {
           return;
         }
@@ -2063,6 +2076,7 @@ function bootstrapHydration(
           responseUrl: navResponseUrl ?? navResponse.url,
           source: "live",
           streamedRedirectTarget,
+          streamedRedirectType,
         });
         if (liveFetchDecision.kind === "hardNavigate") {
           if (liveFetchDecision.discardBody) {
@@ -2078,7 +2092,10 @@ function bootstrapHydration(
               "[vinext] RSC streamed redirect resolved to the current URL — aborting navigation to prevent infinite loop.",
             );
           }
-          performHardNavigationForScrollIntent(liveFetchDecision.url);
+          performHardNavigationForScrollIntent(
+            liveFetchDecision.url,
+            liveFetchDecision.hardNavigationMode,
+          );
           return;
         }
 

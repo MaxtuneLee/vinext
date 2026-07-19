@@ -111,13 +111,20 @@ type PagesFontPreload = {
 /**
  * The `__NEXT_DATA__` fields beyond the always-present core that the Pages
  * renderer serializes: the `__vinext` block plus the readiness flags
- * (gssp/gsp/gip/appGip/autoExport/isExperimentalCompile) the client uses to
+ * (gssp/gsp/gip/appGip/autoExport/nextExport/isExperimentalCompile) the client uses to
  * recompute the initial `router.isReady`. Shared by every render path
  * (initial, ISR regeneration) so they emit identical readiness state.
  */
 export type PagesNextDataExtras = Pick<
   VinextNextData,
-  "__vinext" | "appGip" | "autoExport" | "gip" | "gsp" | "gssp" | "isExperimentalCompile"
+  | "__vinext"
+  | "appGip"
+  | "autoExport"
+  | "gip"
+  | "gsp"
+  | "gssp"
+  | "isExperimentalCompile"
+  | "nextExport"
 >;
 
 export type PagesI18nRenderContext = {
@@ -278,7 +285,10 @@ export function buildPagesNextDataScript(
   const nextDataPayload: Record<string, unknown> = {
     props: options.props ?? { pageProps: options.pageProps },
     page: options.routePattern,
-    query: options.params,
+    // Next.js fallback:true shells intentionally omit the matched route
+    // params. The live slug is published by the hydration query update after
+    // the fallback data request resolves.
+    query: options.isFallback === true ? {} : options.params,
     buildId: options.buildId,
     isFallback: options.isFallback === true,
   };

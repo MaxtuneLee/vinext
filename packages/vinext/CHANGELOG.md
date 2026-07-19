@@ -1,5 +1,82 @@
 # vinext
 
+## 1.0.0-beta.2
+
+### Features
+
+- **Types:** ship Next-compatible types without Next.js (#2612)
+
+### Bug Fixes
+
+#### Pages
+
+- match encoded string static paths (#2629)
+- isolate static render router state (#2583)
+- validate redirect destinations consistently (#2586)
+- preserve data route path identity (#2580)
+- populate route in app initial props router (#2623)
+
+#### Misc
+
+- **Check:** exclude test-runner files from app compatibility scans (#2596)
+- **App Router:** stream generated metadata after the document shell (#2619)
+- **Cache:** isolate draft route responses (#2591)
+- **Middleware:** align unsafe matcher validation (#2599)
+- **Dev:** refresh routes after server restarts (#2588)
+- **Cache:** guard 'use cache' key against Cloudflare KV's 512-byte limit (#2606)
+- **Config:** keep page extensions out of module resolution (#2594)
+- **Navigation:** avoid rewriting URL for history metadata (#2615)
+- **OG:** resolve dot-hash wasm fallbacks (#2608)
+- **Router:** avoid repeated App path decoding (#2556)
+- **App Router:** preserve Flight stream framing (#2579)
+- **Shims:** align public API with vendored Next types (#2617)
+
+### Contributors
+
+- @blitss
+- @exKAZUu
+- @james-elicx
+- @lyzno1
+- @NathanDrake2406
+
+## 1.0.0-beta.1
+
+### Bug Fixes
+
+#### App Router
+
+- preserve streamed metadata placement parity (#2572)
+- delay dynamic SSR stream pulls (#2575)
+- handle redirects in route-miss fallbacks (#2553)
+- preserve semicolons in redirect digests (#2487)
+
+#### Pages
+
+- preserve missing page props on errors (#2568)
+- align preview mode behavior (#2561)
+- mark auto exports in next data (#2569)
+- normalize i18n router URLs (#2565)
+- preserve fast refresh state (#2544)
+
+#### Misc
+
+- **Build:** gate native typeof window folding (#2574)
+- pass server externals to Nitro traceDeps (#2521)
+- **Build:** honor inline next config for static export (#2543)
+- **Routing:** discover dot-directory routes (#2531)
+
+### Performance
+
+- **Build:** use native typeof window folding (#2564)
+- **Pages:** reuse dev stylesheet dependency analysis (#2550)
+
+### Contributors
+
+- @james-elicx
+- @LubomirGeorgiev
+- @NathanDrake2406
+- @WilliamK112
+
 ## 1.0.0-beta.0
 
 ### Features

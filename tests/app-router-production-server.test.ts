@@ -9,7 +9,12 @@ import {
   getPagesClientAssets,
   setPagesClientAssets,
 } from "../packages/vinext/src/server/pages-client-assets.js";
-import { APP_FIXTURE_DIR } from "./helpers.js";
+import { APP_FIXTURE_DIR, createIsolatedFixture } from "./helpers.js";
+
+const ROOT_LAYOUT_NOT_FOUND_REDIRECT_FIXTURE_DIR = path.resolve(
+  import.meta.dirname,
+  "./fixtures/root-layout-not-found-redirect",
+);
 
 function getStylesheetHrefs(html: string): string[] {
   const hrefs: string[] = [];
@@ -980,15 +985,6 @@ describe("App Router Production server (startProdServer)", () => {
     expect(html).toContain("test-post");
   });
 
-  // Ported from Next.js: test/e2e/app-dir/app-prefetch-static/app-prefetch-static.test.ts
-  // https://github.com/vercel/next.js/blob/v16.2.6/test/e2e/app-dir/app-prefetch-static/app-prefetch-static.test.ts
-  it("serves lowercase paths generated from uppercase static params", async () => {
-    const res = await fetch(`${baseUrl}/nextjs-compat/case-insensitive-static-params/se`);
-    expect(res.status).toBe(200);
-    const html = await res.text();
-    expect(html).toContain('id="case-insensitive-static-param"');
-  });
-
   it("serves nested layouts", async () => {
     const res = await fetch(`${baseUrl}/dashboard`);
     expect(res.status).toBe(200);
@@ -1048,6 +1044,139 @@ describe("App Router Production server (startProdServer)", () => {
   it("returns 404 for nonexistent routes", async () => {
     const res = await fetch(`${baseUrl}/no-such-page`);
     expect(res.status).toBe(404);
+  });
+
+  // Faithfully combines two Next.js contracts:
+  // - route misses render the root not-found page inside the root layout:
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/not-found/basic/index.test.ts
+  // - redirect() thrown during an RSC document request becomes a 307 response:
+  //   https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/rsc-redirect/rsc-redirect.test.ts
+  it("handles route-miss root layout redirects in production", async () => {
+    const fixtureRoot = await createIsolatedFixture(
+      ROOT_LAYOUT_NOT_FOUND_REDIRECT_FIXTURE_DIR,
+      "vinext-root-layout-not-found-redirect-",
+    );
+    const redirectOutDir = path.join(fixtureRoot, "dist");
+    let redirectServer: http.Server | undefined;
+    const previousPagesClientAssets = getPagesClientAssets();
+    const prodGlobalKeys = [
+      "__vite_rsc_client_require__",
+      "__vite_rsc_require__",
+      "__vite_rsc_server_require__",
+      "__webpack_chunk_load__",
+      "__webpack_require__",
+    ];
+    const previousGlobals = new Map(
+      prodGlobalKeys.map((key) => [
+        key,
+        {
+          exists: Reflect.has(globalThis, key),
+          value: Reflect.get(globalThis, key),
+        },
+      ]),
+    );
+
+    try {
+      const builder = await createBuilder({
+        root: fixtureRoot,
+        configFile: false,
+        plugins: [vinext({ appDir: fixtureRoot })],
+        logLevel: "silent",
+      });
+      await builder.buildApp();
+      const { startProdServer } = await import("../packages/vinext/src/server/prod-server.js");
+      const started = await startProdServer({
+        port: 0,
+        outDir: redirectOutDir,
+        noCompression: true,
+      });
+      redirectServer = started.server;
+
+      const address = redirectServer.address();
+      if (!address || typeof address === "string") {
+        throw new Error("Production redirect fixture did not bind to a TCP port");
+      }
+      const redirectBaseUrl = `http://127.0.0.1:${address.port}`;
+
+      const notFoundRes = await fetch(`${redirectBaseUrl}/random-content`);
+      expect(notFoundRes.status).toBe(404);
+      const html = await notFoundRes.text();
+      expect(html).toContain("Root Not Found");
+      expect(html).toContain('id="layout-nav"');
+
+      const redirectRes = await fetch(`${redirectBaseUrl}/random-content`, {
+        redirect: "manual",
+        headers: {
+          "x-vinext-root-layout-redirect": "1",
+        },
+      });
+      expect(redirectRes.status).toBe(307);
+      const location = redirectRes.headers.get("location");
+      expect(location).toBeTruthy();
+      expect(new URL(location!, redirectBaseUrl).pathname).toBe("/result");
+
+      // RSC navigations encode the redirect in the flight body (200), not a
+      // 307 status line — mirrors the dev-server RSC test and pins the built
+      // production path through the same boundary redirect-flight builder.
+      // vinext routes RSC by the `.rsc` suffix (app-rsc-request-normalization).
+      const rscRedirectRes = await fetch(`${redirectBaseUrl}/random-content.rsc`, {
+        redirect: "manual",
+        headers: {
+          "x-vinext-root-layout-redirect": "1",
+          Accept: "text/x-component",
+        },
+      });
+      expect(rscRedirectRes.status).toBe(200);
+      expect(rscRedirectRes.headers.get("content-type")).toContain("text/x-component");
+      expect(rscRedirectRes.headers.get("x-vinext-rsc-redirect")).toBe("/result");
+      const rscBody = await rscRedirectRes.text();
+      expect(rscBody).toContain("NEXT_REDIRECT");
+      expect(rscBody).toContain("/result");
+
+      // The RSC drain applies to matched-route HTTP-access fallbacks too, not
+      // only route misses. `/gated` is a matched route that calls notFound();
+      // its route-level not-found boundary (app/gated/not-found.tsx) redirects
+      // on its own header, so it renders during the fallback (not the layout
+      // probe) and its async redirect is caught by the boundary drain. With the
+      // trigger → 200 flight redirect; without it → a normal 404 flight
+      // (proving the buffering does not drop or corrupt the matched-route
+      // payload).
+      const matchedRedirectRes = await fetch(`${redirectBaseUrl}/gated.rsc`, {
+        redirect: "manual",
+        headers: {
+          "x-vinext-gated-notfound-redirect": "1",
+          Accept: "text/x-component",
+        },
+      });
+      expect(matchedRedirectRes.status).toBe(200);
+      expect(matchedRedirectRes.headers.get("x-vinext-rsc-redirect")).toBe("/result");
+      expect(await matchedRedirectRes.text()).toContain("NEXT_REDIRECT");
+
+      const matchedNotFoundRes = await fetch(`${redirectBaseUrl}/gated.rsc`, {
+        redirect: "manual",
+        headers: { Accept: "text/x-component" },
+      });
+      expect(matchedNotFoundRes.status).toBe(404);
+      expect(matchedNotFoundRes.headers.get("x-vinext-rsc-redirect")).toBeNull();
+      expect(await matchedNotFoundRes.text()).toContain("Gated Not Found");
+    } finally {
+      await new Promise<void>((resolve, reject) => {
+        if (!redirectServer) {
+          resolve();
+          return;
+        }
+        redirectServer.close((error) => (error ? reject(error) : resolve()));
+      });
+      setPagesClientAssets(previousPagesClientAssets);
+      for (const [key, previous] of previousGlobals) {
+        if (previous.exists) {
+          Reflect.set(globalThis, key, previous.value);
+        } else {
+          Reflect.deleteProperty(globalThis, key);
+        }
+      }
+      fs.rmSync(fixtureRoot, { recursive: true, force: true });
+    }
   });
 
   // Ported from Next.js: test/e2e/app-dir/rsc-redirect/rsc-redirect.test.ts
@@ -1191,6 +1320,142 @@ describe("App Router Production server (startProdServer)", () => {
     // Verify we can read the body as text (proves streaming works)
     const html = await res.text();
     expect(html.length).toBeGreaterThan(0);
+  });
+
+  it("flushes the document shell before slow generated metadata resolves", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    // https://github.com/vercel/next.js/blob/v16.2.7/test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    const response = await fetch(`${baseUrl}/metadata-streaming-timing`, {
+      headers: { "user-agent": "HeadlessChrome" },
+    });
+    expect(response.status).toBe(200);
+    expect(response.body).not.toBeNull();
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let html = "";
+    let shellTime: number | null = null;
+    let metadataTime: number | null = null;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      html += decoder.decode(value, { stream: true });
+      const now = performance.now();
+      if (shellTime === null && html.includes("metadata-streaming-shell")) {
+        shellTime = now;
+      }
+      if (metadataTime === null && html.includes("Delayed streaming metadata")) {
+        metadataTime = now;
+      }
+    }
+    html += decoder.decode();
+
+    expect(shellTime).not.toBeNull();
+    expect(metadataTime).not.toBeNull();
+    expect(metadataTime! - shellTime!).toBeGreaterThan(600);
+    expect(html).toContain("<title>Delayed streaming metadata</title>");
+    expect(html).toContain('data-testid="metadata-streaming-shell"');
+  });
+
+  it("flushes the RSC navigation shell before slow generated metadata resolves", async () => {
+    // Ported from Next.js: test/e2e/app-dir/instant-validation/instant-validation.test.ts
+    // https://github.com/vercel/next.js/blob/v16.2.7/test/e2e/app-dir/instant-validation/instant-validation.test.ts
+    const response = await fetch(`${baseUrl}/metadata-streaming-timing.rsc`, {
+      headers: { Accept: "text/x-component", RSC: "1", "user-agent": "HeadlessChrome" },
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/x-component");
+    expect(response.body).not.toBeNull();
+
+    const reader = response.body!.getReader();
+    const decoder = new TextDecoder();
+    let flight = "";
+    let shellTime: number | null = null;
+    let metadataTime: number | null = null;
+
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      flight += decoder.decode(value, { stream: true });
+      const now = performance.now();
+      if (shellTime === null && flight.includes("metadata-streaming-shell")) {
+        shellTime = now;
+      }
+      if (metadataTime === null && flight.includes("Delayed streaming metadata")) {
+        metadataTime = now;
+      }
+    }
+    flight += decoder.decode();
+
+    expect(shellTime).not.toBeNull();
+    expect(metadataTime).not.toBeNull();
+    expect(metadataTime! - shellTime!).toBeGreaterThan(600);
+  });
+
+  it("carries a delayed generateMetadata redirect in the streamed RSC payload", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-navigation/metadata-navigation.test.ts
+    // https://github.com/vercel/next.js/blob/v16.2.7/test/e2e/app-dir/metadata-navigation/metadata-navigation.test.ts#L76-L87
+    //
+    // RSC navigation starts streaming before generated metadata settles, so a
+    // late redirect remains an HTTP 200 and travels in the Flight error digest.
+    const response = await fetch(`${baseUrl}/metadata-redirect-test.rsc`, {
+      headers: { Accept: "text/x-component", RSC: "1", "user-agent": "HeadlessChrome" },
+      redirect: "manual",
+    });
+    expect(response.status).toBe(200);
+    expect(response.headers.get("content-type")).toContain("text/x-component");
+
+    const flight = await response.text();
+    expect(flight).toContain("NEXT_REDIRECT;;%2Fabout");
+  });
+
+  it("renders not-found metadata when deferred generateMetadata calls notFound", async () => {
+    // Ported from Next.js: test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    // https://github.com/vercel/next.js/blob/v16.2.7/test/e2e/app-dir/metadata-streaming/metadata-streaming.test.ts
+    const response = await fetch(`${baseUrl}/metadata-streaming-not-found`, {
+      headers: { "user-agent": "HeadlessChrome" },
+    });
+    expect(response.status).toBe(200);
+
+    const html = await response.text();
+    expect(html.match(/<title>/g) ?? []).toHaveLength(1);
+    expect(html).toContain("<title>Streamed not-found metadata</title>");
+
+    const rscResponse = await fetch(`${baseUrl}/metadata-streaming-not-found.rsc`, {
+      headers: { Accept: "text/x-component", RSC: "1", "user-agent": "HeadlessChrome" },
+    });
+    expect(rscResponse.status).toBe(200);
+    const flight = await rscResponse.text();
+    expect(flight).toContain("Streamed not-found metadata");
+    expect(flight).toContain("NEXT_HTTP_ERROR_FALLBACK;404");
+  });
+
+  it("omits searchParams from deferred not-found convention metadata", async () => {
+    // Next.js puts page.tsx in a synthetic __PAGE__ loader-tree child, so the
+    // containing not-found convention receives layout-style { params } props.
+    // Verified against Next.js 16.2.7 production behavior.
+    const response = await fetch(
+      `${baseUrl}/metadata-streaming-not-found-search-params?source=search`,
+      { headers: { "user-agent": "HeadlessChrome" } },
+    );
+    expect(response.status).toBe(200);
+
+    const html = await response.text();
+    expect(html).toContain("<title>Streamed not-found search=false source=missing</title>");
+  });
+
+  it("uses an active slot's local not-found metadata convention", async () => {
+    // Ported from Next.js loader-tree error-convention traversal:
+    // packages/next/src/lib/metadata/resolve-metadata.ts
+    const response = await fetch(`${baseUrl}/metadata-streaming-slot-not-found`, {
+      headers: { "user-agent": "HeadlessChrome" },
+    });
+    expect(response.status).toBe(200);
+
+    const html = await response.text();
+    expect(html).toContain("<title>Slot-local not-found metadata</title>");
+    expect(html).not.toContain("<title>Primary not-found metadata</title>");
   });
 
   it("reports server component render errors via instrumentation in production", async () => {

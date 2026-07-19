@@ -1135,6 +1135,9 @@ describe("Pages Router entry template", () => {
       );
 
       expect(code).toContain("export const hasMiddleware = false");
+      expect(code).toMatch(
+        /wrapWithRouterContext: typeof wrapWithRouterContext[\s\S]*?router: Router,/,
+      );
       const globalsImportIndex = code.indexOf("/server-globals.js");
       const firstUserImportIndex = code.indexOf(
         `import * as page_0 from ${JSON.stringify(path.join(pagesDir, "index.tsx"))}`,
@@ -1182,6 +1185,60 @@ describe("Pages Router entry template", () => {
       expect(code).toContain('pattern: "/plain",');
       expect(code).toContain('dataKind: "none"');
       expect(code).not.toContain("typeof page_");
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // Ported from Next.js: test/e2e/no-page-props/no-page-props.test.ts
+  // https://github.com/vercel/next.js/blob/v16.3.0-canary.80/test/e2e/no-page-props/no-page-props.test.ts
+  it("uses the framework error page in server and client entries when _error is absent", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-default-error-entry-"));
+    const pagesDir = path.join(tmpDir, "pages");
+
+    try {
+      fs.mkdirSync(pagesDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(pagesDir, "index.tsx"),
+        "export default function Page() { return null; }",
+      );
+
+      const nextConfig = await resolveNextConfig({});
+      const matcher = createValidFileMatcher();
+      const serverCode = await generateServerEntry(pagesDir, nextConfig, matcher, null, null);
+      const clientCode = await generateClientEntry(pagesDir, nextConfig, matcher);
+
+      expect(serverCode).toContain('import * as ErrorPageModule from "next/error";');
+      expect(clientCode).toContain('"/_error": () => import("next/error")');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  // Ported from Next.js: test/e2e/no-page-props/no-page-props.test.ts
+  // https://github.com/vercel/next.js/blob/v16.3.0-canary.80/test/e2e/no-page-props/no-page-props.test.ts
+  it("uses a custom error page in the client entry across configured page extensions", async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "vinext-pages-custom-error-entry-"));
+    const pagesDir = path.join(tmpDir, "pages");
+
+    try {
+      fs.mkdirSync(pagesDir, { recursive: true });
+      fs.writeFileSync(
+        path.join(pagesDir, "index.tsx"),
+        "export default function Page() { return null; }",
+      );
+      const errorFilePath = path.join(pagesDir, "_error.page.tsx");
+      fs.writeFileSync(errorFilePath, "export default function ErrorPage() { return null; }");
+
+      const nextConfig = await resolveNextConfig({ pageExtensions: ["page.tsx", "tsx"] });
+      const clientCode = await generateClientEntry(
+        pagesDir,
+        nextConfig,
+        createValidFileMatcher(nextConfig.pageExtensions),
+      );
+
+      expect(clientCode).toContain(`"/_error": () => import(${JSON.stringify(errorFilePath)})`);
+      expect(clientCode).not.toContain('"/_error": () => import("next/error")');
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
