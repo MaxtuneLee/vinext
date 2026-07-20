@@ -111,7 +111,7 @@ const projectServers = {
     ],
     use: { baseURL: "http://localhost:4177" },
     server: {
-      command: "npx vp build && npx wrangler dev --port 4177",
+      command: "VINEXT_E2E_REVALIDATION_PROXY=1 npx vp build && npx wrangler dev --port 4177",
       cwd: "./examples/pages-router-cloudflare",
       port: 4177,
       reuseExistingServer: !process.env.CI,
@@ -129,6 +129,7 @@ const projectServers = {
       port: 4175,
       reuseExistingServer: !process.env.CI,
       timeout: 60_000,
+      env: { NEXT_DEPLOYMENT_ID: "pages-production-deployment" },
     },
   },
   "pages-scroll-restoration": {
