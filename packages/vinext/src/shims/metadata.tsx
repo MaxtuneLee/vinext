@@ -14,6 +14,7 @@ import { makeThenableParams, type ThenableParamsObserver } from "./thenable-para
 import { isAbsoluteOrProtocolRelativeUrl } from "./url-utils.js";
 
 const USE_CACHE_FUNCTION_SYMBOL = Symbol.for("vinext.useCacheFunction");
+const USE_CACHE_ACCEPTS_SECOND_ARGUMENT_SYMBOL = Symbol.for("vinext.useCacheAcceptsSecondArgument");
 
 // ---------------------------------------------------------------------------
 // Viewport types and resolution
@@ -609,11 +610,19 @@ export async function resolveModuleMetadata(
           };
     // Next.js always passes `parent` to regular resolvers. Cached resolvers are
     // different: an unused parent must stay out of the cache key because it can
-    // contain non-serializable values such as a URL metadataBase. vinext uses
-    // function arity as an approximation of Next.js's transform-time used-arg
-    // analysis, so restrict that approximation to `use cache` wrappers.
+    // contain non-serializable values such as a URL metadataBase. The use-cache
+    // transform records whether the declaration accepts a second argument,
+    // including default and rest parameters that Function.length omits.
     const isUseCacheFunction = Reflect.get(generateMetadata, USE_CACHE_FUNCTION_SYMBOL) === true;
-    const passesParent = !isUseCacheFunction || generateMetadata.length >= 2;
+    const acceptsSecondArgument = Reflect.get(
+      generateMetadata,
+      USE_CACHE_ACCEPTS_SECOND_ARGUMENT_SYMBOL,
+    );
+    const passesParent =
+      !isUseCacheFunction ||
+      (typeof acceptsSecondArgument === "boolean"
+        ? acceptsSecondArgument
+        : generateMetadata.length >= 2);
     return await (passesParent ? generateMetadata(props, parent) : generateMetadata(props));
   }
   if (mod.metadata && typeof mod.metadata === "object") {

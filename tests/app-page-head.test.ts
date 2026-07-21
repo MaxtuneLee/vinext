@@ -894,6 +894,7 @@ describe("app page head resolution", () => {
     };
     Object.assign(generateMetadata, {
       [Symbol.for("vinext.useCacheFunction")]: true,
+      [Symbol.for("vinext.useCacheAcceptsSecondArgument")]: false,
     });
 
     const result = await resolveAppPageHead<Record<string, unknown>>({
@@ -946,6 +947,48 @@ describe("app page head resolution", () => {
 
     expect(receivedArgCounts).toEqual([2]);
     expect(result.metadata?.title).toBe("Root description");
+  });
+
+  // Extends Next.js's cached generateMetadata parent-argument coverage:
+  // https://github.com/vercel/next.js/blob/canary/test/e2e/app-dir/use-cache/use-cache.test.ts
+  it("passes the parent to cached generateMetadata with default and rest parameters", async () => {
+    const fallbackMetadata = { description: "Fallback description" };
+    const receivedArgCounts: number[] = [];
+    const withDefault = async function (
+      _props: unknown,
+      parent = Promise.resolve(fallbackMetadata),
+    ) {
+      receivedArgCounts.push(arguments.length);
+      return { title: String((await parent).description) };
+    };
+    const withRest = async function (...args: [unknown, Promise<Record<string, unknown>>?]) {
+      receivedArgCounts.push(args.length);
+      const parent = args[1] ?? Promise.resolve(fallbackMetadata);
+      return { title: String((await parent).description) };
+    };
+    const titles: unknown[] = [];
+
+    for (const generateMetadata of [withDefault, withRest]) {
+      Object.assign(generateMetadata, {
+        [Symbol.for("vinext.useCacheFunction")]: true,
+        [Symbol.for("vinext.useCacheAcceptsSecondArgument")]: true,
+      });
+      const result = await resolveAppPageHead<Record<string, unknown>>({
+        layoutModules: [{ metadata: { description: "Root description" } }],
+        layoutTreePositions: [0],
+        metadataRoutes: [],
+        pageModule: { generateMetadata },
+        params: {},
+        routePath: "/",
+        routeSegments: [],
+      });
+      titles.push(result.metadata?.title);
+    }
+
+    expect(withDefault.length).toBe(1);
+    expect(withRest.length).toBe(0);
+    expect(receivedArgCounts).toEqual([2, 2]);
+    expect(titles).toEqual(["Root description", "Root description"]);
   });
 
   it("keeps primary page title handling independent from active parallel route metadata", async () => {

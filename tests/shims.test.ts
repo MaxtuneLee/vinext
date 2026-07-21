@@ -6789,6 +6789,19 @@ describe('"use cache" runtime', () => {
     expect(two.length).toBe(2);
   });
 
+  it("preserves transform metadata for cached functions that accept a second argument", async () => {
+    const { registerCachedFunction } =
+      await import("../packages/vinext/src/shims/cache-runtime.js");
+    const fn = async (_props: unknown, _parent = Promise.resolve({})) => ({});
+    const cached = registerCachedFunction(fn, "test:default-parent", "", {
+      acceptsSecondArgument: true,
+    });
+
+    expect(fn.length).toBe(1);
+    expect(cached.length).toBe(1);
+    expect(Reflect.get(cached, Symbol.for("vinext.useCacheAcceptsSecondArgument"))).toBe(true);
+  });
+
   it("falls back to JSON when RSC module is unavailable (test environment)", async () => {
     // In vitest, @vitejs/plugin-rsc/react/rsc is not available (no Vite RSC
     // environment). The runtime should gracefully fall back to JSON.stringify
