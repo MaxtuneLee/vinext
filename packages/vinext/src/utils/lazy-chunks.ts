@@ -1,3 +1,5 @@
+import { toSlash } from "pathslash";
+
 /**
  * Build-manifest chunk metadata used to compute lazy chunks.
  */
@@ -87,7 +89,7 @@ export function computeLazyChunks(buildManifest: Record<string, BuildManifestChu
 }
 
 function normalizeManifestKey(key: string): string {
-  return key.split("?")[0].replace(/\\/g, "/").replace(/^\/+/, "");
+  return toSlash(key.split("?")[0]).replace(/^\/+/, "");
 }
 
 function addFile(files: string[], seen: Set<string>, file: string | undefined): void {
