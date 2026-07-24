@@ -25,7 +25,7 @@
 import fs from "node:fs";
 import { createRequire } from "node:module";
 import path, { toSlash } from "pathslash";
-import { pathToFileURL } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 import { preprocessCSS, type PreprocessCSSResult, type ResolvedConfig } from "vite";
 import { markCssUrlAssetReferences, rebaseCssUrlAssetReferences } from "../build/css-url-assets.js";
 
@@ -179,6 +179,7 @@ export function createSassCssUrlAssetImporter(): {
 } {
   const markedStylesheets = new Map<string, SassLoadedStylesheet>();
   const importUrlPrefix = "vinext-css-url-asset:";
+  const stylesheetKey = (url: URL): string => toSlash(fileURLToPath(url));
 
   const prepareStylesheet = (
     filename: string,
@@ -217,7 +218,7 @@ export function createSassCssUrlAssetImporter(): {
           const prepared = prepareStylesheet(candidate, entryDirectory);
           if (prepared === null) return match;
           const canonicalUrl = pathToFileURL(candidate);
-          markedStylesheets.set(canonicalUrl.href, prepared);
+          markedStylesheets.set(stylesheetKey(canonicalUrl), prepared);
           const namespace =
             rule === "use" && !/\bas\s+(?:\*|[-\w]+)/.test(suffix)
               ? ` as ${deriveSassNamespace(importUrl)}`
@@ -235,7 +236,7 @@ export function createSassCssUrlAssetImporter(): {
     },
 
     load(canonicalUrl) {
-      return markedStylesheets.get(canonicalUrl.href) ?? null;
+      return markedStylesheets.get(stylesheetKey(canonicalUrl)) ?? null;
     },
 
     rewriteImports,
