@@ -179,7 +179,6 @@ export function createSassCssUrlAssetImporter(): {
 } {
   const markedStylesheets = new Map<string, SassLoadedStylesheet>();
   const importUrlPrefix = "vinext-css-url-asset:";
-  const stylesheetKey = (url: URL): string => toSlash(fileURLToPath(url));
 
   const prepareStylesheet = (
     filename: string,
@@ -235,7 +234,7 @@ export function createSassCssUrlAssetImporter(): {
     },
 
     load(canonicalUrl) {
-      return markedStylesheets.get(stylesheetKey(canonicalUrl)) ?? null;
+      return markedStylesheets.get(toSlash(fileURLToPath(canonicalUrl))) ?? null;
     },
 
     rewriteImports,
