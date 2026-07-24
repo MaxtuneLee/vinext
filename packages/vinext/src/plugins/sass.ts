@@ -217,8 +217,7 @@ export function createSassCssUrlAssetImporter(): {
           if (!fs.statSync(candidate, { throwIfNoEntry: false })?.isFile()) continue;
           const prepared = prepareStylesheet(candidate, entryDirectory);
           if (prepared === null) return match;
-          const canonicalUrl = pathToFileURL(candidate);
-          markedStylesheets.set(stylesheetKey(canonicalUrl), prepared);
+          markedStylesheets.set(candidate, prepared);
           const namespace =
             rule === "use" && !/\bas\s+(?:\*|[-\w]+)/.test(suffix)
               ? ` as ${deriveSassNamespace(importUrl)}`

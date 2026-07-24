@@ -225,34 +225,31 @@ describe("createSassCssUrlAssetImporter", () => {
     }
   });
 
-  it.runIf(process.platform === "win32")(
-    "loads partials when Sass normalizes Windows short-path URLs",
-    async () => {
-      const sass = await import("sass");
-      const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-sass-short-path-url-"));
-      const shortPathDir = path.join(tmpDir, "RUNNER~1");
-      const entryPath = path.join(shortPathDir, "entry.scss");
-      await fsp.mkdir(shortPathDir);
-      await fsp.writeFile(
-        path.join(shortPathDir, "_card.scss"),
-        `$fg: red;\n.card { background-image: url('./card.svg'); }`,
-      );
+  it("loads partials when Sass normalizes URLs with '~'", async () => {
+    const sass = await import("sass");
+    const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), "vinext-sass-short-path-url-"));
+    const shortPathDir = path.join(tmpDir, "RUNNER~1");
+    const entryPath = path.join(shortPathDir, "entry.scss");
+    await fsp.mkdir(shortPathDir);
+    await fsp.writeFile(
+      path.join(shortPathDir, "_card.scss"),
+      `$fg: red;\n.card { background-image: url('./card.svg'); }`,
+    );
 
-      try {
-        const importer = createSassCssUrlAssetImporter();
-        const rewritten = importer.rewriteImports(
-          `@use "./card";\n.test { color: card.$fg; }`,
-          entryPath,
-        );
-        expect(rewritten).toContain("RUNNER~1");
-        expect(() =>
-          sass.compileString(rewritten, { importers: [importer], syntax: "scss" }),
-        ).not.toThrow();
-      } finally {
-        await fsp.rm(tmpDir, { recursive: true, force: true });
-      }
-    },
-  );
+    try {
+      const importer = createSassCssUrlAssetImporter();
+      const rewritten = importer.rewriteImports(
+        `@use "./card";\n.test { color: card.$fg; }`,
+        entryPath,
+      );
+      expect(rewritten).toContain("RUNNER~1");
+      expect(() =>
+        sass.compileString(rewritten, { importers: [importer], syntax: "scss" }),
+      ).not.toThrow();
+    } finally {
+      await fsp.rm(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("createSassTildeImporter", () => {
